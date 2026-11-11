@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { companionArguments, getCompanionTools } from "../src/tools/companion.js";
 import { guardToolHandler, isToolPermitted, resolveCapabilities } from "../src/security/capabilities.js";
+import { currentInvocation, withInvocationContext } from "../src/workflows/invocation-context.js";
+import { mutationReceipt } from "../src/workflows/mutation-receipt.js";
 
 const scratch: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -19,6 +21,10 @@ describe("Companion integration", () => {
     expect(() => companionArguments(tool, { items: ["--help"], to: "x" })).toThrow();
     expect(() => companionArguments(tool, { items: ["x"], to: "x", shell: "x" })).toThrow();
     expect(() => companionArguments(tool, { items: ["x"] })).toThrow();
+  });
+  it("preserves negative numeric values without accepting CLI flags", () => {
+    expect(companionArguments(tool, { items: ["a"], to: "-6.5" })).toContain("-6.5");
+    expect(() => companionArguments(tool, { items: ["a"], to: "-6--help" })).toThrow();
   });
   it("allows exactly one writer, including direct handler calls", async () => {
     vi.stubEnv("PREMIERE_COMPANION_CLI", "/fixture/companion.mjs");
@@ -56,5 +62,14 @@ describe("Companion integration", () => {
     vi.stubEnv("PREMIERE_COMPANION_CLI", "");
     expect(getCompanionTools()).toEqual({});
     expect(() => getCompanionTools("relative.mjs")).toThrow("absolute");
+  });
+  it("reports a completed Companion mutation as dispatched, never safe to replay", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "companion-check-")); scratch.push(dir);
+    const cli = join(dir, "fake.mjs");
+    writeFileSync(cli, `if(process.argv[2]==='mcp-manifest') console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: [tool] })})); else console.log(JSON.stringify({state:'done',result:{moved:1}}));`);
+    await withInvocationContext({}, async () => {
+      const result = await getCompanionTools(cli).companion_bin_move.handler({ items: ["a"], to: "b" });
+      expect(mutationReceipt(result.success, result.data, currentInvocation(), "companion_bin_move")).toMatchObject({ dispatch: "dispatched", outcome: "committed_unverified" });
+    });
   });
 });

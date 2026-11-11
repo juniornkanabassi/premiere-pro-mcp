@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import { companionAuthority, companionWriter } from "../companion-policy.js";
+import { markHostDispatch } from "../workflows/invocation-context.js";
 
 const execute = promisify(execFile);
 interface Schema { type: string; enum?: unknown[]; minLength?: number; minItems?: number; items?: Schema }
@@ -18,7 +19,7 @@ export function companionArguments(tool: CompanionTool, input: unknown): string[
       if (!Array.isArray(value) || !schema.items || value.length < (schema.minItems ?? 0)) throw new Error("Invalid array");
       value.forEach(item => validate(item, schema.items!));
     } else if (schema.type === "integer" ? !Number.isInteger(value) : typeof value !== schema.type) throw new Error("Invalid argument type");
-    if (typeof value === "string" && (value.startsWith("-") || value.includes("\0") || value.length < (schema.minLength ?? 0))) throw new Error("Unsafe or empty argument");
+    if (typeof value === "string" && ((value.startsWith("-") && !/^-\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(value)) || value.includes("\0") || value.length < (schema.minLength ?? 0))) throw new Error("Unsafe or empty argument");
     if (schema.enum && !schema.enum.includes(value)) throw new Error("Invalid argument enum");
   };
   for (const key of tool.inputSchema.required ?? []) if (!Object.hasOwn(args, key)) throw new Error(`Missing ${key}`);
@@ -60,6 +61,7 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
       handler: async (args: unknown) => {
         const argv = companionArguments(tool, args);
         try {
+          if (companionAuthority(name)!.length > 1) markHostDispatch();
           const { stdout } = await execute(process.execPath, [cli, ...argv], { timeout: 3900000, maxBuffer: 16 * 1024 * 1024 });
           return { success: true, data: JSON.parse(stdout) };
         } catch (cause) {

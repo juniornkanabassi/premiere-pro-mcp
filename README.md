@@ -1,6 +1,16 @@
-# Junior's personal fork
+# Junior's setup
 
-This checkout adds an opt-in [Premiere Companion integration](docs/junior-companion.md). It preserves the existing Companion commands and guards while selecting one writer backend per process. Upstream functionality below remains available; native host validation is separate from the adapter checks.
+This personal fork is based on upstream `f8e666093701a286fadaed0795a4bfd341c1d0ee`. It adds all 54 Premiere Companion commands as `companion_*` tools. They call the existing CLI, with its grants, project locks, backups and serial queue. The shared guard rejects upstream mutations in Companion mode, even if called without tool discovery. The adapter marks a dispatched command correctly so a successful edit cannot be mistaken for a safe retry.
+
+The installed `~/.local/bin/premiere-ai` starts an audited, versioned release under `../Releases/<commit>/`, using Node 24. `premiere-ai --mcp` starts stdio MCP; `premiere-ai status --json` and the other Companion CLI commands work without MCP. Stop an MCP instance by disconnecting it in the client or ending its stdio process. The existing Companion LaunchAgent remains its separately managed daemon.
+
+The installed default is Companion as the sole writer. It loads no additional Premiere panel, has no UXP token, disables telemetry, and does not check for updates. Native mode is inspect-only in the personal launcher. Native edits require a deliberate, separately configured upstream entrypoint and connector; they remain experimental and must never run alongside a Companion writer. Do not enable raw script execution. Native UXP passed selected disposable tests on Premiere 26.5.2, but a second panel interfered with one Companion frame export. The CEP adjustment-layer tool failed because this host has neither required QE method. No automatic fallback is permitted.
+
+Claude Code user scope and Codex both register the stdio launcher as `premiere-mcp`. Reconnect the server or start a fresh session after changing a registration or release. Already running processes keep their loaded release. Check `companion_status`, not the CEP-only `ping`, for the default setup. T3 sessions inherit the user MCP configuration when their provider runtime starts; tool discovery in a running session is the final check.
+
+Update deliberately: review a specific commit in this fork, run `npm ci --ignore-scripts`, `npm run build`, and the relevant tests in the source checkout. Copy `dist`, `scripts`, `package.json` and the locked `node_modules` into a new `../Releases/<commit>/` directory, record hashes, then change the one path in `../00 Project State/premiere-ai`. Retain the previous release for rollback. Never point production at a mutable source build or run an upstream installer. Test on a disposable project before switching the launcher.
+
+Remove only `premiere-mcp` from each client's configuration, then remove `~/.local/bin/premiere-ai` and the personal wrapper. Preserve unrelated MCP entries and Companion itself. Restore a previous release by changing the wrapper path and restarting the client MCP process. Exact installation backups and live evidence are in `../00 Project State/` and the evaluation report. Do not restore a whole old config over newer unrelated changes.
 
 <div align="center">
 

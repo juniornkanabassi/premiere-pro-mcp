@@ -14,7 +14,7 @@ if (args[0] !== '--mcp') {
   const writer = companionWriter();
   delete process.env.POSTHOG_API_KEY;
   delete process.env.PREMIERE_MCP_TOOL_PACKS;
-  process.env.PREMIERE_MCP_CAPABILITIES = 'inspect,edit,export,filesystem';
+  process.env.PREMIERE_MCP_CAPABILITIES = writer === 'companion' ? 'inspect,edit,export,filesystem' : 'inspect';
   if (writer === 'companion') {
     const manifest = JSON.parse(execFileSync(process.execPath, [cli, 'mcp-manifest'], { encoding: 'utf8', timeout: 10000, maxBuffer: 2 * 1024 * 1024 }));
     process.env.PREMIERE_MCP_TOOL_LIST = manifest.tools.map(t => 'companion_' + t.name).join(',');

@@ -6,7 +6,7 @@ Set `PREMIERE_COMPANION_CLI` to the absolute `bin/binboy.mjs` path and run `node
 
 Default `PREMIERE_MCP_WRITER=companion` exposes the complete Companion catalogue and upstream diagnostics. All writes still need Companion’s original project grant and go through its queue. A project opened by hand does not gain a write grant merely because this adapter exists. Start it through Companion when editing is authorised, or use a disposable project first.
 
-`PREMIERE_MCP_WRITER=native` exposes upstream tools and only known read-only Companion commands. A separate configured UXP or CEP connector is required. Native host execution is not proved by adapter tests. Do not enable it until the connector passes a disposable-project check. Raw scripts are excluded by the launcher in both modes. Do not start parallel native and Companion writer processes, or other uncoordinated controllers.
+`PREMIERE_MCP_WRITER=native` exposes upstream tools and only known read-only Companion commands. A separate configured UXP or CEP connector is required. The personal launcher keeps native mode inspect-only. Selected native UXP and CEP calls were tested on a disposable project, but native production editing remains unapproved; see Junior’s setup and the evaluation report. Raw scripts are excluded by the launcher in both modes. Do not start parallel native and Companion writer processes, or other uncoordinated controllers.
 
 The central guard enforces the writer choice even when a tool is called without discovery. This is not OS sandboxing and cannot stop another process or the human editor. CLI exit 5 or timeout remains unknown and must not be automatically retried.
 
