@@ -1,6 +1,6 @@
 # Junior's setup
 
-This personal fork is based on upstream `f8e666093701a286fadaed0795a4bfd341c1d0ee`. It adds all 54 Premiere Companion commands as `companion_*` tools. They call the existing CLI, with its grants, project locks, backups and serial queue. The shared guard rejects upstream mutations in Companion mode, even if called without tool discovery. The adapter marks a dispatched command correctly so a successful edit cannot be mistaken for a safe retry.
+This personal fork is based on upstream `f8e666093701a286fadaed0795a4bfd341c1d0ee`. It adds all 54 Premiere Companion commands as `companion_*` tools. They call the existing CLI, with its grants, project locks, backups and serial queue. The shared guard rejects upstream mutations in Companion mode, even if called without tool discovery. The adapter marks a dispatched command correctly so a successful edit cannot be mistaken for a safe retry. Large CLI responses use private temporary files to avoid truncated pipe output, then those files are removed. Negative numeric arguments retain their sign without accepting CLI flags.
 
 The installed `~/.local/bin/premiere-ai` starts an audited, versioned release under `../Releases/<commit>/`, using Node 24. `premiere-ai --mcp` starts stdio MCP; `premiere-ai status --json` and the other Companion CLI commands work without MCP. Stop an MCP instance by disconnecting it in the client or ending its stdio process. The existing Companion LaunchAgent remains its separately managed daemon.
 

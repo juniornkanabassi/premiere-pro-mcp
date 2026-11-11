@@ -72,4 +72,11 @@ describe("Companion integration", () => {
       expect(mutationReceipt(result.success, result.data, currentInvocation(), "companion_bin_move")).toMatchObject({ dispatch: "dispatched", outcome: "committed_unverified" });
     });
   });
+  it("captures large CLI JSON even when the CLI exits immediately", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "companion-check-")); scratch.push(dir);
+    const cli = join(dir, "fake.mjs");
+    writeFileSync(cli, `if(process.argv[2]==='mcp-manifest') console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: [tool] })})); else {console.log(JSON.stringify({text:'x'.repeat(300000)}));process.exit(0);}`);
+    const result = await getCompanionTools(cli).companion_bin_move.handler({ items: ["a"], to: "b" });
+    expect(result).toMatchObject({ success: true, data: { text: "x".repeat(300000) } });
+  });
 });
