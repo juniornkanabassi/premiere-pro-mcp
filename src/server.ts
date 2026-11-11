@@ -118,6 +118,7 @@ import { argumentDiagnostics, strictDeclaredObjects } from "./workflows/strict-s
 import { recordPerformance } from "./workflows/performance-diagnostics.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
+import { getCompanionTools } from "./tools/companion.js";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -421,6 +422,7 @@ export function collectTools(
   const selectedUxpBridge = bridgeMode === "cep" ? undefined : uxpBridge;
   const tools: Record<string, ToolDef> = {
     ...collectStaticTools(bridgeOptions, capabilities),
+    ...getCompanionTools(),
     ...(sessionGuard ? getSessionGuardTools(sessionGuard) : {}),
     ...getProjectContextTools(bridgeOptions, { repository: projectContextRepository }),
     ...getEditorialContextPackTools({ repository: projectContextRepository }),

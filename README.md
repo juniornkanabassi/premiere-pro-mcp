@@ -1,3 +1,7 @@
+# Junior's personal fork
+
+This checkout adds an opt-in [Premiere Companion integration](docs/junior-companion.md). It preserves the existing Companion commands and guards while selecting one writer backend per process. Upstream functionality below remains available; native host validation is separate from the adapter checks.
+
 <div align="center">
 
 # MCP for Adobe Premiere Pro — local MCP server

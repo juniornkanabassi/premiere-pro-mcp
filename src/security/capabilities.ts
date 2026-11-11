@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { companionAuthority, writerPermits } from "../companion-policy.js";
 
 export const CAPABILITIES = ["inspect", "edit", "export", "filesystem", "unsafe-script"] as const;
 
@@ -560,6 +561,8 @@ const ACTION_CAPABILITIES: Readonly<Record<string, Readonly<Record<string, reado
 
 /** A conservative classification for centralized server registration. */
 export function capabilityForTool(toolName: string): Capability {
+  const companion = companionAuthority(toolName);
+  if (companion) return companion.length === 1 ? "inspect" : "edit";
   if (UNSAFE_TOOL_NAMES.has(toolName)) return "unsafe-script";
   if (/^(export_|validate_export_|start_batch_encode|add_to_render_queue|queue_|encode_|capture_frame)/.test(toolName)) return "export";
   if (/^(import_|relink_|create_project|open_project|save_|consolidate_)/.test(toolName)) return "filesystem";
@@ -572,6 +575,8 @@ export function capabilityForTool(toolName: string): Capability {
 
 /** Resolve authority at the action level for consolidated multi-action tools. */
 export function capabilitiesForToolInvocation(toolName: string, args: unknown): readonly Capability[] {
+  const companion = companionAuthority(toolName);
+  if (companion) return companion;
   if (toolName === "audit_project_structure" && args && typeof args === "object" && (args as Record<string, unknown>).apply === true) return ["inspect", "edit"];
   // set_track_states with snapshot and no state field anywhere only reads the tracks back.
   if (toolName === "set_track_states" && args && typeof args === "object" && (args as Record<string, unknown>).snapshot === true) {
@@ -648,6 +653,9 @@ export function isToolPermitted(
   toolName: string,
   config: CapabilityConfig,
 ): boolean {
+  const companion = companionAuthority(toolName);
+  if (!writerPermits(toolName, toolMayChangeState(toolName))) return false;
+  if (companion) return companion.every(capability => config.capabilities.has(capability));
   if (ALWAYS_LISTED_TOOL_NAMES.has(toolName)) return true;
   if (toolName === "set_track_states") return config.capabilities.has("inspect") || config.capabilities.has("edit");
   if (toolName === "export_sequence_edl") return config.capabilities.has("export");
@@ -669,6 +677,9 @@ export function guardToolHandler<TArgs, TResult>(
   createOperationId: () => string = randomUUID,
 ): (args: TArgs) => Promise<TResult> {
   return async (args: TArgs) => {
+    if (!writerPermits(toolName, capabilitiesForToolInvocation(toolName, args).some(c => c !== "inspect"))) {
+      throw new Error("WRITER_DISABLED: restart with the intended single writer; no command was dispatched");
+    }
     const operationId = createOperationId();
     for (const required of capabilitiesForToolInvocation(toolName, args)) {
       requireCapability(config, required, operationId);
