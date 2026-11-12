@@ -21,10 +21,15 @@
   const TICKS_PER_SECOND = 254016000000n;
   const PARKING_GAP = 10n * TICKS_PER_SECOND;
   const MAX_SEGMENTS = 256;
-  // Premiere places audio on the sample grid (254016000000 / 48000 ticks), so
-  // a planned audio edge can land up to one sample away; video lands within
-  // half a frame. Readback accepts exactly that and reports the largest miss.
-  const AUDIO_SAMPLE_TICKS = 5292000n;
+  // Premiere places audio on the sample grid, so a planned audio edge can land
+  // up to one sample away; video lands within half a frame. Readback accepts
+  // exactly that and reports the largest miss. The sample comes from the
+  // sequence's audio rate; without one, the 44.1 kHz sample (the larger common one).
+  const FALLBACK_SAMPLE_TICKS = 5760000n;
+  // Parked clones are full-length source clips, so one round of parking is
+  // capped at this extent and a long cut is done in several rounds that
+  // reuse the same slot (shortcut: 3 Undo steps per round, raise if rounds are common).
+  const PARKING_BUDGET = 12n * 3600n * TICKS_PER_SECOND;
   const SEGMENT_KEYS = ["sourceStartTicks", "sourceEndTicks", "sourceStartSeconds", "sourceEndSeconds", "videoTrack"];
   // segments mode copies camera ranges from one video track each onto one
   // "program" video track of the same sequence; nothing else may be given.
@@ -92,6 +97,7 @@
       const label = "Copy " + plan.snapshot.clips.length + " clip" + (plan.snapshot.clips.length === 1 ? "" : "s") + " from " + plan.snapshot.sourceSequenceName;
       const direct = plan.entries.filter(function (entry) { return !entry.trimmed; });
       const parked = plan.entries.filter(function (entry) { return entry.trimmed; });
+      const roundCount = parked.length ? parked[parked.length - 1].round + 1 : 0;
 
       // Transaction 1: every clone, direct ones at their destination and
       // trimmed ones at the parking spot. A clone into a track that does not
@@ -110,16 +116,31 @@
           }, name), name);
         });
       }
-      const chunks = plan.newTrack && plan.entries.length > 1 ? [plan.entries.slice(0, 1), plan.entries.slice(1)] : [plan.entries];
+      // Round 0 of parking goes in with the direct clones; later rounds reuse
+      // the slot once the previous round has been moved into place.
+      const first = plan.entries.filter(function (entry) { return !entry.trimmed || entry.round === 0; });
+      const chunks = plan.newTrack && first.length > 1 ? [first.slice(0, 1), first.slice(1)] : [first];
       cloneTransaction(chunks[0], label);
       let steps = 1;
       try {
+        if (plan.newTrack) {
+          // Never go on unless the first clone made the track and landed on it:
+          // the rest would overwrite whatever track it really went to.
+          const entry = chunks[0][0], want = entry.placement.targetTrackIndex;
+          const count = await trackCount(context.destination, "video");
+          if (count !== want + 1) {
+            throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not create video track " + want + " (the sequence has " + count + " video tracks); the first clone may be on another track and the remaining clones were not made");
+          }
+          await findClone(context.destination, entry, entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks), plan);
+        }
         if (chunks.length > 1) { cloneTransaction(chunks[1], label + " (rest)"); steps++; }
-        if (parked.length) {
+        for (let round = 0; round < roundCount; round++) {
+          const mine = parked.filter(function (entry) { return entry.round === round; });
+          if (round > 0) { cloneTransaction(mine, label + " (park " + (round + 1) + ")"); steps++; }
           // Transaction 2: trim each parked clone to the range. Transaction 3:
           // move it into place.
           const clones = [];
-          for (const entry of parked) clones.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart, plan.frame) });
+          for (const entry of mine) clones.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart, plan) });
           context.project.lockedAccess(function () {
             const actions = [];
             for (const clone of clones) {
@@ -138,7 +159,7 @@
           });
           steps++;
           const trimmed = [];
-          for (const entry of parked) trimmed.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks), plan.frame) });
+          for (const entry of mine) trimmed.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks), plan) });
           context.project.lockedAccess(function () {
             const actions = checked(trimmed.map(function (clone) {
               const from = clone.entry.parkedStart + BigInt(clone.entry.placement.trimHeadTicks);
@@ -348,16 +369,22 @@
         if (BigInt(placement.endTicks) > lastEnd) lastEnd = BigInt(placement.endTicks);
       }
       const gap = (PARKING_GAP + frame - 1n) / frame * frame;
-      let parking = (lastEnd + frame - 1n) / frame * frame + gap;
+      const parkingBase = (lastEnd + frame - 1n) / frame * frame + gap;
+      let parking = parkingBase, round = 0;
       for (const entry of entries) {
         if (!entry.trimmed) continue;
+        const length = BigInt(entry.placement.endTicks) - BigInt(entry.placement.startTicks) + BigInt(entry.placement.trimHeadTicks) + BigInt(entry.placement.trimTailTicks);
+        if (length + gap > PARKING_BUDGET) throw refuse("UXP_TARGET_TOO_LARGE", entry.placement.name + " is too long to park while it is trimmed; split the range so it crosses fewer long clips");
+        if (parking - parkingBase + length > PARKING_BUDGET) { round++; parking = parkingBase; }
+        entry.round = round;
         entry.parkedStart = parking;
-        entry.parkedEnd = parking + BigInt(entry.placement.endTicks) - BigInt(entry.placement.startTicks) + BigInt(entry.placement.trimHeadTicks) + BigInt(entry.placement.trimTailTicks);
+        entry.parkedEnd = parking + length;
         parking = (entry.parkedEnd + frame - 1n) / frame * frame + gap;
       }
 
       return {
-        entries, frame, newTrack,
+        entries, frame, newTrack, sampleTicks: await sampleTicksOf(destination),
+        rounds: round + 1,
         snapshot: {
           projectGuid: requiredIdentifier(project.guid, "project GUID"),
           sourceSequenceId: request.sourceSequenceId,
@@ -378,12 +405,20 @@
       return BigInt(text);
     }
 
-    // Half a frame for video, one 48 kHz sample for audio.
-    function tolerance(mediaType, frame) { return mediaType === "audio" ? AUDIO_SAMPLE_TICKS : frame / 2n; }
+    // Half a frame for video, one audio sample for audio.
+    function tolerance(mediaType, plan) { return mediaType === "audio" ? plan.sampleTicks : plan.frame / 2n; }
+    async function sampleTicksOf(sequence) {
+      let rate = Number(await maybeCall(sequence, "getAudioSampleRate"));
+      if (!(rate > 0)) {
+        const settings = await maybeCall(sequence, "getSettings");
+        rate = Number(settings ? await maybeCall(settings, "getAudioSampleRate") : NaN);
+      }
+      return rate >= 8000 && rate <= 192000 ? TICKS_PER_SECOND / BigInt(Math.round(rate)) : FALLBACK_SAMPLE_TICKS;
+    }
     function distance(left, right) { const d = BigInt(left) - BigInt(right); return d < 0n ? -d : d; }
 
-    async function findClone(sequence, entry, startTicks, frame) {
-      const placement = entry.placement, tol = tolerance(placement.mediaType, frame);
+    async function findClone(sequence, entry, startTicks, plan) {
+      const placement = entry.placement, tol = tolerance(placement.mediaType, plan);
       let best = null, bestDistance = tol + 1n;
       for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) {
         const away = distance(await ticksOf(item, "getStartTime"), startTicks);
@@ -416,7 +451,7 @@
         return cache[key];
       }
       for (const entry of plan.entries) {
-        const want = entry.placement, tol = tolerance(want.mediaType, plan.frame);
+        const want = entry.placement, tol = tolerance(want.mediaType, plan);
         const items = await track(want.mediaType, want.targetTrackIndex);
         let found = -1, foundDistance = tol + 1n;
         for (let index = 0; index < items.length; index++) {

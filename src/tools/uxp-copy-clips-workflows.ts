@@ -73,6 +73,23 @@ function camelKey(snakeKey: string): string {
 }
 
 /**
+ * The schema the server validates against: every snapshot field also under its camelCase
+ * twin and none required, so the raw inspect result gets past the server's schema check.
+ * toPanelShape, driven by the strict schema above, still enforces required and unknown fields.
+ */
+function acceptingCamelTwins(schema: Schema): Schema {
+  if (schema.type === "array") return { ...schema, items: acceptingCamelTwins(schema.items as Schema) };
+  if (schema.type !== "object" || !schema.properties) return schema;
+  const properties: Record<string, Schema> = {};
+  for (const [key, child] of Object.entries(schema.properties)) {
+    properties[key] = properties[camelKey(key)] = acceptingCamelTwins(child);
+  }
+  const { required: _required, ...rest } = schema;
+  return { ...rest, properties };
+}
+const toolSnapshotSchema = acceptingCamelTwins(expectedSnapshotSchema);
+
+/**
  * Convert a snapshot to the panel's camelCase shape, rejecting unknown or missing fields.
  * Each field may arrive as its snake_case key (expected_snapshot) or its camelCase twin
  * (the raw inspect result); giving both with different values is refused.
@@ -153,7 +170,7 @@ export function getUxpCopyClipsWorkflowTools(bridge: UxpWebSocketBridge) {
   };
   return {
     apply_camera_cut_uxp: {
-      description: "Build a camera cut on a new or empty 'program' video track from a plan_multicam_angle_switches cut list, by cloning each planned range from its camera's video track onto the program track at the same time, with the camera stack left untouched. Pass the plan's cuts, camera_tracks (camera_id to video track index) and program_track_index (an empty track, or the next track number to create one). Inspect returns the exact clip placements; apply needs that unchanged expected_snapshot, confirm_copy: true and an operation_id. A busy program track is refused. Only the picture is cut; audio tracks, and the picture's linked audio, are not touched. A clip that crosses a cut is trimmed to it (this adds two Undo steps; undo_steps says how many); retimed clips are refused. Each clone is read back (start, end, source in and out within half a frame, enabled state); outcome is verified or committed_unverified. It does not prove playback or rendered frames.",
+      description: "Build a camera cut on a new or empty 'program' video track from a plan_multicam_angle_switches cut list, by cloning each planned range from its camera's video track onto the program track at the same time, with the camera stack left untouched. Pass the plan's cuts, camera_tracks (camera_id to video track index) and program_track_index (an empty track, or the next track number to create one). Inspect returns the exact clip placements; apply needs that unchanged expected_snapshot, confirm_copy: true and an operation_id. A busy program track is refused. Only the picture is cut (checkpoint, cloning the sequence first, is not implemented; duplicate the sequence yourself if you want a restore point); audio tracks, and the picture's linked audio, are not touched. A clip that crosses a cut is trimmed to it (this adds two Undo steps; undo_steps says how many); retimed clips are refused. Each clone is read back (start, end, source in and out within half a frame, enabled state); outcome is verified or committed_unverified. It does not prove playback or rendered frames.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -175,7 +192,7 @@ export function getUxpCopyClipsWorkflowTools(bridge: UxpWebSocketBridge) {
           },
           camera_tracks: { type: "object", maxProperties: 64, additionalProperties: index, description: "Video track index of each camera_id, for example {\"cam1\": 1, \"cam2\": 2}." },
           program_track_index: { ...index, description: "Video track to build the cut on. Must be empty, or equal to the sequence's video track count to create a new one." },
-          expected_snapshot: expectedSnapshotSchema,
+          expected_snapshot: toolSnapshotSchema,
           confirm_copy: { type: "boolean", description: "Must be true for action: apply." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: apply." },
         },
@@ -221,7 +238,7 @@ export function getUxpCopyClipsWorkflowTools(bridge: UxpWebSocketBridge) {
           audio_tracks: { ...trackList, description: "Source audio track indexes to copy. Omit for every audio track; [] for none." },
           video_track_offset: { ...trackOffset, description: "Destination video track = source video track + this offset. Default 0." },
           audio_track_offset: { ...trackOffset, description: "Destination audio track = source audio track + this offset. Default 0." },
-          expected_snapshot: expectedSnapshotSchema,
+          expected_snapshot: toolSnapshotSchema,
           confirm_copy: { type: "boolean", description: "Must be true for action: apply." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: apply." },
         },

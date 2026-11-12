@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { getUxpCopyClipsWorkflowTools } from "../../src/tools/uxp-copy-clips-workflows.js";
 import type { UxpWebSocketBridge } from "../../src/bridge/uxp-websocket-bridge.js";
+import { createServer } from "../../src/server.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 
 const clip = {
   media_type: "video", source_track_index: 0, source_clip_index: 2, target_track_index: 1, name: "Camera.MXF", project_item_id: "cam",
@@ -111,6 +113,35 @@ describe("public clone-based copy-clips MCP tool", () => {
       confirm_copy: true, operation_id: "clash", expected_snapshot: { ...snapshot, projectGuid: "other" },
     })).rejects.toThrow("expected_snapshot.project_guid was given as both project_guid and projectGuid with different values");
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("lets the raw camelCase inspect result through the server's schema check", async () => {
+    const request = vi.fn().mockResolvedValue({ outcome: "verified" });
+    const bridge = { request, getState: vi.fn(() => ({ status: "listening", connected: true })) } as unknown as UxpWebSocketBridge;
+    const server = createServer({}, { uxpBridge: bridge });
+    const client = new Client({ name: "copy-clips-schema-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const call = (expected_snapshot: unknown) => client.callTool({ name: "copy_clips_between_sequences_uxp", arguments: {
+        action: "apply", source_sequence_id: "seq-backup", destination_sequence_id: "seq-segment",
+        source_start_ticks: "254016000000", source_end_ticks: "762048000000", destination_start_ticks: "2540160000000",
+        confirm_copy: true, operation_id: "via-server", expected_snapshot,
+      } });
+      const text = (result: Awaited<ReturnType<typeof call>>) => JSON.stringify(result.content);
+      for (const shape of [snapshot, panelSnapshot]) {
+        request.mockClear();
+        const result = await call(shape);
+        expect(text(result)).not.toContain("INVALID_ARGUMENT");
+        expect(request).toHaveBeenCalledWith("sequence.copyClips", expect.objectContaining({ expectedSnapshot: panelSnapshot }));
+      }
+      // Unknown fields are still refused before anything reaches the panel.
+      request.mockClear();
+      expect(text(await call({ ...panelSnapshot, bogus: 1 }))).toMatch(/bogus|unknown|INVALID_ARGUMENT/i);
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
   });
 
   it("maps a multicam cut list to program-track segments", async () => {
