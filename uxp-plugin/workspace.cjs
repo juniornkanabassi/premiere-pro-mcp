@@ -129,6 +129,7 @@
     const resolveCanonicalPath = deps && deps.resolveCanonicalPath;
     let rootEntry = null;
     let persistentToken = null;
+    let configuredRoot = false;
     let initialized = false;
 
     function nativePathFor(entry) {
@@ -204,6 +205,32 @@
       await writeConfiguration(token);
       rootEntry = entry;
       persistentToken = token;
+      configuredRoot = false;
+      initialized = true;
+      return status();
+    }
+
+    // The MCP server sends its approved root (PREMIERE_UXP_WORKSPACE_ROOT) after the handshake. It needs
+    // the manifest's "fullAccess" file permission, so no picker click is required. A folder the
+    // operator picked in the panel stays in force: the picker is the fallback, not a competitor.
+    async function configureRoot(value) {
+      if (persistentToken && rootEntry) return status();
+      if (!fs || typeof fs.getEntryWithUrl !== "function") {
+        throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "This UXP runtime cannot open a configured workspace folder; use Choose folder in the MCP panel");
+      }
+      const parsed = parseAbsolutePath(value, "configured workspace root");
+      if (parsed.depth < 1) {
+        throw workspaceError("UXP_WORKSPACE_TOO_BROAD", "Configure a project subfolder instead of a filesystem or share root");
+      }
+      let entry;
+      try { entry = await fs.getEntryWithUrl(toFileUrl(parsed.normalized)); } catch (_) {
+        throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "Premiere could not open the configured workspace folder. Check that it exists and that the panel manifest uses localFileSystem fullAccess");
+      }
+      if (!entry || !entry.isFolder || !nativePathFor(entry)) {
+        throw workspaceError("UXP_WORKSPACE_NOT_SELECTED", "The configured workspace root is not a folder");
+      }
+      rootEntry = entry;
+      configuredRoot = true;
       initialized = true;
       return status();
     }
@@ -211,6 +238,7 @@
     async function revoke() {
       rootEntry = null;
       persistentToken = null;
+      configuredRoot = false;
       initialized = true;
       await deleteConfiguration();
       return status();
@@ -223,7 +251,7 @@
     function status() {
       return {
         configured: !!rootEntry,
-        accessMode: "request",
+        accessMode: configuredRoot ? "configured" : "request",
         rootName: rootEntry && typeof rootEntry.name === "string" ? rootEntry.name : null,
         persistent: !!persistentToken,
         pathDisclosure: "redacted",
@@ -245,14 +273,14 @@
     async function resolveThroughGrantedFolder(candidatePath, options) {
       const label = options && options.label || "path";
       if (!canWalkGrantedFolder()) {
-        throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "Canonical path validation is not implemented in this build; use the CEP fallback for path-based workflows");
+        throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "The approved workspace folder cannot be walked on this host, so the path cannot be checked. Nothing was changed");
       }
       const rootPath = nativePathFor(rootEntry);
       const segments = relativeSegments(rootPath, candidatePath, label);
       let entry = rootEntry;
       for (let index = 0; index < segments.length; index += 1) {
         if (!entry || typeof entry.getEntry !== "function") {
-          throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "Canonical path validation is not implemented in this build; use the CEP fallback for path-based workflows");
+          throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "The approved workspace folder cannot be walked on this host, so the path cannot be checked. Nothing was changed");
         }
         try {
           entry = await entry.getEntry(segments[index]);
@@ -273,7 +301,7 @@
       const kind = options && options.kind || "file";
       const rootPath = nativePathFor(rootEntry);
       if (!rootEntry || !rootPath) {
-        throw workspaceError("UXP_WORKSPACE_REQUIRED", "Choose an approved workspace folder in the MCP for Adobe Premiere Pro panel before using " + label);
+        throw workspaceError("UXP_WORKSPACE_REQUIRED", "No workspace folder is approved for " + label + ". Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server, or click Choose folder in the MCP for Adobe Premiere Pro panel. Nothing was changed");
       }
       const candidate = parseAbsolutePath(value, label);
       const lexicallyContained = isContained(rootPath, candidate.normalized, kind === "directory");
@@ -336,7 +364,7 @@
       return !!(entry && !entry.isFolder);
     }
 
-    return { initialize, requestRoot, revoke, status, assertPathAllowed, fileExists };
+    return { initialize, requestRoot, configureRoot, revoke, status, assertPathAllowed, fileExists };
   }
 
   return { createWorkspaceBroker, createCanonicalPathResolver, parseAbsolutePath, isContained, validateLoopbackBridgeUrl, workspaceError };

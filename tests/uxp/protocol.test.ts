@@ -89,7 +89,7 @@ describe("UXP bridge protocol", () => {
   });
   it("routes the panel's frame export through the registry handler that checks the output file", () => {
     const panel = readFileSync(new URL("../../uxp-plugin/index.cjs", import.meta.url), "utf8");
-    expect(panel).toContain('return commandRegistry.dispatch("frame.export", args);');
+    expect(panel).toContain('return commandRegistry.dispatch("frame.export", args, meta);');
     expect(panel).not.toContain("exportSequenceFrame(");
     const commands = readFileSync(new URL("../../uxp-plugin/commands.cjs", import.meta.url), "utf8");
     expect(commands).toContain("const exporterFilename = Protocol.exporterFrameName(filename);");

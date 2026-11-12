@@ -239,7 +239,7 @@ describe("UXP command registry", () => {
         "sequence.createPreset": {
           supported: false,
           workspaceRequired: true,
-          reason: "canonical path validation is not implemented in this build; use the CEP fallback for path-based workflows",
+          reason: expect.stringContaining("cannot be walked on this host"),
         },
       },
     });
@@ -1362,5 +1362,39 @@ describe("UXP transition argument validation", () => {
     expect(() => Commands.validateAddArgs({ videoTrackIndex: 0, clipIndex: 0, matchName: "CrossDissolve", expectedTarget: expectedTransition("end", true) })).not.toThrow();
     expect(() => Commands.validateAddArgs({ videoTrackIndex: -1, clipIndex: 0, matchName: "CrossDissolve", expectedTarget: expectedTransition("end", true) })).toThrow("videoTrackIndex");
     expect(() => Commands.validateAddArgs({ videoTrackIndex: 0, clipIndex: 0, matchName: "CrossDissolve", expectedTarget: expectedTransition("end", true), surprise: true })).toThrow("Unknown argument");
+  });
+});
+
+describe("batch A: workspace discovery and harmless-failure fence (items 3, 10)", () => {
+  it("tells the operator how to approve a workspace instead of blaming the build", async () => {
+    const value = host();
+    const registry = Commands.createCommandRegistry({
+      ppro: value.ppro, Protocol,
+      workspace: { status: () => ({ configured: false, canonicalPathValidation: "unavailable" }), assertPathAllowed: (path: string) => path },
+    });
+    const capabilities = await registry.capabilities();
+    expect(capabilities.commands["frame.export"]).toMatchObject({ supported: false, workspaceRequired: true });
+    expect(capabilities.commands["frame.export"].reason).toContain("PREMIERE_UXP_WORKSPACE_ROOT");
+    expect(capabilities.commands["frame.export"].reason).toContain("Choose folder");
+    expect(capabilities.commands["frame.export"].reason).not.toMatch(/not implemented|CEP/);
+  });
+
+  it("tags an unknown argument as a no-write refusal and leaves no recovery fence", async () => {
+    const value = host();
+    const error = await value.registry.dispatch("sequence.playhead.set", { surprise: true, operationId: "bad-args" }).catch((e: Error) => e);
+    expect(error).toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false, operations: [] });
+  });
+
+  it("tags a path refused by the workspace guard as no-write", async () => {
+    const value = host();
+    const outside = Object.assign(new Error("outputDirectory must stay inside the approved workspace folder"), { code: "UXP_PATH_OUTSIDE_WORKSPACE" });
+    const registry = Commands.createCommandRegistry({
+      ppro: value.ppro, Protocol,
+      workspace: { status: () => ({ configured: true, canonicalPathValidation: "available" }), assertPathAllowed: async () => { throw outside; } },
+    });
+    await expect(registry.dispatch("frame.export", { outputDirectory: "/elsewhere", filename: "f.png" }))
+      .rejects.toMatchObject({ code: "UXP_PATH_OUTSIDE_WORKSPACE", noHostWrite: true });
+    await expect(registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
   });
 });

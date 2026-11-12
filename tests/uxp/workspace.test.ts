@@ -102,7 +102,7 @@ describe("least-privilege UXP workspace broker", () => {
     await expect(unavailable.assertPathAllowed("D:/Projects/Film/media.mov", { label: "media", kind: "file" }))
       .rejects.toMatchObject({
         code: "UXP_CANONICAL_PATH_UNAVAILABLE",
-        message: expect.stringContaining("not implemented in this build"),
+        message: expect.stringContaining("cannot be walked on this host"),
       });
   });
 

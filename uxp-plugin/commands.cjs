@@ -253,9 +253,25 @@
       // A typed code alone cannot prove that a handler did not already write.
       return !!(error && error.noHostDispatch === true && error.dispatchEvidence === "panel_pre_dispatch");
     }
-    async function dispatch(command, args) {
+    // Shared contract 13: the server pins the sequence outside args. Re-activate and read back before
+    // the handler runs; refuse with noHostWrite if the pinned sequence cannot be made active.
+    async function enforceSequencePin(pinnedSequenceId) {
+      const project = await ppro.Project.getActiveProject();
+      const guidOf = (sequence) => { try { return sequence && sequence.guid != null ? String(sequence.guid.toString()) : ""; } catch (_) { return ""; } };
+      const active = project && await project.getActiveSequence();
+      if (guidOf(active) === pinnedSequenceId) return;
+      const target = project && Array.from(await project.getSequences() || []).find((sequence) => guidOf(sequence) === pinnedSequenceId);
+      if (!target) throw refuse("UXP_PINNED_SEQUENCE_MISSING", "The pinned sequence is not in the active project; call sequences.activate on the sequence you want to edit. Nothing was changed");
+      try {
+        if (typeof project.openSequence === "function") await project.openSequence(target);
+        if (typeof project.setActiveSequence === "function") await project.setActiveSequence(target);
+      } catch (_) { /* the readback below decides */ }
+      const after = await project.getActiveSequence();
+      if (guidOf(after) !== pinnedSequenceId) throw refuse("UXP_PIN_MISMATCH", "Premiere would not re-activate the pinned sequence (active is " + (guidOf(after) || "unknown") + "). Nothing was changed");
+    }
+    async function dispatch(command, args, meta) {
       const invocation = { handlerEntered: false };
-      try { return await dispatchInvocation(command, args, invocation); }
+      try { return await dispatchInvocation(command, args, invocation, meta || {}); }
       catch (error) {
         if (!invocation.handlerEntered && error && typeof error === "object") {
           error.noHostDispatch = true;
@@ -264,7 +280,7 @@
         throw error;
       }
     }
-    async function dispatchInvocation(command, args, invocation) {
+    async function dispatchInvocation(command, args, invocation, meta) {
       const definition = definitions[command];
       if (!definition) throw commandError("UXP_UNSUPPORTED_COMMAND", "Unsupported UXP command: " + command);
       if (definition.probe && !await definition.probe()) throw commandError("UXP_COMMAND_UNAVAILABLE", command + " is not supported by this Premiere build");
@@ -272,6 +288,7 @@
       const operationId = validateOperationId(input.operationId);
       if (definition.readOnly) return definition.handler(input);
       if (!invocationSession || !operationLedger.secureIdentityAvailable) throw commandError("UXP_SECURE_IDENTITY_UNAVAILABLE", "Documented UXP cryptographic entropy is unavailable; no host mutation was dispatched. Run the matching panel in a supported Premiere host");
+      if (typeof meta.pinnedSequenceId === "string" && meta.pinnedSequenceId) await enforceSequencePin(meta.pinnedSequenceId);
       const identity = await operationIdentity(false);
       const operationKey = operationId || "anonymous:" + operationLedger.sessionId + ":" + invocationSession + ":" + (++anonymousOperation);
       const binding = operationLedger.bind(command, input, identity);
@@ -296,7 +313,9 @@
           if (completedOperations.size > 256) completedOperations.delete(completedOperations.keys().next().value);
           return envelope;
         } catch (error) {
-          if (provenPreflightRefusal(error)) operationLedger.releasePreflight(operationKey);
+          // noHostWrite is set only on refusals thrown before the handler's first host write (shared contract 1).
+          // A command marked nonFencing (a selection-only change) never needs recovery review.
+          if (provenPreflightRefusal(error) || (error && error.noHostWrite === true) || definition.nonFencing === true) operationLedger.releasePreflight(operationKey);
           else operationLedger.unknown(operationKey);
           throw error;
         }
@@ -337,7 +356,10 @@
         if (!apiSupported) commands[name].reason = "Required Premiere UXP API is unavailable in this host";
         else if (!secureIdentitySupported) commands[name].reason = "Documented UXP cryptographic entropy is unavailable; mutations are disabled";
         else if (!replaySupported) commands[name].reason = "Persistent operation storage is unavailable; mutations are disabled";
-        else if (!pathValidationSupported) commands[name].reason = "canonical path validation is not implemented in this build; use the CEP fallback for path-based workflows";
+        else if (!pathValidationSupported) commands[name].reason = workspaceState.configured
+          ? "The approved workspace folder cannot be walked on this host, so paths cannot be checked. Re-select it with Choose folder in the MCP panel"
+          : "No workspace folder is approved. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server and reconnect (the panel manifest uses fullAccess), or click Choose folder in the MCP panel and pick a folder that contains the paths you will use";
+        if (definition.nonFencing === true) commands[name].nonFencing = true;
       }
       return {
         backend: "uxp", protocolVersion: Protocol.PROTOCOL_VERSION, commandSchemaVersion: Protocol.COMMAND_SCHEMA_VERSION, receiptVersion: Protocol.RECEIPT_VERSION, operationSessionId: operationLedger.sessionId, replayPersistence: operationLedger.durable ? "durable_hashed_tombstones" : "memory_only", hostMinVersion: "25.6.0",
@@ -1823,10 +1845,13 @@
       return Protocol && typeof Protocol.operationSemantics === "function" ? Protocol.operationSemantics(options) : undefined;
     }
     async function allowedPath(value, label, kind) {
-      const path = requiredString(value, label);
-      return workspace && typeof workspace.assertPathAllowed === "function"
-        ? await workspace.assertPathAllowed(path, { label, kind })
-        : path;
+      // Every call site resolves its path before the host write, so a refusal here wrote nothing.
+      try {
+        const path = requiredString(value, label);
+        return workspace && typeof workspace.assertPathAllowed === "function"
+          ? await workspace.assertPathAllowed(path, { label, kind })
+          : path;
+      } catch (error) { if (error && typeof error === "object") error.noHostWrite = true; throw error; }
     }
     function canExportFrame() { return !!(ppro.Exporter && typeof ppro.Exporter.exportSequenceFrame === "function"); }
     function canLiftSelection() {
@@ -2129,8 +2154,8 @@
   }
   function targetArgs(args) { return { videoTrackIndex: nonNegativeInt(args.videoTrackIndex, "videoTrackIndex"), clipIndex: nonNegativeInt(args.clipIndex, "clipIndex") }; }
   function optionalPosition(value) { const result = value == null ? "end" : value; if (result !== "start" && result !== "end") throw commandError("UXP_INVALID_ARGUMENT", "position must be start or end"); return result; }
-  function assertObject(value) { if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", "args must be an object"); }
-  function assertOnlyKeys(value, allowed) { const unknown = Object.keys(value).filter((key) => !allowed.includes(key)); if (unknown.length) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]); }
+  function assertObject(value) { if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", "args must be an object"); }
+  function assertOnlyKeys(value, allowed) { const unknown = Object.keys(value).filter((key) => !allowed.includes(key)); if (unknown.length) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]); }
   function nonNegativeInt(value, name) { if (!Number.isInteger(value) || value < 0) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-negative integer"); return value; }
   function nonNegativeNumber(value, name) { const number = Number(value); if (!Number.isFinite(number) || number < 0) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-negative number"); return number; }
   function boundedTransitionSeconds(value, name) { const number = nonNegativeNumber(value, name); if (number > 86400) throw commandError("UXP_INVALID_ARGUMENT", name + " must be at most 86400"); return number; }
@@ -2142,10 +2167,12 @@
   function requiredBoolean(value, name) { if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
   function optionalBoolean(value, fallback, name) { return value == null ? fallback : requiredBoolean(value, name); }
   function oneOfInt(value, name, allowed) { if (!Number.isInteger(value) || !allowed.includes(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
-  function requireConfirmation(value, message) { if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
-  function requiredOperationId(value) { if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters"); return value; }
-  function validateOperationId(value) { if (value == null) return null; if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw commandError("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters"); return value; }
+  function requireConfirmation(value, message) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
+  function requiredOperationId(value) { if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters"); return value; }
+  function validateOperationId(value) { if (value == null) return null; if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters"); return value; }
   function simpleRevision(value) { var hash = 2166136261; for (var i = 0; i < value.length; i += 1) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 16777619); } return "uxp-" + (hash >>> 0).toString(16); }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
+  // A refusal thrown before the handler's first host write. Tag only where call order proves no write ran.
+  function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
   return { createCommandRegistry, validateAddArgs, validateRemoveArgs, validateInspectTransitionArgs, commandError };
 });

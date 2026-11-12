@@ -90,6 +90,20 @@ describe("UXP MCP tools", () => {
     expect(result.data.capabilities.commands["frame.export"]).toEqual({ supported: true });
   });
 
+  it("surfaces workspace.configured at the top of the capabilities result (item 3)", async () => {
+    const workspace = { configured: false, accessMode: "request", canonicalPathValidation: "unavailable" };
+    const bridge = {
+      request: vi.fn(),
+      getState: vi.fn(() => ({ status: "connected", connected: true, protocolVersion: 2, connectedAt: "t", capabilities: { backend: "uxp", protocolVersion: 2, commands: {}, workspace } })),
+      refreshCapabilities: vi.fn(async () => null),
+    } as unknown as UxpWebSocketBridge;
+    const tools = getUxpTools(bridge);
+    const result = await tools.get_uxp_capabilities.handler() as any;
+    expect(result.data.workspace).toEqual(workspace);
+    expect(tools.export_frame_uxp.description).toContain("PREMIERE_UXP_WORKSPACE_ROOT");
+    expect(tools.inspect_caption_tracks_uxp.description).toContain("not possible through UXP on Premiere 27.0");
+  });
+
   it("maps verified project and interchange workflows to versioned UXP commands", async () => {
     const request = vi.fn().mockResolvedValue({ outcome: "verified" });
     const bridge = { request, getState: vi.fn() } as unknown as UxpWebSocketBridge;

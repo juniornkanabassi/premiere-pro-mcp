@@ -4,6 +4,7 @@ import { assertInvocationNotCancelled, currentInvocation, markHostDispatch, meas
 import { getTempDir, withBridgeWorkflow, type BridgeOptions } from "./file-bridge.js";
 import { inspectHostRecovery, markHostRecovery } from "./host-lease.js";
 import { EventEmitter } from "node:events";
+import { isAbsolute, parse } from "node:path";
 import { createServer, type Server } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { assertNoSymlinkedPaths, SymlinkPathError } from "../security/path-guard.js";
@@ -22,6 +23,8 @@ export interface UxpBridgeOptions {
   requestTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   tempDir?: string;
+  /** Approved workspace root sent to the panel after the handshake. Defaults to PREMIERE_UXP_WORKSPACE_ROOT. */
+  workspaceRoot?: string;
 }
 
 export interface UxpCapability {
@@ -54,6 +57,8 @@ export type UxpConnectionState =
 interface PendingRequest {
   command: string;
   mutating?: boolean;
+  /** Whether the invocation had already dispatched a write before this request. */
+  priorDispatched?: boolean;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -89,7 +94,9 @@ function validPort(value: number): number {
  * CEP after a UXP command has been sent.
  */
 export class UxpWebSocketBridge extends EventEmitter {
-  private readonly options: Required<Omit<UxpBridgeOptions, "tempDir">>;
+  private readonly options: Required<Omit<UxpBridgeOptions, "tempDir" | "workspaceRoot">>;
+  private readonly workspaceRoot: string | null;
+  private pinnedSequenceId: string | null = null;
   private readonly hostBridgeOptions: BridgeOptions;
   private httpServer: Server | null = null;
   private wsServer: WebSocketServer | null = null;
@@ -112,6 +119,10 @@ export class UxpWebSocketBridge extends EventEmitter {
     try { markHostRecovery(getTempDir(this.hostBridgeOptions), "unknown_command_outcome"); } catch { /* retained owner lease prevents another cooperating writer */ }
   }
 
+  /** The sequence every later mutating request must run on (null clears it). The panel re-activates and verifies before each. */
+  pinSequence(sequenceId: string | null): void { this.pinnedSequenceId = sequenceId || null; }
+  getPinnedSequence(): string | null { return this.pinnedSequenceId; }
+
   acknowledgeOperationRecovery(expectedRevision: string, reviewed: boolean): void {
     if (reviewed !== true || expectedRevision !== this.getOperationRecovery().recoveryRevision) throw new UxpBridgeError("UXP_STALE_RECOVERY", "Transport recovery revision changed; inspect current host state again");
     this.uncertainOperations.clear();
@@ -124,6 +135,13 @@ export class UxpWebSocketBridge extends EventEmitter {
     if (!token || token.length < 16) {
       throw new Error("PREMIERE_UXP_TOKEN must contain at least 16 characters");
     }
+    const workspaceRoot = (options.workspaceRoot ?? process.env.PREMIERE_UXP_WORKSPACE_ROOT)?.trim();
+    // Same shape as the panel guard: absolute, and never a filesystem root.
+    const trimmedRoot = workspaceRoot?.replace(/[\\/]+$/, "");
+    if (workspaceRoot && (!isAbsolute(workspaceRoot) || !trimmedRoot || trimmedRoot === parse(workspaceRoot).root.replace(/[\\/]+$/, ""))) {
+      throw new Error("PREMIERE_UXP_WORKSPACE_ROOT must be an absolute project folder, not a filesystem root");
+    }
+    this.workspaceRoot = workspaceRoot || null;
     this.hostBridgeOptions = { tempDir: options.tempDir ?? getTempDir() };
     this.options = {
       token,
@@ -254,13 +272,16 @@ export class UxpWebSocketBridge extends EventEmitter {
       throw new UxpBridgeError("UXP_NOT_CONNECTED", "Premiere UXP connection changed during capability refresh");
     }
     if (hello.commands[command]?.supported !== true) {
+      // The panel's own reason (for example "no workspace folder is approved") is the useful part.
+      const reason = hello.commands[command]?.reason;
       throw new UxpBridgeError(
         "UXP_COMMAND_UNSUPPORTED",
-        `Connected Premiere host does not support UXP command '${command}'`,
+        `Connected Premiere host does not support UXP command '${command}'${typeof reason === "string" && reason ? `. ${reason}` : ""}`,
       );
     }
 
-    const mutating = hello.commands[command]?.readOnly !== true && !/^(?:capabilities\.get|state\.get|operations\.recovery\.|operation\.cancel)/.test(command);
+    // A nonFencing command (a selection-only change) never needs recovery review.
+    const mutating = hello.commands[command]?.readOnly !== true && hello.commands[command]?.nonFencing !== true && !/^(?:capabilities\.get|state\.get|operations\.recovery\.|operation\.cancel)/.test(command);
     if (mutating && inspectHostRecovery(getTempDir(this.hostBridgeOptions)).recoveryRequired) throw new UxpBridgeError("UXP_RECOVERY_REQUIRED", "Shared Premiere execution state is uncertain; inspect operation recovery before another backend writes");
     if (mutating && this.uncertainOperations.size > 0) throw new UxpBridgeError("UXP_RECOVERY_REQUIRED", "An earlier UXP reply was lost; inspect operation recovery and current host state before another mutation");
     if (mutating && (hello.commandSchemaVersion !== UXP_COMMAND_SCHEMA_VERSION || hello.receiptVersion !== UXP_RECEIPT_VERSION)) throw new UxpBridgeError("UXP_SCHEMA_INCOMPATIBLE", "Panel command/receipt schema is absent or incompatible; install the matching panel before editing");
@@ -281,6 +302,8 @@ export class UxpWebSocketBridge extends EventEmitter {
     }
     const requestTimeoutMs = Math.max(this.options.requestTimeoutMs, minimumTimeoutMs);
     const requestId = randomUUID();
+    // The pin rides beside args, so no handler's argument check changes. Sequence commands choose their own target.
+    const pin = hello.commands[command]?.readOnly !== true && !/^(?:capabilities\.get|state\.get|operations\.recovery\.|operation\.cancel|sequences\.)/.test(command) ? this.pinnedSequenceId : null;
     const frame = JSON.stringify({
       protocolVersion: hello.protocolVersion,
       type: "command",
@@ -288,7 +311,9 @@ export class UxpWebSocketBridge extends EventEmitter {
       requestId,
       command,
       args,
+      ...(pin ? { pinnedSequenceId: pin } : {}),
     });
+    const priorDispatched = currentInvocation()?.dispatched === true;
     // The panel drops frames over 64 KiB before it can read the requestId, so an
     // oversized command would only surface as a timeout. Refuse it here instead.
     if (Buffer.byteLength(frame, "utf8") > MAX_UXP_COMMAND_BYTES) {
@@ -304,7 +329,7 @@ export class UxpWebSocketBridge extends EventEmitter {
         if (mutating) this.recordUncertain(requestId, command);
         reject(new UxpBridgeError("UXP_TIMEOUT", `UXP command '${command}' timed out`));
       }, requestTimeoutMs);
-      this.pending.set(requestId, { command, mutating, resolve, reject, timer, context: currentInvocation() });
+      this.pending.set(requestId, { command, mutating, priorDispatched, resolve, reject, timer, context: currentInvocation() });
       const sendFailed = (error?: Error) => {
         if (!error) return;
         const pending = this.pending.get(requestId);
@@ -347,6 +372,7 @@ export class UxpWebSocketBridge extends EventEmitter {
     this.socket = client;
     this.hello = null;
     this.connectedAt = null;
+    this.pinnedSequenceId = null;
     this.handshakeTimer = setTimeout(() => {
       client.close(1008, "Versioned hello required");
     }, this.options.handshakeTimeoutMs);
@@ -388,6 +414,9 @@ export class UxpWebSocketBridge extends EventEmitter {
       this.handshakeTimer = null;
       this.hello = hello as UxpHello;
       this.connectedAt = new Date().toISOString();
+      // Approved workspace root from server configuration, so no picker click is needed. The panel
+      // still applies its own path guard and refuses paths outside it.
+      if (this.workspaceRoot) client.send(JSON.stringify({ protocolVersion: this.hello.protocolVersion, type: "config", payload: { workspaceRoot: this.workspaceRoot } }));
       this.emit("connected", this.getState());
       return;
     }
@@ -409,16 +438,29 @@ export class UxpWebSocketBridge extends EventEmitter {
     if (message.payload?.ok === true) {
       const result = message.payload.result;
       if (pending.mutating && (result?.recoveryRequired === true || result?.outcome === "unknown" || result?.mutationOutcome === "unknown")) this.recordUncertain(message.requestId, pending.command);
+      this.learnPin(pending.command, result);
       pending.resolve(message.payload.result);
     } else {
       const error = message.payload?.error;
-      if (pending.mutating && !(error?.noHostDispatch === true && error?.dispatchEvidence === "panel_pre_dispatch")) this.recordUncertain(message.requestId, pending.command);
+      const noHostWrite = error?.noHostWrite === true && error?.dispatchEvidence === "handler_pre_write";
+      if (pending.mutating && !noHostWrite && !(error?.noHostDispatch === true && error?.dispatchEvidence === "panel_pre_dispatch")) this.recordUncertain(message.requestId, pending.command);
+      // A refusal that provably wrote nothing must not leave the invocation marked as dispatched,
+      // or the server would fence the next write as "unknown". Keep any earlier dispatch in the same call.
+      if (noHostWrite && pending.context && pending.priorDispatched === false) pending.context.dispatched = false;
       pending.reject(new UxpBridgeError(
         error?.code ?? "UXP_COMMAND_FAILED",
         error?.message ?? `UXP command '${pending.command}' failed`,
       ));
     }
     }, pending.context);
+  }
+
+  /** Pin the sequence after a verified activate; forget it once that sequence is closed or deleted. */
+  private learnPin(command: string, result: any): void {
+    const id = typeof result?.sequence?.id === "string" ? result.sequence.id : null;
+    if (!id) return;
+    if (command === "sequences.activate" && result?.outcome === "verified") this.pinnedSequenceId = id;
+    else if ((command === "sequences.close" || command === "sequences.delete") && this.pinnedSequenceId === id) this.pinnedSequenceId = null;
   }
 
   private clearConnection(error: Error): void {

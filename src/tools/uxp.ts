@@ -110,7 +110,9 @@ export function getUxpTools(bridge: UxpWebSocketBridge) {
             // Fall back to the handshake report below.
           }
         }
-        return { success: true, data: { ...bridge.getState(), capabilitiesSource } };
+        const state = bridge.getState();
+        // Path-based commands (frame export, imports, encoder) stay unsupported until a workspace root is approved.
+        return { success: true, data: { ...state, capabilitiesSource, ...(state.connected ? { workspace: state.capabilities?.workspace ?? null } : {}) } };
       },
     },
     get_uxp_state: {
@@ -229,7 +231,7 @@ export function getUxpTools(bridge: UxpWebSocketBridge) {
       handler: async (args: { sequence_guid: string }) => invoke(bridge, "sequence.timingByGuid.inspect", { sequenceGuid: args.sequence_guid }),
     },
     inspect_caption_tracks_uxp: {
-      description: "Inventory native caption tracks on the active sequence through documented Premiere UXP APIs. Returns track identity, name, mute state, and item count only; it does not inspect cue text, timing, rendered appearance, or caption correctness.",
+      description: "Inventory native caption tracks on the active sequence through documented Premiere UXP APIs. Returns track identity, name, mute state, and item count only; it does not inspect cue text, timing, rendered appearance, or caption correctness. Caption track creation is not possible through UXP on Premiere 27.0 (an imported .srt placed in a sequence leaves the caption track count at 0); create captions with Premiere's Captions panel, or use burned-in text clips or a transcript import instead.",
       parameters: {},
       operationalCapability: {
         backend: "UXP" as const,
@@ -1060,7 +1062,7 @@ export function getUxpTools(bridge: UxpWebSocketBridge) {
       }),
     },
     export_frame_uxp: {
-      description: "Export a sequence frame through Premiere's supported UXP Exporter, then check in the host panel that the PNG exists. Returns outcome verified when a new file is found, committed_unverified when UXP storage cannot check or the file already existed, and fails when no file was written.",
+      description: "Export a sequence frame through Premiere's supported UXP Exporter, then check in the host panel that the PNG exists. Returns outcome verified when a new file is found, committed_unverified when UXP storage cannot check or the file already existed, and fails when no file was written. output_directory must be inside the approved workspace root (PREMIERE_UXP_WORKSPACE_ROOT on the MCP server, or the folder chosen in the panel); get_uxp_capabilities reports workspace.configured.",
       parameters: {
         type: "object" as const,
         properties: {

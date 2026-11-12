@@ -199,8 +199,66 @@ describe("registry transport fault behavior", () => {
     await expect(restored.registry.dispatch("test.mutate", { operationId: "new", value: 2 })).rejects.toMatchObject({ code: "UXP_OPERATION_CONSUMED" });
     expect(restored.mutation).toHaveBeenCalledTimes(257);
   });
+  it("releases the reservation when a handler refuses with noHostWrite, and lets the same ID retry", async () => {
+    const value = host();
+    value.mutation.mockImplementationOnce(async () => { throw Object.assign(new Error("Unknown argument: x"), { code: "UXP_INVALID_ARGUMENT", noHostWrite: true }); });
+    await expect(value.registry.dispatch("test.mutate", { operationId: "refused" })).rejects.toMatchObject({ noHostWrite: true });
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+    await expect(value.registry.dispatch("test.mutate", { operationId: "refused", value: 3 })).resolves.toMatchObject({ value: 3 });
+  });
+  it("still fences a handler that wrote and then threw, even with a typed code", async () => {
+    const value = host();
+    value.mutation.mockImplementationOnce(async () => { throw Object.assign(new Error("failed after executeTransaction"), { code: "UXP_VERIFICATION_FAILED" }); });
+    await expect(value.registry.dispatch("test.mutate", { operationId: "wrote" })).rejects.toThrow(/after executeTransaction/);
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true });
+  });
+  it("never fences a nonFencing command (selection-only change), whatever it throws", async () => {
+    const mutation = vi.fn(async () => { throw new Error("selection rejected"); });
+    const sequence = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const project = { guid: "project-1", getActiveSequence: async () => sequence };
+    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project } }, Protocol, Workflows: { createWorkflowDefinitions: () => ({ "test.select": { nonFencing: true, handler: mutation } }) } });
+    await expect(registry.dispatch("test.select", {})).rejects.toThrow(/selection rejected/);
+    await expect(registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+    expect((await registry.capabilities()).commands["test.select"]).toMatchObject({ nonFencing: true });
+  });
   it("fails incompatible command and receipt schemas before dispatch", () => {
     for (const field of ["commandSchemaVersion", "receiptVersion"]) expect(() => Protocol.parseCommand({ protocolVersion: 2, type: "command", command: "test.mutate", [field]: 99 })).toThrow(/matching MCP panel/);
     expect(Protocol.parseCommand({ protocolVersion: 2, type: "command", command: "test.mutate", commandSchemaVersion: 1, receiptVersion: 1 }).command).toBe("test.mutate");
+  });
+});
+describe("sequence pin (item 13)", () => {
+  function pinHost(activeGuid: string, activates = true) {
+    const first = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const second = { guid: "sequence-2", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    let active = activeGuid === "sequence-1" ? first : second;
+    const setActiveSequence = vi.fn(async (sequence: typeof first) => { if (activates) active = sequence; return true; });
+    const project = { guid: "project-1", getActiveSequence: async () => active, getSequences: async () => [first, second], openSequence: vi.fn(async () => true), setActiveSequence };
+    const mutation = vi.fn(async () => ({ outcome: "verified" }));
+    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project } }, Protocol, Workflows: { createWorkflowDefinitions: () => ({ "test.mutate": { handler: mutation }, "test.read": { readOnly: true, handler: async () => ({}) } }) } });
+    return { registry, setActiveSequence, mutation, first };
+  }
+  it("re-activates the pinned sequence and verifies it before the handler runs", async () => {
+    const value = pinHost("sequence-2");
+    await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" })).resolves.toMatchObject({ outcome: "verified" });
+    expect(value.setActiveSequence).toHaveBeenCalledWith(value.first);
+    expect(value.mutation).toHaveBeenCalledOnce();
+  });
+  it("leaves Premiere alone when the pinned sequence is already active, and for reads", async () => {
+    const value = pinHost("sequence-1");
+    await value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" });
+    const other = pinHost("sequence-2");
+    await other.registry.dispatch("test.read", {}, { pinnedSequenceId: "sequence-1" });
+    expect(value.setActiveSequence).not.toHaveBeenCalled();
+    expect(other.setActiveSequence).not.toHaveBeenCalled();
+  });
+  it("refuses with noHostWrite and never runs the handler when the pin will not activate", async () => {
+    const value = pinHost("sequence-2", false);
+    await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" })).rejects.toMatchObject({ code: "UXP_PIN_MISMATCH", noHostWrite: true });
+    expect(value.mutation).not.toHaveBeenCalled();
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+  });
+  it("refuses when the pinned sequence is not in the active project", async () => {
+    const value = pinHost("sequence-1");
+    await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "gone" })).rejects.toMatchObject({ code: "UXP_PINNED_SEQUENCE_MISSING", noHostWrite: true });
   });
 });

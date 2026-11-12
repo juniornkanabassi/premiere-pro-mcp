@@ -114,7 +114,7 @@ async function capabilities() {
       verification: "bounded exact transcript-export SHA-256 readback"
     },
     "captions.inspect": { supported: supportedHost, readOnly: true, minVersion: "25.6.0" },
-    "captions.create": { supported: false, reason: "No documented Premiere UXP caption creation API." },
+    "captions.create": { supported: false, reason: "Caption track creation is not possible through UXP on Premiere 27.0: an imported .srt placed in a sequence (overwrite or insert) leaves the caption track count at 0, and Sequence has no caption track creator. Alternatives: (1) create or import captions in Premiere's Captions panel and use captions.inspect afterwards; (2) burned-in captions as text or MOGRT clips on a top video track; (3) import a transcript onto the clip with transcript.import, then click Create captions in Premiere." },
     "captions.update": { supported: false, reason: "No documented Premiere UXP caption text/timing mutation API." },
     "captions.delete": { supported: false, reason: "No documented Premiere UXP caption deletion API." }
   });
@@ -264,6 +264,12 @@ async function inspectCaptions() {
   return { sequenceId: String(sequence.guid), sequenceName: sequence.name, trackCount: count, tracks };
 }
 
+// Host GUIDs are objects that JSON-serialise to {}; send their string form.
+function idString(value) {
+  if (value == null) return null;
+  try { return typeof value.toString === "function" ? String(value.toString()) : String(value); } catch (_) { return null; }
+}
+
 async function stateSnapshot() {
   const project = await ppro.Project.getActiveProject();
   const sequence = project && await project.getActiveSequence();
@@ -271,21 +277,30 @@ async function stateSnapshot() {
   return {
     revision: stateRevision,
     projectOpen: !!project,
-    project: project ? { id: project.guid || null, name: project.name || null, path: project.path || null } : null,
+    project: project ? { id: idString(project.guid), name: project.name || null, path: project.path || null } : null,
     sequenceOpen: !!sequence,
-    sequence: sequence ? { id: sequence.guid || null, name: sequence.name || null } : null,
+    sequence: sequence ? { id: idString(sequence.guid), name: sequence.name || null } : null,
     playheadSeconds: position ? position.seconds : null
   };
 }
 
-async function exportFrame(args, operation) {
+async function exportFrame(args, operation, meta) {
   assertNotCancelled(operation);
   publishOperation("progress", operation, { phase: "preflight", progress: 0.1 });
   assertNotCancelled(operation);
   operation.phase = "host_call";
   publishOperation("progress", operation, { phase: "host_call", progress: 0.4, cancellable: false });
   // The registry handler exports and then checks that the PNG exists on disk.
-  return commandRegistry.dispatch("frame.export", args);
+  return commandRegistry.dispatch("frame.export", args, meta);
+}
+
+// The sequence pin travels beside args (shared contract 13), which Protocol.parseCommand does not keep.
+function pinnedSequenceIdOf(raw) {
+  try {
+    const value = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const pin = value && value.pinnedSequenceId;
+    return typeof pin === "string" && pin.length > 0 && pin.length <= 512 ? pin : null;
+  } catch (_) { return null; }
 }
 
 async function dispatch(raw) {
@@ -303,7 +318,7 @@ async function dispatch(raw) {
     let result;
     if (cmd.command === "capabilities.get") result = await capabilities();
     else if (cmd.command === "state.get") result = await stateSnapshot();
-    else if (cmd.command === "frame.export") result = await exportFrame(cmd.args, operation);
+    else if (cmd.command === "frame.export") result = await exportFrame(cmd.args, operation, { pinnedSequenceId: pinnedSequenceIdOf(raw) });
     else if (cmd.command === "transcript.export") result = await exportTranscript(cmd.args);
     else if (cmd.command === "transcript.search") result = await searchTranscript(cmd.args);
     else if (cmd.command === "transcript.has") result = await hasTranscript(cmd.args);
@@ -311,7 +326,7 @@ async function dispatch(raw) {
     else {
       assertNotCancelled(operation);
       operation.phase = "host_call";
-      result = await commandRegistry.dispatch(cmd.command, cmd.args);
+      result = await commandRegistry.dispatch(cmd.command, cmd.args, { pinnedSequenceId: pinnedSequenceIdOf(raw) });
     }
     const response = Protocol.envelope("result", {
       ok: true,
@@ -360,7 +375,8 @@ async function dispatch(raw) {
       error: {
         code: errorCode,
         message: error.message || String(error),
-        ...(error.noHostDispatch === true && error.dispatchEvidence === "panel_pre_dispatch" ? { noHostDispatch: true, dispatchEvidence: "panel_pre_dispatch" } : {}),
+        ...(error.noHostDispatch === true && error.dispatchEvidence === "panel_pre_dispatch" ? { noHostDispatch: true, dispatchEvidence: "panel_pre_dispatch" }
+          : error.noHostWrite === true ? { noHostWrite: true, dispatchEvidence: "handler_pre_write" } : {}),
         operation: Protocol.operationSemantics({ cancellationSupported: true })
       }
     }, cmd && cmd.requestId));
@@ -390,9 +406,24 @@ function connect() {
     send(Protocol.envelope("hello", await capabilities()));
     publishState("connected");
   };
-  socket.onmessage = (event) => dispatch(event.data);
+  socket.onmessage = (event) => { if (!applyServerConfig(event.data)) dispatch(event.data); };
   socket.onerror = () => setStatus("Bridge connection error");
   socket.onclose = () => { void commandRegistry.dispose(); scheduleReconnect("Disconnected"); };
+}
+// After the handshake the server may send its approved workspace root (PREMIERE_UXP_WORKSPACE_ROOT).
+// Returns true when the frame was a config frame. The root is applied through the same path guard as a picked folder.
+function applyServerConfig(raw) {
+  if (typeof raw !== "string" || raw.indexOf('"config"') === -1) return false;
+  let frame;
+  try { frame = JSON.parse(raw); } catch (_) { return false; }
+  if (!frame || frame.type !== "config") return false;
+  const root = frame.payload && frame.payload.workspaceRoot;
+  if (typeof root === "string" && root) {
+    workspaceBroker.configureRoot(root)
+      .then(() => { renderWorkspaceStatus(); setStatus("Workspace root set by the MCP server"); })
+      .catch((error) => setStatus(error.message || String(error)));
+  }
+  return true;
 }
 function scheduleReconnect(message) { setStatus(message + "; retrying in 2s"); reconnectTimer = setTimeout(connect, 2000); }
 function send(value) { if (socket && socket.readyState === WebSocket.OPEN) socket.send(Protocol.serializeEnvelope(value)); }
@@ -583,6 +614,6 @@ async function revokeWorkspace() {
 function renderWorkspaceStatus() {
   const element = document.getElementById("workspace-status"), value = workspaceBroker.status();
   if (element) element.textContent = value.configured
-    ? "Approved folder: " + value.rootName + "\nPersistent access: yes\nNative path: redacted\nCanonical path validation: " + value.canonicalPathValidation
-    : "No approved workspace folder";
+    ? "Approved folder: " + value.rootName + (value.accessMode === "configured" ? " (set by the MCP server)" : "") + "\nPersistent access: " + (value.persistent ? "yes" : "no") + "\nNative path: redacted\nCanonical path validation: " + value.canonicalPathValidation
+    : "No approved workspace folder. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server, or choose one here";
 }

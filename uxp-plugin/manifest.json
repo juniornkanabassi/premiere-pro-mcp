@@ -16,7 +16,7 @@
     }
   ],
   "requiredPermissions": {
-    "localFileSystem": "request",
+    "localFileSystem": "fullAccess",
     "network": { "domains": "all" }
   }
 }

@@ -150,8 +150,8 @@ export function validateUxpManifest(manifest, packageJson, { expectedId } = {}) 
     "UXP package must include the MCP for Adobe Premiere Pro panel entry point",
   );
   assert(
-    manifest.requiredPermissions?.localFileSystem === "request",
-    "UXP package must use operator-requested local file access",
+    manifest.requiredPermissions?.localFileSystem === "fullAccess",
+    "UXP package must use fullAccess so the server-configured workspace root needs no picker click; the runtime path guard still confines paths to that root",
   );
   const domains = manifest.requiredPermissions?.network?.domains;
   assert(
