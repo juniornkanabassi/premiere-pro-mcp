@@ -128,7 +128,7 @@ describe("sequence pin (item 13)", () => {
     expect(byCommand("sequences.activate")[1].pinnedSequenceId).toBeUndefined();
   });
 
-  it("does not pin from an unverified activate, and forgets a closed pinned sequence", async () => {
+  it("pins from any accepted activate, and forgets a closed or deleted pinned sequence", async () => {
     const { bridge, client } = await connected();
     let outcome = "committed_unverified";
     client.on("message", (raw) => {
@@ -136,11 +136,29 @@ describe("sequence pin (item 13)", () => {
       if (frame.type === "command") reply(client, frame, { ok: true, result: { outcome, sequence: { id: "seq-B", name: "B" } } });
     });
     await bridge.request("sequences.activate", {});
-    expect(bridge.getPinnedSequence()).toBeNull();
+    expect(bridge.getPinnedSequence()).toBe("seq-B");
     outcome = "verified";
     await bridge.request("sequences.activate", {});
     expect(bridge.getPinnedSequence()).toBe("seq-B");
     await bridge.request("sequences.close", {});
+    expect(bridge.getPinnedSequence()).toBeNull();
+  });
+
+  it("keeps the pin when an activate is refused, and clears it after a project open or close", async () => {
+    const { bridge, client } = await connected({ commands: { "project.sessions.open": { supported: true, readOnly: false }, "project.sessions.close": { supported: true, readOnly: false } } });
+    client.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Frame;
+      if (frame.type !== "command") return;
+      if (frame.args.refuse) reply(client, frame, { ok: false, error: { code: "UXP_INVALID_ARGUMENT", message: "no", noHostWrite: true, dispatchEvidence: "handler_pre_write" } });
+      else reply(client, frame, { ok: true, result: { outcome: "verified", sequence: { id: "seq-A", name: "A" } } });
+    });
+    await bridge.request("sequences.activate", {});
+    await expect(bridge.request("sequences.activate", { refuse: true })).rejects.toBeTruthy();
+    expect(bridge.getPinnedSequence()).toBe("seq-A");
+    await bridge.request("project.sessions.open", {});
+    expect(bridge.getPinnedSequence()).toBeNull();
+    await bridge.request("sequences.activate", {});
+    await bridge.request("project.sessions.close", {});
     expect(bridge.getPinnedSequence()).toBeNull();
   });
 

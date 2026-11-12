@@ -470,14 +470,15 @@ export class UxpWebSocketBridge extends EventEmitter {
   }
 
   /**
-   * A verified activate sets the pin. Any other successful mutating sequence command (create, clone, open,
-   * close, delete, createPreset, an unverified activate) may change the active sequence, so it clears the
-   * pin rather than let the next edit be switched back to a stale sequence. Reads never touch it.
+   * An accepted activate sets the pin (the panel re-verifies the sequence before every edit, so an unverified
+   * readback is still a safe pin). Any other successful mutating sequence command (create, clone, open, close,
+   * delete, createPreset) or project open/close/switch may change the active sequence, so it clears the pin
+   * rather than let the next edit be switched back to a stale sequence. Reads never touch it.
    */
   private learnPin(command: string, result: any, mutating: boolean | undefined): void {
-    if (!mutating || !/^(?:sequences\.|sequence\.createPreset$)/.test(command)) return;
+    if (!mutating || !/^(?:sequences\.|sequence\.createPreset$|project\.sessions\.(?:create|open|close|saveAs|branchCopies)$)/.test(command)) return;
     const id = typeof result?.sequence?.id === "string" ? result.sequence.id : null;
-    this.pinnedSequenceId = command === "sequences.activate" && result?.outcome === "verified" && id ? id : null;
+    this.pinnedSequenceId = command === "sequences.activate" && id ? id : null;
   }
 
   private clearConnection(error: Error): void {

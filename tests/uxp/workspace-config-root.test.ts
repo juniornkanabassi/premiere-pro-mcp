@@ -115,6 +115,32 @@ describe("server-configured workspace root (item 3)", () => {
     expect(missing.status().configError).toContain("fullAccess");
   });
 
+  it("fails closed: a refused server root leaves no approved folder, old or picked", async () => {
+    const root = folder("/Users/j/Workspace");
+    const file = { isFolder: false, name: "x.png", nativePath: "/Users/j/Workspace/x.png" };
+    const check = (broker: any) => broker.assertPathAllowed(file.nativePath, { label: "path", kind: "file" });
+    // (a) an earlier server root, then a refused new root
+    const earlier = Workspace.createWorkspaceBroker({ fs: fsFor(root) });
+    await earlier.configureRoot("/Users/j/Workspace");
+    await expect(earlier.configureRoot("/Users/j")).rejects.toMatchObject({ code: "UXP_WORKSPACE_TOO_BROAD" });
+    expect(earlier.status()).toMatchObject({ configured: false, accessMode: "request", persistent: false, configError: expect.any(String) });
+    await expect(check(earlier)).rejects.toMatchObject({ code: "UXP_WORKSPACE_REQUIRED" });
+    // (b) a picked home folder, then a failed configure
+    const home = folder("/Users/j");
+    const store = new Map<string, string>();
+    const dataFolder = { getEntry: async (name: string) => ({ read: async () => store.get(name), delete: async () => {} }), createFile: async (name: string) => ({ write: async (value: string) => { store.set(name, value); } }) };
+    const picked = Workspace.createWorkspaceBroker({ fs: fsFor(root, { getFolder: vi.fn(async () => home), getDataFolder: vi.fn(async () => dataFolder) }) });
+    await picked.requestRoot();
+    await expect(picked.configureRoot("/Users/j/Gone")).rejects.toMatchObject({ code: "UXP_WORKSPACE_UNAVAILABLE" });
+    expect(picked.status().configured).toBe(false);
+    await expect(picked.assertPathAllowed("/Users/j/Workspace/x.png", { label: "path", kind: "file" })).rejects.toMatchObject({ code: "UXP_WORKSPACE_REQUIRED" });
+    // picking a folder again does not reopen it while the server's root is refused
+    await picked.requestRoot();
+    expect(picked.status().configured).toBe(false);
+    // a later good config frame recovers
+    await expect(picked.configureRoot("/Users/j/Workspace")).resolves.toMatchObject({ configured: true, configError: null, accessMode: "configured" });
+  });
+
   it("keeps /root and /root-evil apart", async () => {
     const evil = { isFolder: false, name: "x.png", nativePath: "/Users/j/Workspace-evil/x.png" };
     const root = folder("/Users/j/Workspace", {});

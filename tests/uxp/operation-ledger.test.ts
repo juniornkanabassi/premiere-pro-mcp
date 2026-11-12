@@ -272,6 +272,21 @@ describe("sequence pin (item 13)", () => {
     await Promise.all([first, second]);
     expect(order).toEqual(["first-start", "first-end", "reactivate"]);
   });
+  it("does not claim 'nothing changed' when a refusal follows a pin switch", async () => {
+    const first = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const second = { guid: "sequence-2", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    let calls = 0;
+    // Calls: queue-time identity, pin check, pin readback, identity after the pin. The last one disagrees.
+    const getActiveSequence = async () => [second, second, first, second][calls++] ?? second;
+    const project = { guid: "project-1", getActiveSequence, getSequences: async () => [first, second], openSequence: async () => true, setActiveSequence: async () => true };
+    const mutation = vi.fn(async () => ({ outcome: "verified" }));
+    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project } }, Protocol, Workflows: { createWorkflowDefinitions: () => ({ "test.mutate": { handler: mutation } }) } });
+    const error = await registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" }).catch((caught: any) => caught);
+    expect(error).toMatchObject({ code: "UXP_STALE_PROJECT", hostMayHaveChanged: true, message: expect.stringContaining("re-activated from sequence-2 to sequence-1") });
+    expect(error.noHostDispatch).toBeUndefined();
+    expect(error.noHostWrite).toBeUndefined();
+    expect(mutation).not.toHaveBeenCalled();
+  });
   it("leaves Premiere alone when the pinned sequence is already active, and for reads", async () => {
     const value = pinHost("sequence-1");
     await value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" });

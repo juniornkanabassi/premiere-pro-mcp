@@ -131,6 +131,7 @@
     let persistentToken = null;
     let configuredRoot = false;
     let configError = null;
+    let configRefused = false;
     let pickedFolderName = null;
     let initialized = false;
 
@@ -207,6 +208,7 @@
       await writeConfiguration(token);
       persistentToken = token;
       initialized = true;
+      if (configRefused) return status();
       if (configuredRoot && rootEntry) {
         // The server's configured root wins. The picked folder is stored but not used, and the conflict is reported.
         pickedFolderName = samePath(entry, rootEntry) ? null : entry.name || "picked folder";
@@ -251,9 +253,17 @@
         pickedFolderName = picked && !samePath(picked, entry) ? picked.name || "picked folder" : null;
         rootEntry = entry;
         configuredRoot = true;
+        configRefused = false;
         configError = null;
         return status();
       } catch (error) {
+        // Fail closed: a refused server root leaves no approved folder at all (not the old root, not a picked
+        // folder) until a later config frame succeeds, so every path command is refused.
+        rootEntry = null;
+        configuredRoot = false;
+        pickedFolderName = null;
+        configRefused = true;
+        initialized = true;
         configError = error && error.message ? String(error.message) : String(error);
         throw error;
       }
@@ -288,6 +298,7 @@
       persistentToken = null;
       configuredRoot = false;
       configError = null;
+      configRefused = false;
       pickedFolderName = null;
       initialized = true;
       await deleteConfiguration();
@@ -303,7 +314,7 @@
         configured: !!rootEntry,
         accessMode: configuredRoot ? "configured" : "request",
         rootName: rootEntry && typeof rootEntry.name === "string" ? rootEntry.name : null,
-        persistent: !!persistentToken && !configuredRoot,
+        persistent: !!persistentToken && !configuredRoot && !configRefused,
         configError: configError,
         pickedFolderIgnored: configuredRoot && pickedFolderName ? pickedFolderName : null,
         pathDisclosure: "redacted",

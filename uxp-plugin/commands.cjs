@@ -311,10 +311,20 @@
       if (record) throw commandError("UXP_OPERATION_CONSUMED", "Operation ID was consumed; its result is unavailable or unknown. Inspect current state; replay is not authorized");
       const execute = async () => {
         const sequencePin = pin ? await enforceSequencePin(pin) : null;
-        const current = await operationIdentity(false);
-        if (Ledger.canonical(current) !== Ledger.canonical(identity)) throw commandError("UXP_STALE_PROJECT", "Active project or sequence changed while waiting; no host mutation was dispatched");
-        operationLedger.assertReady(current);
-        operationLedger.reserve(operationKey, binding, current);
+        let current;
+        try {
+          current = await operationIdentity(false);
+          if (Ledger.canonical(current) !== Ledger.canonical(identity)) throw commandError("UXP_STALE_PROJECT", "Active project or sequence changed while waiting; the command was not run");
+          operationLedger.assertReady(current);
+          operationLedger.reserve(operationKey, binding, current);
+        } catch (error) {
+          // The pin check may already have switched the active sequence, so a later refusal is not proof of "no change".
+          if (sequencePin && error && typeof error === "object") {
+            error.hostMayHaveChanged = true;
+            error.message = (error.message || String(error)) + " (the pinned sequence was re-activated from " + (sequencePin.from || "unknown") + " to " + sequencePin.to + " first, so the active sequence may have changed)";
+          }
+          throw error;
+        }
         try {
           invocation.handlerEntered = true;
           const result = await definition.handler(input);
