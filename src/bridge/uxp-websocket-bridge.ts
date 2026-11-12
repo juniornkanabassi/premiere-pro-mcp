@@ -71,9 +71,12 @@ export class UxpBridgeError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    /** The panel's proof that nothing was written or dispatched, when it gave one. */
+    readonly evidence: { noHostWrite?: boolean; noHostDispatch?: boolean; dispatchEvidence?: string } = {},
   ) {
     super(message);
     this.name = "UxpBridgeError";
+    Object.assign(this, evidence);
   }
 }
 
@@ -464,6 +467,7 @@ export class UxpWebSocketBridge extends EventEmitter {
       pending.reject(new UxpBridgeError(
         error?.code ?? "UXP_COMMAND_FAILED",
         error?.message ?? `UXP command '${pending.command}' failed`,
+        { noHostWrite: error?.noHostWrite === true, noHostDispatch: error?.noHostDispatch === true, dispatchEvidence: typeof error?.dispatchEvidence === "string" ? error.dispatchEvidence : undefined },
       ));
     }
     }, pending.context);

@@ -68,7 +68,7 @@
       return value;
     }
     // Raw ProjectItems have no getItems(); nested bins only expose it after FolderItem.cast (commands.cjs findProjectItem).
-    function folderOrNull(item) { if (!item) return null; if (ppro.FolderItem && ppro.FolderItem.cast) try { const cast = ppro.FolderItem.cast(item); if (cast) return cast; } catch (_) {} return item.getItems ? item : null; }
+    function folderOrNull(item) { if (!item) return null; if (ppro.FolderItem && ppro.FolderItem.cast) try { const cast = ppro.FolderItem.cast(item); if (cast && typeof cast.getItems === "function") return cast; } catch (_) {} return item.getItems ? item : null; }
     async function find(project, wanted) { const queue = [await project.getRootItem()]; let count = 0; while (queue.length) { const item = queue.shift(); if (++count > 4096) fail("UXP_PROJECT_TOO_LARGE", "Project search exceeded 4096 items"); if (await id(item) === wanted) return item; const folder = folderOrNull(item); if (folder) queue.push.apply(queue, Array.from(await folder.getItems() || [])); } fail("UXP_PROJECT_ITEM_NOT_FOUND", "Project item not found: " + wanted); }
     async function sequences(project) { const out = []; for (const item of Array.from(await project.getSequences() || [])) out.push(await snap(item)); return out; }
     async function addedSequence(project, before) { const known = new Set(before.map(function (x) { return x.id; })); for (const item of Array.from(await project.getSequences() || [])) if (!known.has(await id(item))) return item; return null; }

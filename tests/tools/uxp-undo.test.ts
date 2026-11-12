@@ -9,7 +9,7 @@ type Live = (command: string, args: any, ctx: { identity: { sequence: string; pr
 
 // A fake panel. Identity reads answer from `ctx`; everything else from `live` (default: verified).
 function setup(live: Live | Record<string, unknown> = {}) {
-  const ctx = { identity: { sequence: "seq-1", project: "/p.prproj" } };
+  const ctx: { identity: { sequence: string; project: string }; pin?: string } = { identity: { sequence: "seq-1", project: "/p.prproj" } };
   const request = vi.fn(async (command: string, args: any) => {
     if (command === "sequences.inspect") return { activeSequenceId: ctx.identity.sequence };
     if (command === "sequenceSettings.get") return typeof live === "function" ? (live(command, args, ctx) as any)?.settings ? live(command, args, ctx) : { settings: { videoFrameRate: 25 } } : { settings: { videoFrameRate: 25 } };
@@ -17,7 +17,7 @@ function setup(live: Live | Record<string, unknown> = {}) {
     if (typeof live === "function") return live(command, args, ctx);
     return live[command] ?? { verified: true, outcome: "verified" };
   });
-  const bridge = { request } as unknown as UxpWebSocketBridge;
+  const bridge = { request, getPinnedSequence: () => ctx.pin ?? null } as unknown as UxpWebSocketBridge;
   const observed = observeUxpEdits(bridge);
   const tools = getUxpUndoTools(bridge);
   const writes = () => request.mock.calls.map(([command]) => command).filter((command) => !/\.(inspect|get)$/.test(command));
@@ -40,7 +40,7 @@ describe("MCP-side undo stack: recording", () => {
     await observed.request("some.newCommand", {});        // unknown mutating command
     request.mockImplementationOnce(async () => { throw Object.assign(new Error("lost"), { code: "UXP_TIMEOUT" }); });
     await expect(observed.request("markers.add", {})).rejects.toThrow("lost");
-    request.mockImplementationOnce(async () => { throw Object.assign(new Error("refused"), { noHostWrite: true }); });
+    request.mockImplementationOnce(async () => { throw Object.assign(new Error("refused"), { noHostWrite: true, dispatchEvidence: "handler_pre_write" }); });
     await expect(observed.request("markers.add", {})).rejects.toThrow("refused");
     request.mockImplementationOnce(async () => { throw Object.assign(new Error("offline"), { code: "UXP_NOT_CONNECTED" }); });
     await expect(observed.request("markers.add", {})).rejects.toThrow("offline");
@@ -179,7 +179,7 @@ describe("MCP-side undo stack: undo", () => {
     const refused = setup({ "trackItem.update": moved, "trackItem.inspect": moved.after });
     await refused.observed.request("trackItem.update", {});
     refused.request.mockImplementation(async (command: string) => {
-      if (command === "trackItem.update") throw Object.assign(new Error("bad args"), { noHostWrite: true });
+      if (command === "trackItem.update") throw Object.assign(new Error("bad args"), { noHostWrite: true, dispatchEvidence: "handler_pre_write" });
       return command === "sequences.inspect" ? { activeSequenceId: "seq-1" } : command === "state.get" ? { project: { path: "/p.prproj" } } : moved.after;
     });
     expect(await refused.tools.undo_last_edit_uxp.handler({})).toMatchObject({ success: false, noHostWrite: true, error: expect.stringContaining("before changing anything") });
@@ -215,5 +215,32 @@ describe("MCP-side undo stack: undo", () => {
     await a.observed.request("trackItem.update", {});
     expect(await a.list()).toHaveLength(1);
     expect(await b.list()).toHaveLength(0);
+  });
+});
+
+describe("MCP-side undo stack: safety after merge", () => {
+  it("treats an unproven noHostWrite tag as uncertain", async () => {
+    const { observed, request, list } = setup();
+    request.mockImplementationOnce(async () => { throw Object.assign(new Error("refused?"), { noHostWrite: true }); });
+    await expect(observed.request("markers.add", {})).rejects.toThrow("refused?");
+    expect((await list()).map((entry) => entry.invertible)).toEqual([false]);
+  });
+
+  it("refuses to undo while the bridge is pinned to another sequence", async () => {
+    const { observed, tools, writes, ctx } = setup({ "trackItem.update": moved });
+    await observed.request("trackItem.update", { mediaType: "video", trackIndex: 0, clipIndex: 0, startSeconds: 1 });
+    ctx.pin = "seq-other";
+    const result = await tools.undo_last_edit_uxp.handler({}) as any;
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/pinned to another sequence/);
+    expect(writes().filter((command) => command === "trackItem.update")).toHaveLength(1);
+  });
+
+  it("does not let a selection change or sequence switch block older undos", async () => {
+    const { observed, list } = setup({ "trackItem.update": moved });
+    await observed.request("trackItem.update", { mediaType: "video", trackIndex: 0, clipIndex: 0, startSeconds: 1 });
+    await observed.request("selection.update", {});
+    await observed.request("sequences.activate", { sequenceId: "seq-1" });
+    expect((await list()).map((entry) => entry.invertible)).toEqual([true]);
   });
 });

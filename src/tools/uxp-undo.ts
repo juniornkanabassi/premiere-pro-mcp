@@ -56,7 +56,7 @@ const same = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
 const isObject = (value: unknown): value is Json => !!value && typeof value === "object" && !Array.isArray(value);
 const refuse = (error: string) => ({ success: false as const, error, noHostWrite: true as const });
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-const refusedBeforeWrite = (error: any) => error?.noHostWrite === true || error?.noHostDispatch === true || LOCAL_REFUSALS.has(error?.code);
+const refusedBeforeWrite = (error: any) => (error?.noHostWrite === true && error?.dispatchEvidence === "handler_pre_write") || (error?.noHostDispatch === true && error?.dispatchEvidence === "panel_pre_dispatch") || LOCAL_REFUSALS.has(error?.code);
 
 function describeEntry(entry: Entry) {
   return { id: entry.id, command: entry.command, label: entry.label, invertible: entry.reason === null, ...(entry.reason ? { reason: entry.reason, hint: CHECKPOINT_HINT } : {}), recordedAt: entry.recordedAt };
@@ -79,6 +79,8 @@ async function readIdentity(request: RequestFn): Promise<Identity> {
 
 function isReadOnly(bridge: UxpWebSocketBridge, command: string): boolean {
   if (/^(?:capabilities\.get|state\.get|operations\.recovery\.|operation\.cancel)/.test(command)) return true;
+  // Selection and sequence switches change no timeline content; the sequence check at undo time covers a switch.
+  if (command === "selection.update" || command === "sequences.activate") return true;
   const known = (bridge.getState?.() as any)?.capabilities?.commands?.[command];
   // shortcut: a name check stands in when the panel's capability list is unavailable; a miss only records an extra blocker.
   return known ? known.readOnly === true : /\.(?:inspect|get)$/.test(command);
@@ -292,6 +294,9 @@ export function getUxpUndoTools(bridge: UxpWebSocketBridge) {
       return refuse(`Cannot undo "${entry.label}". Premiere would not name the project or sequence, so it cannot be checked that this is where the edit was made.`);
     }
     if (entry.identity.sequenceId !== current.sequenceId) return refuse(`Cannot undo "${entry.label}". It was made in another sequence than the one active now; activate that sequence first.`);
+    // The bridge sends edits to its pinned sequence; a pin elsewhere would replay this undo on a different (possibly cloned) sequence.
+    const pinned = bridge.getPinnedSequence?.();
+    if (pinned && pinned !== entry.identity.sequenceId) return refuse(`Cannot undo "${entry.label}". Edits are pinned to another sequence than the one this edit was made in; activate the edit's sequence with manage_sequences_uxp first.`);
 
     let plan: Plan;
     try { plan = await planInverse(entry, request); }
