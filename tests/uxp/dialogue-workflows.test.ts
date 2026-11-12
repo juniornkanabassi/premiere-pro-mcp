@@ -74,6 +74,51 @@ describe("UXP dialogue command module", () => {
     ], output_duration_seconds: 1, original_sources_unchanged: true, render_verified: false } })).rejects.toMatchObject({ code: "UXP_STALE_PROJECT" });
     expect(mutate).not.toHaveBeenCalled();
   });
+  it("finds a source two bins down when raw children have no getItems and only cast folders do", async () => {
+    const children: any[] = [];
+    const nestedView = { name: "Nested", getId: async () => "nested", getItems: async () => children };
+    const rawNested = { name: "Nested", getId: async () => "nested" };
+    const topView = { name: "Top", getId: async () => "top", getItems: async () => [rawNested] };
+    const rawTop = { name: "Top", getId: async () => "top" };
+    const source = { name: "Source", getId: async () => "clip", isMulticamClip: async () => false,
+      createSubClipAction: (name: string) => ({ apply: () => children.push({ name, getId: async () => `sub-${children.length + 1}` }) }) };
+    children.push(source);
+    const root = { getId: async () => "root", getItems: async () => [rawTop] };
+    const createdSequences: any[] = [];
+    const project = { getGuid: async () => "project", getRootItem: async () => root, getSequences: async () => createdSequences,
+      lockedAccess: (fn: () => void) => fn(), executeTransaction: (fn: (compound: any) => void) => { fn({ addAction: (action: any) => { action.apply(); return true; } }); return true; },
+      createSequenceFromMedia: async (name: string) => { const sequence = { name, getGuid: async () => "sequence" }; createdSequences.push(sequence); return sequence; } };
+    const views = new Map<any, any>([[rawTop, topView], [rawNested, nestedView]]);
+    const ppro = { Project: { getActiveProject: async () => project }, ClipProjectItem: { cast: (item: any) => item.createSubClipAction ? item : null },
+      FolderItem: { cast: (item: any) => views.get(item) || null },
+      TickTime: { createWithSeconds: (seconds: number) => ({ seconds }) }, SequenceEditor: { getEditor: () => ({ createInsertProjectItemAction: () => ({ apply() {} }) }) } };
+    const command = api.createDialogueWorkflowDefinitions({ ppro })["dialogue.deriveSequence"];
+    const result = await command.handler({ operationId: "op-deep", plan: { schema_version: 1, project_guid: "project", mode: "talking_head", sequence_name: "Deep", segments: [
+      { id: "one", source_project_item_id: "clip", transcript_revision: `sha256:${"a".repeat(64)}`, source_start_seconds: 0, source_end_seconds: 1 },
+    ], output_duration_seconds: 1, original_sources_unchanged: true, render_verified: false } });
+    expect(result).toMatchObject({ outcome: "committed_unverified", partial: false });
+    expect(result.createdSubclips).toHaveLength(1);
+  });
+  it("tags pre-write refusals noHostWrite and leaves a failed commit untagged", async () => {
+    const command = api.createDialogueWorkflowDefinitions({ ppro: { Project: { getActiveProject: async () => null } } })["dialogue.deriveSequence"];
+    const refused = await command.handler({ operationId: "bad id!", plan: {} }).catch((error: any) => error);
+    expect(refused).toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    const noProject = await command.handler({ operationId: "op-1", plan: { schema_version: 1, project_guid: "p", mode: "talking_head", sequence_name: "S", segments: [{ id: "a", source_project_item_id: "c", source_start_seconds: 0, source_end_seconds: 1 }], output_duration_seconds: 1, original_sources_unchanged: true, render_verified: false } }).catch((error: any) => error);
+    expect(noProject).toMatchObject({ code: "UXP_NO_ACTIVE_PROJECT", noHostWrite: true });
+
+    // A rejected transaction is after the first host write: reported as a partial receipt, never as a no-write refusal.
+    const children: any[] = [];
+    const source = { name: "Source", getId: async () => "clip", getParentBin: async () => ({ getId: async () => "bin", getItems: async () => children }), isMulticamClip: async () => false,
+      createSubClipAction: () => ({ apply() {} }) };
+    const project = { getGuid: async () => "p", getRootItem: async () => ({ getId: async () => "root", getItems: async () => [source] }), getSequences: async () => [],
+      lockedAccess: (fn: () => void) => fn(), executeTransaction: () => false, createSequenceFromMedia: async () => ({}) };
+    const ppro = { Project: { getActiveProject: async () => project }, ClipProjectItem: { cast: (item: any) => item }, FolderItem: { cast: (item: any) => item.getItems ? item : null },
+      TickTime: { createWithSeconds: (seconds: number) => ({ seconds }) }, SequenceEditor: { getEditor: () => ({ createInsertProjectItemAction: () => ({ apply() {} }) }) } };
+    const failing = api.createDialogueWorkflowDefinitions({ ppro })["dialogue.deriveSequence"];
+    const failed = await failing.handler({ operationId: "op-2", plan: { schema_version: 1, project_guid: "p", mode: "talking_head", sequence_name: "S2", segments: [{ id: "a", source_project_item_id: "clip", source_start_seconds: 0, source_end_seconds: 1 }], output_duration_seconds: 1, original_sources_unchanged: true, render_verified: false } }).catch((error: any) => error);
+    expect(failed).toMatchObject({ partial: true, outcome: "committed_unverified" });
+    expect(failed.noHostWrite).toBeUndefined();
+  });
   it("walks the project tree when the cast clip has no getParentBin", async () => {
     const children: any[] = [];
     const parent = { name: "Media", getId: async () => "bin", getItems: async () => children };

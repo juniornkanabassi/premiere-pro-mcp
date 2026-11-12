@@ -457,6 +457,7 @@ describe("advanced stable UXP workflow MCP catalog", () => {
     expect(results).toEqual(Array.from({ length: 4 }, () => ({
       success: false,
       error: "Unsupported workflow action: destroy_everything",
+      noHostWrite: true,
     })));
     expect(request).not.toHaveBeenCalled();
   });
@@ -512,6 +513,7 @@ describe("advanced stable UXP workflow MCP catalog", () => {
     expect(results).toEqual(Array.from({ length: 5 }, () => ({
       success: false,
       error: "Unsupported workflow action: undefined",
+      noHostWrite: true,
     })));
     expect(request).not.toHaveBeenCalled();
   });

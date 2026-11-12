@@ -68,6 +68,12 @@ describe("UXP tool handler coverage", () => {
           delete args[unsupported];
         }
       }
+      // edit_timeline_uxp refuses arguments its action does not take; keep one action's set.
+      if (name === "edit_timeline_uxp" && all) {
+        for (const unsupported of ["project_item_id", "limit_shift", "time_offset_seconds", "video_track_offset", "audio_track_offset", "align_to_video", "insert", "ripple", "media_type", "shift_overlapping", "file_path"]) {
+          delete args[unsupported];
+        }
+      }
       const result = await tool.handler(args);
       expect(result).toBeDefined();
       if (name === "get_uxp_capabilities") expect(getState).toHaveBeenCalled();

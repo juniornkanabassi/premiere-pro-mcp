@@ -80,6 +80,7 @@ import { getTemporalRenderEvidenceTools } from "./tools/temporal-render-evidence
 import { getSessionGuardTools, SessionGuardStore } from "./tools/session-guard.js";
 import { deriveToolOperationalCapability } from "./tool-capability-report.js";
 import { getUxpTools } from "./tools/uxp.js";
+import { getUxpUndoTools, observeUxpEdits } from "./tools/uxp-undo.js";
 import { getMogrtAuthoringTools } from "./tools/mogrt-authoring.js";
 import { getMogrtStudioTools } from "./tools/mogrt-studio.js";
 import { getRenderHandoffTools } from "./tools/render-handoff.js";
@@ -419,7 +420,8 @@ export function collectTools(
   // tool definitions are immutable, while context, telemetry, and UXP tools
   // close over server-specific state. Reuse only the former so initialization
   // stays fast without ever leaking one request's project context or bridge.
-  const selectedUxpBridge = bridgeMode === "cep" ? undefined : uxpBridge;
+  // Tools share a bridge that reports each finished edit to the MCP-side undo stack.
+  const selectedUxpBridge = bridgeMode === "cep" || !uxpBridge ? undefined : observeUxpEdits(uxpBridge);
   const tools: Record<string, ToolDef> = {
     ...collectStaticTools(bridgeOptions, capabilities),
     ...getCompanionTools(),
@@ -432,6 +434,7 @@ export function collectTools(
     ...getMediaWatchTools(mediaWatchRegistry),
     ...getOperationRecoveryTools(selectedUxpBridge, bridgeOptions),
     ...(selectedUxpBridge ? getUxpTools(selectedUxpBridge) : {}),
+    ...(uxpBridge && selectedUxpBridge ? getUxpUndoTools(uxpBridge) : {}),
   };
   // Compositions use the same schema and authority boundary as external calls.
   // A plan token or a discovered tool name is never authority to bypass it.
@@ -511,6 +514,7 @@ export function resolveToolSelection(
     // getUxpTools only closes over the bridge inside handlers, so an absent
     // bridge is enough to enumerate the names it would register.
     for (const name of Object.keys(getUxpTools(undefined as unknown as UxpWebSocketBridge))) known.add(name);
+    for (const name of Object.keys(getUxpUndoTools(undefined as unknown as UxpWebSocketBridge))) known.add(name);
   }
   const unknown = unknownExplicitTools(selection, known);
   if (unknown.length > 0) {

@@ -439,6 +439,16 @@ describe("advanced stable Premiere UXP workflows", () => {
     })).resolves.toMatchObject({ created: true, outcome: "verified", item: { name: "Selects" } });
   });
 
+  it("descends into nested bins when raw children have no getItems and only a cast folder does", async () => {
+    const value = advancedHost();
+    const { getItems: _hidden, ...rawBin } = value.bin as any;
+    (value.root as any).getItems = vi.fn(async () => [rawBin]);
+    value.ppro.FolderItem.cast.mockImplementation((item: any) => { if (item === rawBin) return value.bin; if (!item.isFolder) throw new Error("not folder"); return item; });
+    await expect(value.registry.dispatch("projectTree.inspect", { maxDepth: 2 })).resolves.toMatchObject({
+      items: [{ id: "bin-1", depth: 1, isBin: true }, { id: "clip-1", parentId: "bin-1", depth: 2 }],
+    });
+  });
+
   it("verifies project-item removal from the tree even when the removed item is still selected (#642)", async () => {
     const value = advancedHost();
     await expect(value.registry.dispatch("bins.remove", {
@@ -1582,9 +1592,16 @@ describe("advanced stable Premiere UXP workflows", () => {
     await expect(value.registry.dispatch("timeline.structure.inspect", {
       includeSourceProjectItems: true, includeSourceNestedSequenceIdentity: true,
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
+    // A page stops between tracks and says where to resume; it never fails a multi-track timeline.
     await expect(value.registry.dispatch("timeline.structure.inspect", {
       mediaType: "all", maxItems: 1,
-    })).rejects.toMatchObject({ code: "UXP_TIMELINE_TOO_LARGE" });
+    })).resolves.toMatchObject({ itemCount: 1, complete: false, nextStartTrack: { mediaType: "audio", trackIndex: 0 }, tracks: [{ mediaType: "video" }] });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "all", maxItems: 1, startTrack: { mediaType: "audio", trackIndex: 0 },
+    })).resolves.toMatchObject({ itemCount: 1, complete: true, nextStartTrack: null, tracks: [{ mediaType: "audio" }] });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "video", startTrack: { mediaType: "audio", trackIndex: 0 },
+    })).rejects.toMatchObject({ code: "UXP_TARGET_NOT_FOUND" });
     expect(value.project.lockedAccess).not.toHaveBeenCalled();
   });
 
@@ -1777,6 +1794,20 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
   });
 
+  it("unwraps Premiere 27.0 {value} readbacks and lists each keyframe's own value", async () => {
+    const value = advancedHost();
+    value.parameterState.keyframes = [1, 3];
+    value.parameter.getValueAtTime.mockResolvedValue({ value: 130 });
+    value.parameter.getKeyframePtr.mockImplementation((time: { seconds: number }) => value.parameterState.keyframes.includes(time.seconds)
+      ? { position: { seconds: time.seconds }, getTemporalInterpolationMode: async () => 1, value: { value: time.seconds * 10 } } : null);
+    const target = { mediaType: "video", trackIndex: 0, clipIndex: 0, componentIndex: 0, paramIndex: 0, expectedComponentId: "ADBE Opacity", expectedParamName: "Opacity" };
+    await expect(value.registry.dispatch("parameters.inspect", { ...target, timeSeconds: 3 })).resolves.toMatchObject({
+      value: 130, keyframes: [{ seconds: 1, value: 10 }, { seconds: 3, value: 30 }],
+    });
+    await expect(value.registry.dispatch("parameters.keyframe.inspect", { ...target, direction: "at", timeSeconds: 3 }))
+      .resolves.toMatchObject({ found: true, keyframe: { positionSeconds: 3, value: 30 } });
+  });
+
   it("locates one exact, directional, or bounded-nearest keyframe with native position and interpolation readback", async () => {
     const value = advancedHost();
     value.parameterState.keyframes = [1, 3, 7];
@@ -1818,10 +1849,34 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(staleTarget.parameter.getKeyframePtr).not.toHaveBeenCalled();
   });
 
+  it("activates a sequence verified only when getActiveSequence reads it back", async () => {
+    const held = advancedHost();
+    await expect(held.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .resolves.toMatchObject({ activated: true, outcome: "verified", verified: true, activeSequenceId: "sequence-1", verificationBoundary: "active_sequence_readback" });
+    expect(held.project.openSequence).toHaveBeenCalledBefore(held.project.setActiveSequence);
+
+    // Premiere says a different sequence is active: failed, not committed_unverified.
+    const drifted = advancedHost();
+    drifted.project.getActiveSequence.mockResolvedValue({ guid: "sequence-other", name: "Other" });
+    await expect(drifted.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .rejects.toMatchObject({ code: "UXP_ACTIVATION_NOT_HELD" });
+
+    // The readback itself fails: committed_unverified.
+    const unreadable = advancedHost();
+    // Only after activation: the panel's own pre-dispatch check reads the active sequence first.
+    unreadable.project.setActiveSequence.mockImplementation(async () => { unreadable.project.getActiveSequence.mockRejectedValue(new Error("no active sequence")); return true; });
+    await expect(unreadable.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .resolves.toMatchObject({ activated: true, outcome: "committed_unverified", verified: false });
+
+    const rejected = advancedHost();
+    rejected.project.setActiveSequence.mockResolvedValue(false);
+    await expect(rejected.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .rejects.toMatchObject({ code: "UXP_HOST_REJECTED" });
+  });
+
   it("keeps direct sequence actions unverified with stable result keys and probes host methods", async () => {
     const value = advancedHost();
     for (const [command, resultField] of [
-      ["sequences.activate", "activated"],
       ["sequences.open", "opened"],
       ["sequences.close", "closed"],
     ]) {
