@@ -94,7 +94,7 @@
           const action = plan
             ? editor.createCloneTrackItemAction(
               context.item,
-              ppro.TickTime.createWithSeconds(plan.offsetSeconds),
+              ppro.TickTime.createWithTicks(plan.offsetTicks),
               before.mediaType === "video" ? plan.verticalOffset : 0,
               before.mediaType === "audio" ? plan.verticalOffset : 0,
               false,
@@ -254,24 +254,31 @@
     }
 
     // Frame-snaps the destination, proves its range on the destination track is empty (read-only), and
-    // returns the offsets the clone needs. Everything here is a refusal before any write.
+    // returns the offset the clone needs, in ticks. Everything here is a refusal before any write.
     async function planDestination(context, snapshot, destination) {
       const source = snapshot.source;
       if (source.durationSeconds <= 0 || !numbersEqual(source.endSeconds - source.startSeconds, source.durationSeconds)) {
         throw refuse("UXP_TARGET_UNSUPPORTED", "The source item has no readable positive duration to copy");
       }
       if (typeof context.sequence.getTimebase !== "function") throw refuse("UXP_COMMAND_UNAVAILABLE", "Premiere cannot report the sequence frame length to snap the destination");
-      const frameTicks = Number(await context.sequence.getTimebase());
-      if (!Number.isFinite(frameTicks) || frameTicks <= 0) throw commandError("UXP_VERIFICATION_FAILED", "Premiere returned an invalid sequence timebase");
-      const frameSeconds = frameTicks / TICKS_PER_SECOND;
-      const startSeconds = Math.round((destination.seconds == null ? source.startSeconds : destination.seconds) / frameSeconds) * frameSeconds;
+      if (typeof ppro.TickTime.createWithTicks !== "function") throw refuse("UXP_COMMAND_UNAVAILABLE", "Premiere cannot build an exact tick offset for the destination");
+      const timebase = String(await context.sequence.getTimebase());
+      if (!/^\d{1,18}$/.test(timebase) || BigInt(timebase) <= 0n) throw commandError("UXP_VERIFICATION_FAILED", "Premiere returned an invalid sequence timebase");
+      const frame = BigInt(timebase), ticksPerSecond = BigInt(TICKS_PER_SECOND);
+      const sourceTime = await requiredMethod(context.item, "getStartTime")();
+      if (!sourceTime || !/^\d{1,30}$/.test(String(sourceTime.ticks))) throw commandError("UXP_VERIFICATION_FAILED", "Premiere returned an unreadable source start tick value");
+      const sourceStart = BigInt(String(sourceTime.ticks));
+      const wanted = destination.seconds == null ? sourceStart : BigInt(Math.round(destination.seconds * 1000000)) * ticksPerSecond / 1000000n;
+      const startTicks = (wanted + frame / 2n) / frame * frame;
+      const startSeconds = Number(startTicks) / TICKS_PER_SECOND, endSeconds = startSeconds + source.durationSeconds;
       const trackIndex = destination.trackIndex == null ? snapshot.trackIndex : destination.trackIndex;
-      const endSeconds = startSeconds + source.durationSeconds;
       if (endSeconds > 86400) throw refuse("UXP_INVALID_ARGUMENT", "The copy would run past the documented timeline bounds");
       const title = snapshot.mediaType === "video" ? "Video" : "Audio";
       const count = Number(await context.sequence["get" + title + "TrackCount"]());
-      // A track index equal to the count asks Premiere for a new track (live 27.0, video).
+      // A track index equal to the count asks Premiere for a new track. That is proven on live 27.0 for video only.
       if (trackIndex > count) throw refuse("UXP_TARGET_NOT_FOUND", "destinationTrackIndex is more than one past the last " + snapshot.mediaType + " track");
+      if (trackIndex === count && snapshot.mediaType === "audio") throw refuse("UXP_TARGET_UNSUPPORTED", "Creating a new audio track for a copy is unproven on Premiere 27.0. Copy onto an existing audio track.");
+      const existing = [];
       if (trackIndex < count) {
         const items = trackIndex === snapshot.trackIndex ? context.items : (await trackItemsAt(context.sequence, { mediaType: snapshot.mediaType, trackIndex }).catch(function (error) {
           if (error && error.code === "UXP_TARGET_NOT_FOUND") return { items: [] };
@@ -283,25 +290,29 @@
           if (start < endSeconds - 0.000001 && end > startSeconds + 0.000001) {
             throw refuse("UXP_TARGET_OCCUPIED", "The destination range " + startSeconds.toFixed(3) + "s to " + endSeconds.toFixed(3) + "s on " + snapshot.mediaType + " track " + trackIndex + " overlaps clip " + index + ", so nothing was copied");
           }
+          existing.push({ start, end });
         }
       }
       return {
-        trackIndex, startSeconds, endSeconds, frameSeconds,
-        offsetSeconds: startSeconds - source.startSeconds, verticalOffset: trackIndex - snapshot.trackIndex, newTrack: trackIndex === count
+        trackIndex, startSeconds, endSeconds, frameSeconds: Number(frame) / TICKS_PER_SECOND, existing,
+        offsetTicks: String(startTicks - sourceStart), verticalOffset: trackIndex - snapshot.trackIndex
       };
     }
 
-    // The copy is found by source item and start (within half a frame), never by index.
+    // The copy is found by source item and start (within half a frame), never by index. Every other clip on
+    // the destination track must be exactly where it was, so a copy that trimmed a neighbour is caught.
     async function destinationReadback(context, before, plan) {
       const target = { mediaType: before.mediaType, trackIndex: plan.trackIndex, clipIndex: 0 };
       const destinationItems = plan.trackIndex === before.trackIndex ? context.items : (await trackItemsAt(context.sequence, target)).items;
       let duplicate = null, duplicateClipIndex = -1;
-      for (let index = 0; index < destinationItems.length && !duplicate; index++) {
+      const others = [];
+      for (let index = 0; index < destinationItems.length; index++) {
         const start = tickSeconds(await requiredMethod(destinationItems[index], "getStartTime")());
-        if (start != null && Math.abs(start - plan.startSeconds) <= plan.frameSeconds / 2) {
+        if (!duplicate && start != null && Math.abs(start - plan.startSeconds) <= plan.frameSeconds / 2) {
           const candidate = await itemSnapshot(destinationItems[index], "duplicate readback");
-          if (candidate.projectItemId === before.source.projectItemId) { duplicate = candidate; duplicateClipIndex = index; }
+          if (candidate.projectItemId === before.source.projectItemId) { duplicate = candidate; duplicateClipIndex = index; continue; }
         }
+        others.push({ start, end: tickSeconds(await requiredMethod(destinationItems[index], "getEndTime")()) });
       }
       if (!duplicate) throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not expose the duplicate at the requested destination");
       // The source may have shifted index if the copy landed before it on the same track, so find it again by start.
@@ -313,21 +324,25 @@
         }
       }
       if (!sourceNow) throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not expose the source item after the duplicate");
+      const tolerance = plan.frameSeconds / 2;
+      const neighboursUnchanged = others.length === plan.existing.length && others.every(function (item, index) {
+        return item.start != null && item.end != null && Math.abs(item.start - plan.existing[index].start) <= tolerance && Math.abs(item.end - plan.existing[index].end) <= tolerance;
+      });
       return {
         projectGuid: context.projectGuid, sequenceId: context.sequenceId, mediaType: context.mediaType,
         sourceTrackIndex: before.trackIndex, sourceClipIndex: before.clipIndex,
         destinationTrackIndex: plan.trackIndex, duplicateClipIndex,
         sourceTrackItemCount: context.items.length, destinationTrackItemCount: destinationItems.length,
+        destinationGrewByOne: destinationItems.length === plan.existing.length + 1, destinationNeighboursUnchanged: neighboursUnchanged,
         source: sourceNow, duplicate
       };
     }
 
     function sameDestinationResult(before, after, plan) {
       const source = before.source, duplicate = after.duplicate;
-      const grew = after.destinationTrackIndex === before.trackIndex
-        ? after.destinationTrackItemCount === before.trackItemCount + 1
-        : after.destinationTrackItemCount >= 1 && after.sourceTrackItemCount === before.trackItemCount;
-      return after.projectGuid === before.projectGuid && after.sequenceId === before.sequenceId && after.mediaType === before.mediaType && grew &&
+      return after.projectGuid === before.projectGuid && after.sequenceId === before.sequenceId && after.mediaType === before.mediaType &&
+        after.destinationGrewByOne && after.destinationNeighboursUnchanged &&
+        (after.destinationTrackIndex === before.trackIndex || after.sourceTrackItemCount === before.trackItemCount) &&
         sameItem(after.source, source) && duplicate.projectItemId === source.projectItemId &&
         Math.abs(duplicate.startSeconds - plan.startSeconds) <= plan.frameSeconds / 2 &&
         numbersEqual(duplicate.endSeconds - duplicate.startSeconds, source.durationSeconds) &&

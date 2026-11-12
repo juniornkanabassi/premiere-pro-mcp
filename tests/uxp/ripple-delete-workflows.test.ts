@@ -19,6 +19,10 @@ type HostOptions = {
   /** A trim that Premiere accepts but does not apply. */
   ignoreSetStart?: boolean;
   missingAudioTrack?: boolean;
+  /** The host returns each track's items latest first. */
+  reverseOrder?: boolean;
+  /** A move onto occupied space trims or removes the neighbour it lands on, as an overwrite would. */
+  overwriteOnMove?: boolean;
 };
 
 /**
@@ -58,7 +62,21 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
       createSetStartAction: vi.fn((to: { ticks: string }) => { inLock(); const d = BigInt(to.ticks) - BigInt(state.start); return { apply: () => { if (options.ignoreSetStart) return; shift(state, "start", d); shift(state, "inPoint", d); } }; }),
       createSetEndAction: vi.fn((to: { ticks: string }) => { inLock(); const d = BigInt(to.ticks) - BigInt(state.end); return { apply: () => { shift(state, "end", d); shift(state, "outPoint", d); } }; }),
       // A move is relative.
-      createMoveAction: vi.fn((by: { ticks: string }) => { inLock(); return { apply: () => { if (options.ignoreMoves) return; shift(state, "start", BigInt(by.ticks)); shift(state, "end", BigInt(by.ticks)); } }; }),
+      createMoveAction: vi.fn((by: { ticks: string }) => { inLock(); return { apply: () => {
+        if (options.ignoreMoves) return;
+        shift(state, "start", BigInt(by.ticks)); shift(state, "end", BigInt(by.ticks));
+        if (options.overwriteOnMove) {
+          const list = lists[kind][trackIndex]!, start = BigInt(state.start), end = BigInt(state.end);
+          for (const other of [...list]) {
+            if (other === item) continue;
+            const otherStart = BigInt(other.state.start), otherEnd = BigInt(other.state.end);
+            if (otherStart >= end || otherEnd <= start) continue;
+            if (otherStart >= start && otherEnd <= end) list.splice(list.indexOf(other), 1);
+            else if (otherStart < start) shift(other.state, "end", start - otherEnd);
+            else shift(other.state, "start", end - otherStart);
+          }
+        }
+      } }; }),
     };
     return item;
   }
@@ -66,13 +84,14 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   video.forEach((track, index) => lists.video.push(track.map((state) => makeItem(state, "video", index))));
   audio.forEach((track, index) => lists.audio.push(track.map((state) => makeItem(state, "audio", index))));
   const sorted = (list: Item[]) => [...list].sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)));
+  const served = (list: Item[]) => options.reverseOrder ? sorted(list).reverse() : sorted(list);
   const sequence = {
     guid: "sequence-1",
     getTimebase: vi.fn(async () => String(FRAME)),
     getVideoTrackCount: vi.fn(async () => lists.video.length),
     getAudioTrackCount: vi.fn(async () => lists.audio.length),
-    getVideoTrack: vi.fn(async (index: number) => lists.video[index] ? { getTrackItems: vi.fn(async () => sorted(lists.video[index]!)) } : null),
-    getAudioTrack: vi.fn(async (index: number) => options.missingAudioTrack || !lists.audio[index] ? null : { getTrackItems: vi.fn(async () => sorted(lists.audio[index]!)) }),
+    getVideoTrack: vi.fn(async (index: number) => lists.video[index] ? { getTrackItems: vi.fn(async () => served(lists.video[index]!)) } : null),
+    getAudioTrack: vi.fn(async (index: number) => options.missingAudioTrack || !lists.audio[index] ? null : { getTrackItems: vi.fn(async () => served(lists.audio[index]!)) }),
   };
   const cloneAction = vi.fn((source: Item, offset: { ticks: string }, videoOffset: number, audioOffset: number, alignToVideo: boolean, isInsert: boolean) => {
     inLock();
@@ -160,10 +179,19 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
     // Live 27.0 refused every real edit for this; the ripple is now driven here, so the overlap is only a warning.
     const value = timelineHost([rippleTrack()], [[clip("partner", 0, 10, 0)]]);
     await expect(value.registry.dispatch("trackItem.rippleDelete", rippleArgs("ripple-overlap"))).resolves.toMatchObject({
-      rippleDeleted: true, outcome: "verified", otherTrackItemsOverRange: [{ mediaType: "audio", trackIndex: 0, clipIndex: 0 }],
+      rippleDeleted: true, outcome: "verified", otherTrackItemsOverRange: [{ mediaType: "audio", trackIndex: 0, clipIndex: 0 }], laterClipsOnUntouchedTracks: 0,
     });
     expect(value.track("video", 0)).toEqual([[0, 10, 40]]);
     expect(value.track("audio", 0)).toEqual([[0, 10, 0]]);
+  });
+
+  it("counts the clips after the edit on tracks it did not shift, and reports a failed scan instead of hiding it", async () => {
+    const later = timelineHost([rippleTrack()], [[clip("partner", 0, 10, 0), clip("next", 10, 20, 0), clip("last", 20, 30, 0)]]);
+    await expect(later.registry.dispatch("trackItem.rippleDelete", rippleArgs("ripple-later"))).resolves.toMatchObject({ outcome: "verified", laterClipsOnUntouchedTracks: 2 });
+    const broken = timelineHost([rippleTrack()], [[clip("partner", 0, 10, 0)]], { missingAudioTrack: true });
+    const result = await broken.registry.dispatch("trackItem.rippleDelete", rippleArgs("ripple-scan"));
+    expect(result).toMatchObject({ outcome: "verified", otherTrackItemsOverRange: null, laterClipsOnUntouchedTracks: null });
+    expect((result as { scanError: string }).scanError).toContain("Premiere cannot inspect a track");
   });
 
   it("removes without ripple, then moves the successor in a second transaction and verifies it", async () => {
@@ -251,15 +279,15 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
     expect(value.track("video", 0)).toEqual([[0, 10, 40]]);
   });
 
-  it("throws committed_unverified with Undo guidance when the gap-closing move is not applied", async () => {
+  it("returns a committed_unverified receipt with Undo guidance when the gap-closing move is not applied", async () => {
     const value = timelineHost([rippleTrack()], [], { ignoreMoves: true });
-    const failure = await value.registry.dispatch("trackItem.rippleDelete", rippleArgs("ripple-no-move")).catch((error: Error & { code?: string }) => error);
-    expect(failure).toMatchObject({ code: "UXP_COMMITTED_UNVERIFIED" });
-    expect((failure as Error).message).toContain("the project has already changed");
-    expect((failure as Error).message).toContain("the delete left a gap of 10s");
-    expect((failure as Error).message).toContain("Do not retry this call");
-    expect((failure as Error).message).toContain("Undo 2 times");
-    expect((failure as { noHostWrite?: boolean }).noHostWrite).toBeUndefined();
+    const result = await value.registry.dispatch("trackItem.rippleDelete", rippleArgs("ripple-no-move"));
+    expect(result).toMatchObject({ rippleDeleted: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: 2, rollbackPerformed: false, after: null, before: expectedSnapshot });
+    const text = JSON.stringify(result);
+    expect(text).toContain("project has already changed");
+    expect(text).toContain("the delete left a gap of 10s");
+    expect(text).toContain("Do not retry this call");
+    expect(text).toContain("Undo 2 times");
   });
 });
 
@@ -268,20 +296,25 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
 // ---------------------------------------------------------------------------------------------
 
 describe("trackItems.remove", () => {
-  const items = (...coordinates: Array<[Kind, number, number]>) => coordinates.map(([mediaType, trackIndex, clipIndex]) => ({ mediaType, trackIndex, clipIndex }));
+  /** A coordinate plus the guard every removal must carry, read from the host's current layout. */
+  const items = (value: ReturnType<typeof timelineHost>, ...coordinates: Array<[Kind, number, number]>) => coordinates.map(([mediaType, trackIndex, clipIndex]) => {
+    const sorted = [...value.lists[mediaType][trackIndex]!].sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)));
+    const state = sorted[clipIndex]!.state;
+    return { mediaType, trackIndex, clipIndex, expectedProjectItemId: state.pid, expectedStartTicks: state.start };
+  });
   const apply = (value: ReturnType<typeof timelineHost>, args: Record<string, unknown>, operationId: string) =>
     value.registry.dispatch("trackItems.remove", { confirmRemove: true, operationId, ...args });
 
   it("removes in one transaction and leaves a gap when ripple is off, building the selection inside lockedAccess", async () => {
     const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0), clip("c", 20, 30, 0)]]);
-    await expect(apply(value, { items: items(["video", 0, 1]) }, "rm-1")).resolves.toMatchObject({ removed: true, verified: true, outcome: "verified", ripple: false, itemsRemoved: 1, itemsMoved: 0, undoSteps: 1 });
+    await expect(apply(value, { items: items(value, ["video", 0, 1]) }, "rm-1")).resolves.toMatchObject({ removed: true, verified: true, outcome: "verified", ripple: false, itemsRemoved: 1, itemsMoved: 0, undoSteps: 1 });
     expect(value.track("video", 0)).toEqual([[0, 10, 0], [20, 30, 0]]);
     expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
   });
 
   it("closes each track with exact moves when ripple is on, across video and audio in one selection", async () => {
     const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0), clip("c", 20, 30, 0)]], [[clip("x", 0, 10, 0), clip("y", 10, 20, 0)]]);
-    await expect(apply(value, { items: items(["video", 0, 1], ["audio", 0, 0]), ripple: true }, "rm-2")).resolves.toMatchObject({ removed: true, outcome: "verified", itemsRemoved: 2, itemsMoved: 2, undoSteps: 2 });
+    await expect(apply(value, { items: items(value, ["video", 0, 1], ["audio", 0, 0]), ripple: true }, "rm-2")).resolves.toMatchObject({ removed: true, outcome: "verified", itemsRemoved: 2, itemsMoved: 2, undoSteps: 2 });
     expect(value.track("video", 0)).toEqual([[0, 10, 0], [10, 20, 0]]);
     expect(value.track("audio", 0)).toEqual([[0, 10, 0]]);
     expect(value.removeAction).toHaveBeenCalledWith(expect.anything(), false, 3, false);
@@ -290,12 +323,18 @@ describe("trackItems.remove", () => {
   it("refuses a reviewed coordinate that no longer matches, before any write", async () => {
     // A fresh host per attempt: the dispatcher fences a registry after an untagged failure until it honours noHostWrite.
     const fresh = () => timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0)]]);
+    const guard = { expectedProjectItemId: "b", expectedStartTicks: tk(10) };
     const attempts: Array<[(value: ReturnType<typeof timelineHost>) => Promise<unknown>, string]> = [
-      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "somebody-else" }] }, "rm-3"), "UXP_STALE_TRACK_ITEM"],
-      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedStartTicks: tk(11) }] }, "rm-4"), "UXP_STALE_TRACK_ITEM"],
-      [(v) => apply(v, { items: items(["video", 0, 5]) }, "rm-5"), "UXP_TARGET_NOT_FOUND"],
-      [(v) => apply(v, { items: items(["video", 0, 1], ["video", 0, 1]) }, "rm-6"), "UXP_INVALID_ARGUMENT"],
-      [(v) => v.registry.dispatch("trackItems.remove", { items: items(["video", 0, 1]), operationId: "rm-7" }), "UXP_CONFIRMATION_REQUIRED"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "somebody-else", expectedStartTicks: tk(10) }] }, "rm-3"), "UXP_STALE_TRACK_ITEM"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "b", expectedStartTicks: tk(11) }] }, "rm-4"), "UXP_STALE_TRACK_ITEM"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "b", expectedStartSeconds: 11 }] }, "rm-4b"), "UXP_STALE_TRACK_ITEM"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 5, ...guard }] }, "rm-5"), "UXP_TARGET_NOT_FOUND"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, ...guard }, { mediaType: "video", trackIndex: 0, clipIndex: 1, ...guard }] }, "rm-6"), "UXP_INVALID_ARGUMENT"],
+      [(v) => v.registry.dispatch("trackItems.remove", { items: items(v, ["video", 0, 1]), operationId: "rm-7" }), "UXP_CONFIRMATION_REQUIRED"],
+      // A coordinate with no guard, or only half of one, is refused: a clip index shifts after any cut.
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1 }] }, "rm-9"), "UXP_INVALID_ARGUMENT"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "b" }] }, "rm-10"), "UXP_INVALID_ARGUMENT"],
+      [(v) => apply(v, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedStartTicks: tk(10) }] }, "rm-11"), "UXP_INVALID_ARGUMENT"],
     ];
     for (const [run, code] of attempts) {
       const value = fresh();
@@ -305,9 +344,26 @@ describe("trackItems.remove", () => {
     }
   });
 
+  it("accepts the start in seconds within half a frame, as trackItem.inspect returns it", async () => {
+    const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0)]]);
+    await expect(apply(value, { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, expectedProjectItemId: "b", expectedStartSeconds: 10.015 }] }, "rm-12")).resolves.toMatchObject({ outcome: "verified" });
+    expect(value.track("video", 0)).toEqual([[0, 10, 0]]);
+  });
+
+  it("refuses an old clip index after a razor shifted it, before any further write", async () => {
+    const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0)]]);
+    const stale = items(value, ["video", 0, 1]); // b, reviewed before the cut
+    await expect(value.registry.dispatch("trackItem.razor", { confirmRazor: true, operationId: "rz-shift", mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4 })).resolves.toMatchObject({ outcome: "verified" });
+    const transactions = value.project.executeTransaction.mock.calls.length;
+    // Clip 1 is now the right half of a, not b.
+    await expect(apply(value, { items: stale }, "rm-13")).rejects.toMatchObject({ code: "UXP_STALE_TRACK_ITEM", noHostWrite: true });
+    expect(value.project.executeTransaction).toHaveBeenCalledTimes(transactions);
+    expect(value.track("video", 0)).toEqual([[0, 4, 0], [4, 10, 4], [10, 20, 0]]);
+  });
+
   it("reports committed_unverified with the Undo count when the ripple move does not land", async () => {
     const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0)]], [], { ignoreMoves: true });
-    await expect(apply(value, { items: items(["video", 0, 0]), ripple: true }, "rm-8")).resolves.toMatchObject({
+    await expect(apply(value, { items: items(value, ["video", 0, 0]), ripple: true }, "rm-8")).resolves.toMatchObject({
       removed: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: 2, rollbackPerformed: false,
       problems: [expect.stringContaining("instead of")],
     });
@@ -424,6 +480,36 @@ describe("timeline.range.extract", () => {
     const clear = timelineHost([[clip("a", 0, 30, 0)]], [[clip("partner", 0, 5, 0)]]);
     await expect(extract(clear, { startSeconds: 10, endSeconds: 12, videoTracks: [0], audioTracks: [] }, "ex-3")).resolves.toMatchObject({ outcome: "verified", tracks: 1 });
     expect(clear.track("audio", 0)).toEqual([[0, 5, 0]]);
+  });
+
+  it("treats the media type you did not name as no tracks, so a linked partner blocks the extract", async () => {
+    const value = timelineHost([[clip("a", 0, 30, 0)]], [[clip("partner", 0, 30, 0)]]);
+    await expect(extract(value, { startSeconds: 10, endSeconds: 12, videoTracks: [0] }, "ex-10")).rejects.toMatchObject({
+      code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true, message: expect.stringContaining("audio track 0 clip 0"),
+    });
+    expect(value.project.executeTransaction).not.toHaveBeenCalled();
+    const only = timelineHost([[clip("a", 0, 30, 0)]], [[clip("partner", 0, 30, 0)]]);
+    await expect(extract(only, { startSeconds: 10, endSeconds: 12, audioTracks: [0] }, "ex-11")).rejects.toMatchObject({ code: "UXP_TARGET_UNSUPPORTED", message: expect.stringContaining("video track 0 clip 0") });
+    // Naming neither still means every track.
+    const all = timelineHost([[clip("a", 0, 30, 0)]], [[clip("partner", 0, 30, 0)]]);
+    await expect(extract(all, { startSeconds: 10, endSeconds: 12 }, "ex-12")).resolves.toMatchObject({ outcome: "verified", tracks: 2 });
+  });
+
+  it("counts clips after the range on tracks that were left alone", async () => {
+    const value = timelineHost([[clip("a", 0, 30, 0)]], [[clip("partner", 0, 5, 0), clip("later-1", 20, 25, 0), clip("later-2", 25, 30, 0)]]);
+    await expect(extract(value, { startSeconds: 10, endSeconds: 12, videoTracks: [0], audioTracks: [] }, "ex-13")).resolves.toMatchObject({ outcome: "verified", laterClipsOnUntouchedTracks: 2 });
+  });
+
+  it("orders the closing moves itself: earliest first even when the host lists items latest first and overwrites on a bad move", async () => {
+    const value = timelineHost([[clip("a", 0, 10, 0), clip("b", 10, 20, 0), clip("c", 20, 30, 0), clip("d", 30, 40, 0)]], [], { reverseOrder: true, overwriteOnMove: true });
+    const order: string[] = [];
+    for (const item of value.lists.video[0]!) {
+      const original = item.createMoveAction.getMockImplementation()!;
+      item.createMoveAction.mockImplementation(((by: { ticks: string }) => { const action = original(by as never); return { apply: () => { order.push(item.state.pid); action.apply(); } }; }) as never);
+    }
+    await expect(extract(value, { startSeconds: 10, endSeconds: 20 }, "ex-14")).resolves.toMatchObject({ outcome: "verified", itemsMoved: 2 });
+    expect(order).toEqual(["c", "d"]);
+    expect(value.track("video", 0)).toEqual([[0, 10, 0], [10, 20, 0], [20, 30, 0]]);
   });
 
   it("removes whole clips inside the range and shifts a clip that starts inside it", async () => {

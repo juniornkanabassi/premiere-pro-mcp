@@ -114,8 +114,10 @@
         assertRippleSupported(before);
         // Other tracks no longer block the delete (live 27.0 refused it for nothing), but their
         // items are not moved, so a linked partner drifts. Report them; the scan is advisory.
-        const overlaps = await crossTrackBlockers(context.sequence, context, before.target.startSeconds, before.target.endSeconds).catch(function () { return null; });
+        let scan = null, scanError = null;
+        try { scan = await crossTrackBlockers(context.sequence, context, before.target.startSeconds, before.target.endSeconds); } catch (error) { scanError = error && error.message ? error.message : String(error); }
         const progress = { undoSteps: 0 };
+        const scanReport = { otherTrackItemsOverRange: scan ? scan.blockers.slice(0, 8) : null, laterClipsOnUntouchedTracks: scan ? scan.later : null, ...(scanError ? { scanError } : {}) };
         let after;
         try {
           // The edit engine needs the sequence timebase, which the inspection context does not carry.
@@ -135,14 +137,10 @@
         } catch (error) {
           if (!progress.undoSteps) throw error;
           // The remove already committed, so a bare failure would invite a retry that deletes a second clip.
-          throw commandError(
-            "UXP_COMMITTED_UNVERIFIED",
-            "Premiere committed " + progress.undoSteps + " transaction" + (progress.undoSteps === 1 ? "" : "s") +
-              ", so the project has already changed, but the result is not the requested contiguous ripple delete: " +
-              (error && error.message ? error.message : String(error)) +
-              ". Do not retry this call. Inspect the track and use Premiere Undo " + progress.undoSteps + " time" +
-              (progress.undoSteps === 1 ? "" : "s") + " if the result is unwanted."
-          );
+          // Return the same receipt shape as remove, razor and extract so undo can record it.
+          return Object.assign(unverified({ rippleDeleted: false, before, after: null, ...scanReport }, progress, [
+            "The project has already changed, but the result is not the requested contiguous ripple delete: " + (error && error.message ? error.message : String(error)) + ". Do not retry this call."
+          ]), { readbackError: error && error.message ? error.message : String(error) });
         }
         return {
           rippleDeleted: true,
@@ -152,7 +150,7 @@
           verificationBoundary: "planned_track_layout_and_successor_readback",
           undoLabel: "Ripple delete timeline item",
           undoSteps: progress.undoSteps,
-          otherTrackItemsOverRange: overlaps ? overlaps.slice(0, 8) : null
+          ...scanReport
         };
       });
     }
@@ -184,10 +182,11 @@
     }
 
     // Items on other tracks over the removed range are not moved by a single-track ripple, so
-    // a linked partner or spanning layer drifts. Find them so the receipt can say so.
+    // a linked partner or spanning layer drifts. Count them, and the clips after the edit point
+    // that are now out of sync, so the receipt can say so.
     async function crossTrackBlockers(sequence, target, startSeconds, endSeconds) {
       const itemType = ppro.Constants && ppro.Constants.TrackItemType, blockers = [];
-      let scanned = 0;
+      let scanned = 0, later = 0;
       for (const mediaType of ["video", "audio"]) {
         const title = mediaType === "video" ? "Video" : "Audio";
         const countMethod = "get" + title + "TrackCount", trackMethod = "get" + title + "Track";
@@ -206,10 +205,11 @@
             const start = tickSeconds(await items[clipIndex].getStartTime()), end = tickSeconds(await items[clipIndex].getEndTime());
             if (start == null || end == null) throw commandError("UXP_VERIFICATION_FAILED", "Premiere returned unreadable item timing while checking the ripple range");
             if (start < endSeconds - 0.000001 && end > startSeconds + 0.000001) blockers.push({ mediaType, trackIndex, clipIndex });
+            else if (start >= endSeconds - 0.000001) later++;
           }
         }
       }
-      return blockers;
+      return { blockers, later };
     }
 
     async function trackItemsAt(sequence, target) {
@@ -559,6 +559,11 @@
           if (request.expectedStartTicks != null && info.start !== BigInt(request.expectedStartTicks)) {
             throw refuse("UXP_STALE_TRACK_ITEM", mediaType + " track " + trackIndex + " clip " + request.clipIndex + " does not start at the reviewed time");
           }
+          // Seconds come from trackItem.inspect as floats, so match within half a frame.
+          if (request.expectedStartSeconds != null) {
+            const wantTicks = BigInt(Math.round(request.expectedStartSeconds * 1000000)) * TICKS_PER_SECOND / 1000000n, off = info.start - wantTicks;
+            if ((off < 0n ? -off : off) > context.frame / 2n) throw refuse("UXP_STALE_TRACK_ITEM", mediaType + " track " + trackIndex + " clip " + request.clipIndex + " does not start at the reviewed time");
+          }
           removed.add(request.clipIndex - from);
         }
         groups.push({ mediaType, trackIndex, from, items: read.items, infos: read.infos, removed });
@@ -588,7 +593,7 @@
       });
     }
 
-    // Moves every later item to its planned start, nearest first so each lands in space already freed.
+    // Moves every later item to its planned start (see the ordering below).
     // plans: [{ mediaType, trackIndex, from, expected }]. Returns how many items moved.
     async function moveToLayout(context, progress, plans, label) {
       const moves = [];
@@ -600,12 +605,16 @@
         read.infos.forEach(function (info, index) {
           if (info.pid !== plan.expected[index].pid) throw commandError("UXP_VERIFICATION_FAILED", plan.mediaType + " track " + plan.trackIndex + " has a different clip order after the removal than planned");
           const delta = plan.expected[index].start - info.start;
-          if (delta !== 0n) moves.push({ item: info.item, delta });
+          if (delta !== 0n) moves.push({ item: info.item, delta, start: info.start });
         });
       }
       if (!moves.length) return 0;
+      // Never rely on the host's item order: left moves go earliest first, right moves latest first, so each lands in space already freed.
+      const byStart = function (left, right) { return left.start < right.start ? -1 : left.start > right.start ? 1 : 0; };
+      const ordered = moves.filter(function (move) { return move.delta < 0n; }).sort(byStart)
+        .concat(moves.filter(function (move) { return move.delta > 0n; }).sort(function (left, right) { return byStart(right, left); }));
       transact(context, progress, label, function () {
-        return moves.map(function (move) { return requiredMethod(move.item, "createMoveAction")(tickTime(move.delta)); });
+        return ordered.map(function (move) { return requiredMethod(move.item, "createMoveAction")(tickTime(move.delta)); });
       });
       return moves.length;
     }
@@ -628,15 +637,20 @@
       const seen = new Set();
       const requests = args.items.map(function (value) {
         assertObject(value, "items[]");
-        assertOnlyKeys(value, ["mediaType", "trackIndex", "clipIndex", "expectedProjectItemId", "expectedStartTicks"]);
+        assertOnlyKeys(value, ["mediaType", "trackIndex", "clipIndex", "expectedProjectItemId", "expectedStartTicks", "expectedStartSeconds"]);
         const request = targetCoordinates(value), key = request.mediaType + ":" + request.trackIndex + ":" + request.clipIndex;
         if (seen.has(key)) throw refuse("UXP_INVALID_ARGUMENT", "items lists " + key + " twice");
         seen.add(key);
-        if (value.expectedProjectItemId != null) request.expectedProjectItemId = requiredIdentifierArg(value.expectedProjectItemId, "expectedProjectItemId");
+        // A clip index shifts whenever anything is cut or removed, so every coordinate must name its clip and where it starts.
+        if (value.expectedProjectItemId == null || (value.expectedStartTicks == null && value.expectedStartSeconds == null)) {
+          throw refuse("UXP_INVALID_ARGUMENT", "items[] needs expectedProjectItemId and expectedStartTicks (or expectedStartSeconds) so a shifted clip index cannot remove the wrong clip");
+        }
+        request.expectedProjectItemId = requiredIdentifierArg(value.expectedProjectItemId, "expectedProjectItemId");
         if (value.expectedStartTicks != null) {
           if (typeof value.expectedStartTicks !== "string" || !/^\d{1,30}$/.test(value.expectedStartTicks)) throw refuse("UXP_INVALID_ARGUMENT", "expectedStartTicks must be a non-negative tick string");
           request.expectedStartTicks = value.expectedStartTicks;
         }
+        if (value.expectedStartSeconds != null) request.expectedStartSeconds = boundedSeconds(value.expectedStartSeconds, "expectedStartSeconds");
         return request;
       });
       const context = await editContext(), progress = { undoSteps: 0 };
@@ -770,12 +784,14 @@
       if (args.confirmExtract !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "timeline.range.extract requires confirmExtract: true");
       requireOperationId(args.operationId);
       const startSeconds = boundedSeconds(args.startSeconds, "startSeconds"), endSeconds = boundedSeconds(args.endSeconds, "endSeconds");
-      const wanted = { video: trackList(args.videoTracks, "videoTracks"), audio: trackList(args.audioTracks, "audioTracks") };
+      // Naming tracks for one media type leaves the other alone, so the blocker check protects a linked partner. Naming neither means every track.
+      const named = args.videoTracks != null || args.audioTracks != null;
+      const wanted = { video: trackList(args.videoTracks, "videoTracks") || (named ? [] : null), audio: trackList(args.audioTracks, "audioTracks") || (named ? [] : null) };
       const context = await editContext(), progress = { undoSteps: 0 };
       const a = snapTicks(startSeconds, context.frame), b = snapTicks(endSeconds, context.frame);
       if (b <= a) throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be after startSeconds once both snap to a frame");
       const shift = b - a, chosen = [], blockers = [];
-      let scanned = 0, touched = 0, later = 0;
+      let scanned = 0, touched = 0, later = 0, laterUntouched = 0;
       for (const mediaType of ["video", "audio"]) {
         const count = await trackCount(context.sequence, mediaType);
         for (const index of wanted[mediaType] || []) if (index >= count) throw refuse("UXP_TARGET_NOT_FOUND", mediaType + " track " + index + " does not exist");
@@ -784,7 +800,10 @@
           scanned += read.infos.length;
           if (scanned > MAX_SCANNED_ITEMS) throw refuse("UXP_TARGET_TOO_LARGE", "Too many timeline items to extract from safely in one call");
           if (wanted[mediaType] && wanted[mediaType].indexOf(trackIndex) === -1) {
-            read.infos.forEach(function (info, clipIndex) { if (info.start < b && info.end > a) blockers.push(mediaType + " track " + trackIndex + " clip " + clipIndex); });
+            read.infos.forEach(function (info, clipIndex) {
+              if (info.start < b && info.end > a) blockers.push(mediaType + " track " + trackIndex + " clip " + clipIndex);
+              else if (info.start >= b) laterUntouched++;
+            });
             continue;
           }
           for (const info of read.infos) {
@@ -802,7 +821,7 @@
       if (!touched && !later) throw refuse("UXP_TARGET_NOT_FOUND", "Nothing on the chosen tracks is inside or after the range");
       if (later > MAX_TRACK_ITEMS) throw refuse("UXP_TARGET_TOO_LARGE", "More than " + MAX_TRACK_ITEMS + " items would have to move");
       const specs = chosen.map(function (track) { return { mediaType: track.mediaType, trackIndex: track.trackIndex }; });
-      const base = { extracted: false, startSeconds: secondsOf(a), endSeconds: secondsOf(b) };
+      const base = { extracted: false, startSeconds: secondsOf(a), endSeconds: secondsOf(b), laterClipsOnUntouchedTracks: laterUntouched };
       return guarded(progress, base, async function () {
         // Cut at the far edge first so the second cut still finds one item to split.
         for (const cut of [b, a]) {
@@ -825,6 +844,7 @@
         return {
           extracted: true, committed: true, verified: true, outcome: "verified", startSeconds: secondsOf(a), endSeconds: secondsOf(b), removedSeconds: secondsOf(shift),
           tracks: chosen.length, itemsRemoved: requests.length, itemsMoved: moved, maxPositionErrorSeconds: secondsOf(verified.maxError),
+          laterClipsOnUntouchedTracks: laterUntouched,
           undoSteps: progress.undoSteps, verificationBoundary: "planned_track_layout_readback"
         };
       });

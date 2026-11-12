@@ -66,4 +66,13 @@ describe("public guarded contiguous track-item ripple-delete MCP tool", () => {
     })).rejects.toThrow("items[] has an unknown field: surprise");
     expect(request).not.toHaveBeenCalled();
   });
+
+  it("marks the project-item guard required and passes the start in seconds through", async () => {
+    const request = vi.fn().mockResolvedValue({ outcome: "verified" });
+    const tool = getUxpRippleDeleteWorkflowTools({ request } as unknown as UxpWebSocketBridge).remove_track_items_uxp;
+    expect(tool.parameters.properties.items.items.required).toContain("expected_project_item_id");
+    // The panel, not this wrapper, refuses a missing start guard (tested in tests/uxp), so the call is forwarded unchanged.
+    await tool.handler({ items: [{ media_type: "video", track_index: 0, clip_index: 0, expected_project_item_id: "p1", expected_start_seconds: 12.5 }], confirm_remove: true, operation_id: "rm-4" });
+    expect(request).toHaveBeenCalledWith("trackItems.remove", { items: [{ mediaType: "video", trackIndex: 0, clipIndex: 0, expectedProjectItemId: "p1", expectedStartSeconds: 12.5 }], confirmRemove: true, operationId: "rm-4" });
+  });
 });

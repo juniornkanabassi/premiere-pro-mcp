@@ -84,7 +84,7 @@ const trackIndexList = { type: "array", maxItems: 64, uniqueItems: true, items: 
 const seconds = { type: "number", minimum: 0, maximum: 86400 } as const;
 
 type RemoveItemsArgs = {
-  items: Array<{ media_type: "video" | "audio"; track_index: number; clip_index: number; expected_project_item_id?: string; expected_start_ticks?: string }>;
+  items: Array<{ media_type: "video" | "audio"; track_index: number; clip_index: number; expected_project_item_id: string; expected_start_ticks?: string; expected_start_seconds?: number }>;
   ripple?: boolean; confirm_remove?: boolean; operation_id?: string;
 };
 type RazorArgs = {
@@ -98,31 +98,33 @@ type ExtractArgs = {
 
 function removeItemCoordinate(item: RemoveItemsArgs["items"][number]) {
   if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("items[] must be objects");
-  const allowed = ["media_type", "track_index", "clip_index", "expected_project_item_id", "expected_start_ticks"];
+  const allowed = ["media_type", "track_index", "clip_index", "expected_project_item_id", "expected_start_ticks", "expected_start_seconds"];
   for (const key of Object.keys(item)) if (!allowed.includes(key)) throw new Error(`items[] has an unknown field: ${key}`);
   return {
     mediaType: item.media_type, trackIndex: item.track_index, clipIndex: item.clip_index,
-    ...(item.expected_project_item_id === undefined ? {} : { expectedProjectItemId: item.expected_project_item_id }),
+    expectedProjectItemId: item.expected_project_item_id,
     ...(item.expected_start_ticks === undefined ? {} : { expectedStartTicks: item.expected_start_ticks }),
+    ...(item.expected_start_seconds === undefined ? {} : { expectedStartSeconds: item.expected_start_seconds }),
   };
 }
 
 export function getUxpRippleDeleteWorkflowTools(bridge: UxpWebSocketBridge) {
   return {
     remove_track_items_uxp: {
-      description: "Remove timeline items by coordinate, optionally closing the gaps. With ripple: true each edited track is closed up by moving later items by the exact removed length (Premiere's own ripple shifts whole frames and its overlap flag is unreliable, so it is not used); items on other tracks, such as a linked partner, are not moved. Reads every edited track back against the planned layout and reports verified, or committed_unverified with the Undo count. Optional expected_project_item_id / expected_start_ticks guard each coordinate against a stale view. Needs confirm_remove and an operation ID.",
+      description: "Remove timeline items by coordinate, optionally closing the gaps. With ripple: true each edited track is closed up by moving later items by the exact removed length (Premiere's own ripple shifts whole frames and its overlap flag is unreliable, so it is not used); items on other tracks, such as a linked partner, are not moved. Reads every edited track back against the planned layout and reports verified, or committed_unverified with the Undo count. Every item must carry expected_project_item_id and either expected_start_ticks or expected_start_seconds (matched within half a frame), because a clip index shifts after any cut or removal; a missing or mismatched guard is refused by the panel before any change. Needs confirm_remove and an operation ID.",
       parameters: {
         type: "object" as const, additionalProperties: false,
         properties: {
           items: {
             type: "array", minItems: 1, maxItems: 512,
             items: {
-              type: "object", additionalProperties: false, required: ["media_type", "track_index", "clip_index"],
+              type: "object", additionalProperties: false, required: ["media_type", "track_index", "clip_index", "expected_project_item_id"],
               properties: {
                 media_type: { type: "string", enum: ["video", "audio"] },
                 track_index: { type: "integer", minimum: 0, maximum: 511 }, clip_index: { type: "integer", minimum: 0, maximum: 511 },
                 expected_project_item_id: { type: "string", minLength: 1, maxLength: 512 },
-                expected_start_ticks: { type: "string", pattern: "^\\d{1,30}$", description: "Tick string of the clip's reviewed start." },
+                expected_start_ticks: { type: "string", pattern: "^\\d{1,30}$", description: "Tick string of the clip's reviewed start. Give this or expected_start_seconds." },
+                expected_start_seconds: { type: "number", minimum: 0, maximum: 86400, description: "Reviewed start in seconds (as trackItem.inspect returns it). Give this or expected_start_ticks." },
               },
             },
           },
@@ -165,13 +167,13 @@ export function getUxpRippleDeleteWorkflowTools(bridge: UxpWebSocketBridge) {
       }),
     },
     extract_timeline_range_uxp: {
-      description: "Cut a time range out of the timeline and close the gap (an extract). Razors the chosen tracks at the range edges, removes what is inside, then moves every later item left by the exact range length and reads the result back. Defaults to all tracks; video_tracks / audio_tracks limit it, and a track you leave out that has an item over the range makes the call refuse before changing anything, so linked partners cannot drift. Refuses retimed or reversed items at the range edges. Many Undo steps (reported). Needs confirm_extract and an operation ID.",
+      description: "Cut a time range out of the timeline and close the gap (an extract). Razors the chosen tracks at the range edges, removes what is inside, then moves every later item left by the exact range length and reads the result back. Defaults to all tracks when neither video_tracks nor audio_tracks is given. If either is given, the other media type defaults to no tracks, and any track left out that has an item over the range makes the call refuse before changing anything, so linked partners cannot drift. The receipt reports laterClipsOnUntouchedTracks (clips after the range on tracks that were not shifted). Refuses retimed or reversed items at the range edges. Many Undo steps (reported). Needs confirm_extract and an operation ID.",
       parameters: {
         type: "object" as const, additionalProperties: false,
         properties: {
           start_seconds: seconds, end_seconds: seconds,
-          video_tracks: { ...trackIndexList, description: "Video track indexes to edit. Omit for all." },
-          audio_tracks: { ...trackIndexList, description: "Audio track indexes to edit. Omit for all." },
+          video_tracks: { ...trackIndexList, description: "Video track indexes to edit. Omit both lists for all tracks; if only audio_tracks is given, no video track is edited." },
+          audio_tracks: { ...trackIndexList, description: "Audio track indexes to edit. Omit both lists for all tracks; if only video_tracks is given, no audio track is edited." },
           confirm_extract: { type: "boolean", description: "Must be true." }, operation_id: operationIdSchema,
         },
         required: ["start_seconds", "end_seconds", "confirm_extract", "operation_id"],
@@ -186,7 +188,7 @@ export function getUxpRippleDeleteWorkflowTools(bridge: UxpWebSocketBridge) {
       }),
     },
     ripple_delete_track_item_uxp: {
-      description: "Inspect or perform one guarded ripple delete on an audio or video timeline item using documented UXP SequenceEditor actions. Apply requires complete target and contiguous-successor snapshots, explicit confirmation, and an operation ID; it serializes with guarded slips, slides, and append duplicates on that track, commits two transactions (remove, then close the gap), and reads back the successor at the removed coordinate. It refuses before any change when it cannot ripple: a final item or a gap. Premiere's own ripple is not used (live 27.0 shifts whole frames and its overlap flag is unreliable): the clip is removed without ripple, then the successors on that track move by the exact removed length and are read back. Items on other tracks over the range are reported in otherTrackItemsOverRange, not moved. It does not prove media handles, linked A/V synchronization, rendered frames, playback, persistence, or Undo behavior.",
+      description: "Inspect or perform one guarded ripple delete on an audio or video timeline item using documented UXP SequenceEditor actions. Apply requires complete target and contiguous-successor snapshots, explicit confirmation, and an operation ID; it serializes with guarded slips, slides, and append duplicates on that track, commits two transactions (remove, then close the gap), and reads back the successor at the removed coordinate. It refuses before any change when it cannot ripple: a final item or a gap. Premiere's own ripple is not used (live 27.0 shifts whole frames and its overlap flag is unreliable): the clip is removed without ripple, then the successors on that track move by the exact removed length and are read back. Items on other tracks over the range are reported in otherTrackItemsOverRange, and the clips after the edit on those untouched tracks (now out of sync) are counted in laterClipsOnUntouchedTracks, not moved. A failure after the remove returns a committed_unverified receipt with the Undo count. It does not prove media handles, linked A/V synchronization, rendered frames, playback, persistence, or Undo behavior.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
