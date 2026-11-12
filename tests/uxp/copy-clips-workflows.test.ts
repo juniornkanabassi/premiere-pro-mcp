@@ -68,7 +68,7 @@ function item(kind: Kind, projectItemId: string, start: number, end: number, inP
  * two on V1 (0-40, 40-100, the second disabled), b-roll on V2 at 30-35, mixdown
  * on A0 (0-100). Destination "Segment": a body clip on V0 at 20-30 s.
  */
-function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean } = {}) {
+function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?: (state: ItemState, kind: Kind) => void } = {}) {
   counter = 0;
   const source = makeSequence("seq-backup", "Backup", [
     [item("video", "host", 0, 100, 1000, { name: "Host.MXF" })],
@@ -95,6 +95,7 @@ function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean } = {}) 
       const shift = BigInt(offset.ticks);
       const copy = makeItem({ ...sourceItem.state, id: `clone-${++counter}`, start: String(BigInt(sourceItem.state.start) + shift), end: String(BigInt(sourceItem.state.end) + shift) }, options);
       if (options.readbackBreaks) copy.state.disabled = !copy.state.disabled;
+      options.drift?.(copy.state, found.kind);
       destination.tracks[found.kind][found.index + (found.kind === "video" ? videoOffset : audioOffset)].push(copy);
       expect(alignToVideo).toBe(false);
       expect(isInsert).toBe(false);
@@ -258,5 +259,193 @@ describe("UXP copy clips between sequences", () => {
     const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
     const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "trim-broken" });
     expect(result).toMatchObject({ copied: false, committed: true, outcome: "committed_unverified" });
+  });
+
+  describe("readback tolerance", () => {
+    const whole = (extra: Record<string, unknown> = {}) => request({ videoTracks: [2], audioTracks: [], destinationStartTicks: tick(40), ...extra });
+    const run = async (value: ReturnType<typeof host>, args: Record<string, unknown>) => {
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      return value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "tol-" + ++counter });
+    };
+
+    it("verifies a video end that lands 1 tick short and reports the deviation", async () => {
+      const value = host({ drift: (state, kind) => { if (kind === "video") state.end = String(BigInt(state.end) - 1n); } });
+      await expect(run(value, whole())).resolves.toMatchObject({ copied: true, verified: true, outcome: "verified", maxDeviationTicks: "1" });
+    });
+
+    it("verifies audio that lands less than one sample away", async () => {
+      const value = host({ drift: (state, kind) => { if (kind === "audio") { state.start = String(BigInt(state.start) + 3000000n); state.end = String(BigInt(state.end) + 3000000n); } } });
+      const args = request({ videoTracks: [], audioTracks: [0], sourceStartTicks: tick(0), sourceEndTicks: tick(100), destinationStartTicks: tick(0) });
+      await expect(run(value, args)).resolves.toMatchObject({ copied: true, verified: true, outcome: "verified", maxDeviationTicks: "3000000" });
+    });
+
+    it("takes the sample from the sequence audio rate, falling back to 44.1 kHz", async () => {
+      const drift = (state: ItemState, kind: Kind) => { if (kind === "audio") { state.start = String(BigInt(state.start) + 5500000n); state.end = String(BigInt(state.end) + 5500000n); } };
+      const args = request({ videoTracks: [], audioTracks: [0], sourceStartTicks: tick(0), sourceEndTicks: tick(100), destinationStartTicks: tick(0) });
+      // No rate on the sequence: the larger 44.1 kHz sample (5,760,000 ticks) applies.
+      await expect(run(host({ drift }), args)).resolves.toMatchObject({ verified: true, maxDeviationTicks: "5500000" });
+      // A 48 kHz sequence has a 5,292,000 tick sample, so the same landing is a real miss.
+      const value = host({ drift });
+      (value.destination as unknown as { getAudioSampleRate: () => Promise<number> }).getAudioSampleRate = async () => 48000;
+      await expect(run(value, args)).resolves.toMatchObject({ verified: false, outcome: "committed_unverified" });
+    });
+
+    it("does not verify a video clip that lands a whole frame away", async () => {
+      const frame = 254016000n;
+      const value = host({ drift: (state, kind) => { if (kind === "video") state.end = String(BigInt(state.end) + frame); } });
+      const result = await run(value, whole());
+      expect(result).toMatchObject({ copied: false, committed: true, partial: true, outcome: "committed_unverified", maxDeviationTicks: String(frame) });
+      expect(result.problems[0]).toContain("planned source range");
+    });
+  });
+
+  describe("camera cut segments", () => {
+    /** One sequence: cam1 on V0 and cam2 on V1 as ready-cut pieces (or whole when long), plus a mic on A0. */
+    function stack(long = false, options: { createsTrack?: boolean; video?: Item[][] } = {}) {
+      counter = 0;
+      const piece = (id: string, start: number, end: number) => item("video", id, long ? 0 : start, long ? 100 : end, 1000 + (long ? 0 : start), { name: id + "@" + start });
+      const sequence = makeSequence("seq-stack", "Stack",
+        options.video ?? [long ? [piece("cam1", 0, 10)] : [piece("cam1", 0, 10), piece("cam1", 20, 30)], [piece("cam2", 10, 20)]],
+        [[item("audio", "mic", 0, 100, 0)]]);
+      let latestEnd = 0n;
+      const clone = vi.fn((sourceItem: Item, offset: { ticks: string }, videoOffset: number) => ({
+        apply: () => {
+          let index = sequence.tracks.video.findIndex((list) => list.includes(sourceItem)) + videoOffset;
+          // Without track creation a clone aimed past the last track lands on it.
+          if (options.createsTrack === false) index = Math.min(index, sequence.tracks.video.length - 1);
+          sequence.tracks.video[index] ??= [];
+          const shift = BigInt(offset.ticks);
+          const copy = makeItem({ ...sourceItem.state, id: `clone-${++counter}`, start: String(BigInt(sourceItem.state.start) + shift), end: String(BigInt(sourceItem.state.end) + shift) });
+          if (BigInt(copy.state.end) > latestEnd) latestEnd = BigInt(copy.state.end);
+          sequence.tracks.video[index].push(copy);
+        },
+      }));
+      const addAction = vi.fn((action: { apply: () => void }) => { action.apply(); return true; });
+      const project = {
+        guid: "project-1", getSequences: vi.fn(async () => [sequence]),
+        lockedAccess: vi.fn((callback: () => void) => callback()),
+        executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }),
+      };
+      const ppro = {
+        Project: { getActiveProject: vi.fn(async () => project) },
+        TickTime: { createWithTicks: vi.fn((ticks: string) => ({ ticks })) },
+        SequenceEditor: { getEditor: vi.fn(() => ({ createCloneTrackItemAction: clone })) },
+        Constants: { TrackItemType: { CLIP: 1 } },
+      };
+      return { sequence, project, clone, latestEnd: () => latestEnd, registry: Commands.createCommandRegistry({ ppro, Protocol }) };
+    }
+    const cut = (programTrack: number, segments: Array<Record<string, unknown>> = [
+      { sourceStartTicks: tick(0), sourceEndTicks: tick(10), videoTrack: 0 },
+      { sourceStartTicks: tick(10), sourceEndTicks: tick(20), videoTrack: 1 },
+      { sourceStartTicks: tick(20), sourceEndTicks: tick(30), videoTrack: 0 },
+    ]) => ({ sourceSequenceId: "seq-stack", destinationSequenceId: "seq-stack", programTrack, segments });
+    const program = (value: ReturnType<typeof stack>, index: number) => [...value.sequence.tracks.video[index]]
+      .sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)))
+      .map((entry) => [entry.state.projectItemId, entry.state.start, entry.state.end, entry.state.inPoint]);
+
+    it("plans exact placements on the program track, one per segment", async () => {
+      const value = stack();
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", cut(2));
+      expect(plan.clips.map((clip: { projectItemId: string; targetTrackIndex: number; startTicks: string; endTicks: string }) => [clip.projectItemId, clip.targetTrackIndex, clip.startTicks, clip.endTicks])).toEqual([
+        ["cam1", 2, tick(0), tick(10)], ["cam2", 2, tick(10), tick(20)], ["cam1", 2, tick(20), tick(30)],
+      ]);
+      expect(plan).toMatchObject({ sourceStartTicks: tick(0), sourceEndTicks: tick(30), destinationStartTicks: tick(0) });
+      expect(value.clone).not.toHaveBeenCalled();
+    });
+
+    it("builds the cut on a new program track with contiguous edges and the cameras untouched", async () => {
+      const value = stack();
+      const args = cut(2);
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "cut-1" });
+      expect(result).toMatchObject({ copied: true, verified: true, outcome: "verified", clipsCopied: 3 });
+      expect(program(value, 2)).toEqual([["cam1", tick(0), tick(10), tick(1000)], ["cam2", tick(10), tick(20), tick(1010)], ["cam1", tick(20), tick(30), tick(1020)]]);
+      // The first clone makes the new track in a transaction of its own.
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(2);
+      expect(result.undoSteps).toBe(2);
+      expect(value.sequence.tracks.video[0]).toHaveLength(2);
+      expect(value.sequence.tracks.video[1]).toHaveLength(1);
+      expect(value.clone.mock.calls.map((call) => [call[2], call[3]])).toEqual([[2, 0], [1, 0], [2, 0]]);
+    });
+
+    it("trims clips that run across the cuts and places them exactly", async () => {
+      const value = stack(true);
+      const args = cut(2);
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "cut-2" });
+      expect(result).toMatchObject({ copied: true, verified: true, clipsTrimmed: 3 });
+      expect(program(value, 2)).toEqual([["cam1", tick(0), tick(10), tick(1000)], ["cam2", tick(10), tick(20), tick(1010)], ["cam1", tick(20), tick(30), tick(1020)]]);
+    });
+
+    it("stops after the first clone when the program track was not created", async () => {
+      const value = stack(false, { createsTrack: false });
+      const args = cut(2);
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "cut-nt" });
+      expect(result).toMatchObject({ copied: false, committed: true, verified: false, outcome: "committed_unverified", undoSteps: 1 });
+      expect(result.readbackError).toContain("did not create video track 2");
+      // Only the first clone was made; the other two never ran.
+      expect(value.clone).toHaveBeenCalledTimes(1);
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("parks long clips in bounded rounds that reuse one slot", async () => {
+      // Two 1 hour cameras and 40 ten second cuts: parking every full-length clone end to end would take 40 hours.
+      counter = 0;
+      const cam = (id: string) => item("video", id, 0, 3600, 0, { name: id });
+      const value = stack(false, { video: [[cam("cam1")], [cam("cam2")]] });
+      const segments = Array.from({ length: 40 }, (_, n) => ({ sourceStartTicks: tick(n * 10), sourceEndTicks: tick(n * 10 + 10), videoTrack: n % 2 }));
+      const args = cut(2, segments);
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "cut-long" });
+      expect(result).toMatchObject({ copied: true, verified: true, clipsTrimmed: 40 });
+      expect(value.sequence.tracks.video[2]).toHaveLength(40);
+      // Nothing ever sat further out than the cut, one gap and the 12 hour budget.
+      expect(value.latestEnd()).toBeLessThanOrEqual(BigInt(tick(400 + 10 + 3600 * 12 + 3600)));
+      expect(result.undoSteps).toBeLessThan(20);
+    });
+
+    it("refuses a trimmed clip too long to park", async () => {
+      const value = stack(false, { video: [[item("video", "cam1", 0, 13 * 3600, 0)], [item("video", "cam2", 0, 100, 0)]] });
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", cut(2, [{ sourceStartTicks: tick(5), sourceEndTicks: tick(10), videoTrack: 0 }])))
+        .rejects.toMatchObject({ code: "UXP_TARGET_TOO_LARGE", noHostWrite: true });
+    });
+
+    it("cuts onto an existing empty track in one transaction", async () => {
+      const value = stack();
+      value.sequence.tracks.video.push([]);
+      const args = cut(2);
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args, expectedSnapshot: plan, confirmCopy: true, operationId: "cut-3" });
+      expect(result).toMatchObject({ verified: true, undoSteps: 1 });
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a busy program track, a missing track and a gap before any write", async () => {
+      const busy = stack();
+      await expect(busy.registry.dispatch("sequence.copyClips.inspect", cut(1, [{ sourceStartTicks: tick(0), sourceEndTicks: tick(10), videoTrack: 0 }])))
+        .rejects.toMatchObject({ code: "UXP_TARGET_OCCUPIED", noHostWrite: true });
+      await expect(stack().registry.dispatch("sequence.copyClips.inspect", cut(5))).rejects.toMatchObject({ code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true });
+      await expect(stack().registry.dispatch("sequence.copyClips.inspect", cut(2, [{ sourceStartTicks: tick(40), sourceEndTicks: tick(50), videoTrack: 0 }])))
+        .rejects.toMatchObject({ code: "UXP_TARGET_NOT_FOUND", noHostWrite: true, message: expect.stringContaining("segments[0] has no clip") });
+      expect(busy.project.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it("refuses overlapping segments, mixed arguments and the program track as a camera", async () => {
+      const value = stack();
+      const overlap = cut(2, [
+        { sourceStartTicks: tick(0), sourceEndTicks: tick(10), videoTrack: 0 },
+        { sourceStartTicks: tick(5), sourceEndTicks: tick(20), videoTrack: 1 },
+      ]);
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", overlap)).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", { ...cut(2), sourceStartTicks: tick(0) })).rejects.toMatchObject({ noHostWrite: true, message: expect.stringContaining("cannot be combined") });
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", cut(0))).rejects.toMatchObject({ noHostWrite: true, message: expect.stringContaining("program track itself") });
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", { ...cut(2), destinationSequenceId: "other" })).rejects.toMatchObject({ noHostWrite: true });
+    });
+
+    it("tags argument refusals on a plain copy as no-write too", async () => {
+      const value = host();
+      await expect(value.registry.dispatch("sequence.copyClips", { ...request(), operationId: "x" })).rejects.toMatchObject({ code: "UXP_CONFIRMATION_REQUIRED", noHostWrite: true });
+    });
   });
 });

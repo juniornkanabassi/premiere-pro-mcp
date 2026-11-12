@@ -544,13 +544,24 @@
         throw commandError("UXP_STALE_SEQUENCE", "The active sequence changed; inspect the timeline selection again before updating it");
       }
       if (desiredItems.length) {
-        const selection = createEmptyTrackItemSelection();
-        for (const item of desiredItems) {
-          if (selection.addItem(item, false) !== true) {
-            throw commandError("UXP_SELECTION_REJECTED", "Premiere rejected a clip while constructing the timeline selection");
-          }
+        // Live Premiere 27.0 (probe P2): addItem returns false outside
+        // lockedAccess and a selection is invalid once its callback returns,
+        // so build it and hand it to setSelection inside one callback.
+        const project = verifiedContext.project;
+        if (!project || typeof project.lockedAccess !== "function") {
+          throw refuse("UXP_COMMAND_UNAVAILABLE", "This Premiere build does not expose locked access, which timeline selection needs");
         }
-        const set = await hostBoolean(verifiedContext.sequence.setSelection(selection));
+        let rejected = false, pending = null;
+        project.lockedAccess(() => {
+          const selection = createEmptyTrackItemSelection();
+          for (const item of desiredItems) {
+            if (selection.addItem(item, false) !== true) { rejected = true; return; }
+          }
+          pending = verifiedContext.sequence.setSelection(selection);
+        });
+        // setSelection has not run when addItem refuses, so nothing was written.
+        if (rejected) throw refuse("UXP_SELECTION_REJECTED", "Premiere rejected a clip while constructing the timeline selection");
+        const set = await hostBoolean(pending);
         if (!set) throw commandError("UXP_SELECTION_REJECTED", "Premiere did not accept the requested timeline selection");
       } else {
         const cleared = await hostBoolean(verifiedContext.sequence.clearSelection());
@@ -668,7 +679,7 @@
       let selection = null;
       const created = ppro.TrackItemSelection.createEmptySelection((value) => { selection = value; });
       if (created !== true || !selection || typeof selection.addItem !== "function") {
-        throw commandError("UXP_SELECTION_REJECTED", "Premiere could not create an empty timeline selection");
+        throw refuse("UXP_SELECTION_REJECTED", "Premiere could not create an empty timeline selection");
       }
       return selection;
     }
@@ -697,8 +708,16 @@
       return left.length === right.length && left.every((value, index) => value === right[index]);
     }
 
-    async function selectedItemsForEffect(context, mediaType) {
-      const selected = await selectedTrackItems(context.sequence), classified = await classifySelection(context.sequence, selected.items);
+    async function selectedItemsForEffect(context, mediaType, targets) {
+      // Explicit targets resolve clips directly, so a batch effect never
+      // depends on the UI selection (which Premiere often refuses to set).
+      const selected = targets ? null : await selectedTrackItems(context.sequence);
+      const classified = targets
+        ? (await resolveSelectionTargets(context.sequence, targets)).map((value, selectionIndex) => ({
+          item: value.item, selectionIndex, mediaType: targets[selectionIndex].mediaType,
+          trackIndex: targets[selectionIndex].trackIndex, clipIndex: targets[selectionIndex].clipIndex
+        }))
+        : await classifySelection(context.sequence, selected.items);
       const invalid = classified.filter((value) => value.mediaType !== mediaType);
       if (invalid.length) throw commandError("UXP_SELECTION_TYPE_MISMATCH", "Every selected item must be a " + mediaType + " clip for this compound operation");
       return classified;
@@ -706,7 +725,7 @@
 
     async function addEffectToSelection(args) {
       const input = validateEffectAdd(args, true), context = await activeContext(true);
-      const targets = await selectedItemsForEffect(context, input.mediaType), prepared = [];
+      const targets = await selectedItemsForEffect(context, input.mediaType, input.targets), prepared = [];
       for (const target of targets) {
         const chain = await componentChain(target.item), before = chain.getComponentCount();
         if (input.insertionIndex != null && input.insertionIndex > before) throw commandError("UXP_INVALID_ARGUMENT", "insertionIndex exceeds a selected clip's component count");
@@ -734,7 +753,7 @@
 
     async function removeEffectFromSelection(args) {
       const input = validateEffectRemove(args, true), context = await activeContext(true);
-      const targets = await selectedItemsForEffect(context, input.mediaType), prepared = [];
+      const targets = await selectedItemsForEffect(context, input.mediaType, input.targets), prepared = [];
       for (const target of targets) {
         const chain = await componentChain(target.item), before = chain.getComponentCount();
         if (input.componentIndex >= before) throw commandError("UXP_TARGET_NOT_FOUND", "componentIndex is out of range on a selected clip");
@@ -1831,16 +1850,16 @@
   }
 
   function validateEffectAdd(args, selection) {
-    const keys = selection ? ["mediaType", "effectId", "insertionIndex", "operationId"] : ["mediaType", "trackIndex", "clipIndex", "effectId", "insertionIndex", "operationId"];
-    const target = selection ? (assertObject(args), assertOnlyKeys(args, keys), { mediaType: enumValue(args.mediaType, "mediaType", ["video", "audio"]) }) : validateTrackTarget(args, keys.filter((key) => key !== "operationId"));
+    const keys = selection ? ["mediaType", "effectId", "insertionIndex", "targets", "operationId"] : ["mediaType", "trackIndex", "clipIndex", "effectId", "insertionIndex", "operationId"];
+    const target = selection ? (assertObject(args), assertOnlyKeys(args, keys), { mediaType: enumValue(args.mediaType, "mediaType", ["video", "audio"]), targets: validateSelectionItems(args.targets, true) }) : validateTrackTarget(args, keys.filter((key) => key !== "operationId"));
     target.effectId = boundedString(args.effectId, "effectId", 256);
     target.insertionIndex = args.insertionIndex == null ? null : nonNegativeInt(args.insertionIndex, "insertionIndex");
     return target;
   }
 
   function validateEffectRemove(args, selection) {
-    const keys = selection ? ["mediaType", "componentIndex", "expectedEffectId", "operationId"] : ["mediaType", "trackIndex", "clipIndex", "componentIndex", "expectedEffectId", "operationId"];
-    const target = selection ? (assertObject(args), assertOnlyKeys(args, keys), { mediaType: enumValue(args.mediaType, "mediaType", ["video", "audio"]) }) : validateTrackTarget(args, keys.filter((key) => key !== "operationId"));
+    const keys = selection ? ["mediaType", "componentIndex", "expectedEffectId", "targets", "operationId"] : ["mediaType", "trackIndex", "clipIndex", "componentIndex", "expectedEffectId", "operationId"];
+    const target = selection ? (assertObject(args), assertOnlyKeys(args, keys), { mediaType: enumValue(args.mediaType, "mediaType", ["video", "audio"]), targets: validateSelectionItems(args.targets, true) }) : validateTrackTarget(args, keys.filter((key) => key !== "operationId"));
     target.componentIndex = nonNegativeInt(args.componentIndex, "componentIndex");
     target.expectedEffectId = boundedString(args.expectedEffectId, "expectedEffectId", 256);
     return target;
@@ -1855,10 +1874,17 @@
       if (Object.prototype.hasOwnProperty.call(args, "items")) throw commandError("UXP_INVALID_ARGUMENT", "items must be omitted when mode is clear");
       return { mode, expectedSequenceGuid, items: [] };
     }
-    if (!Array.isArray(args.items) || !args.items.length || args.items.length > MAX_SELECTION_ITEMS) {
-      throw commandError("UXP_INVALID_ARGUMENT", "items must contain 1-" + MAX_SELECTION_ITEMS + " timeline targets");
+    return { mode, expectedSequenceGuid, items: validateSelectionItems(args.items, false) };
+  }
+
+  // Fingerprinted timeline targets, shared by selection.update and the
+  // effects.selection targets list. `optional` returns null when omitted.
+  function validateSelectionItems(rawItems, optional) {
+    if (optional && rawItems == null) return null;
+    if (!Array.isArray(rawItems) || !rawItems.length || rawItems.length > MAX_SELECTION_ITEMS) {
+      throw commandError("UXP_INVALID_ARGUMENT", (optional ? "targets" : "items") + " must contain 1-" + MAX_SELECTION_ITEMS + " timeline targets");
     }
-    const coordinates = new Set(), items = args.items.map((raw, index) => {
+    const coordinates = new Set(), items = rawItems.map((raw, index) => {
       assertObject(raw);
       assertOnlyKeys(raw, [
         "mediaType", "trackIndex", "clipIndex", "expectedProjectItemId",
@@ -1880,7 +1906,7 @@
       coordinates.add(coordinate);
       return item;
     });
-    return { mode, expectedSequenceGuid, items };
+    return items;
   }
 
   function validateSelectionTargetInspectionArgs(args) {
@@ -1980,6 +2006,8 @@
   }
   function valuesEqual(left, right) { return typeof right === "number" ? typeof left === "number" && Math.abs(left - right) < 0.000001 : left === right; }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
+  // A refusal thrown before any host write; the dispatcher keeps the flag.
+  function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
 
   return { createWorkflowDefinitions, commandError };
 });

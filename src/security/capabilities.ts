@@ -377,6 +377,10 @@ const ACTION_CAPABILITIES: Readonly<Record<string, Readonly<Record<string, reado
     inspect: ["inspect"],
     apply: ["edit"],
   },
+  apply_camera_cut_uxp: {
+    inspect: ["inspect"],
+    apply: ["edit"],
+  },
   unnest_sequence_uxp: {
     inspect: ["inspect"],
     apply: ["edit"],

@@ -118,7 +118,7 @@ describe("next-wave UXP MCP tools", () => {
       additionalProperties: false,
       required: ["action"],
       properties: {
-        action: { enum: ["inspect", "set_mute"] },
+        action: { enum: ["inspect", "set_mute", "set_lock", "set_target"] },
         media_type: { enum: ["all", "video", "audio", "caption"] },
         track_indices: { maxItems: 64, uniqueItems: true },
         muted: { type: "boolean" },
@@ -533,6 +533,17 @@ describe("next-wave UXP MCP tools", () => {
     expect(request).toHaveBeenLastCalledWith("track.state.set", {});
     await expect(tool.handler({ action: "unsupported" }))
       .resolves.toEqual({ success: false, error: "Unsupported track-state action: unsupported" });
+  });
+
+  it("refuses track lock and target requests without calling the bridge", async () => {
+    const request = vi.fn();
+    const tool = getUxpNextWorkflowTools({ request, getState: vi.fn() } as unknown as UxpWebSocketBridge).manage_track_state_uxp;
+    for (const action of ["set_lock", "set_target"]) {
+      const result = await tool.handler({ action, track_indices: [0] }) as { success: boolean; error: string; noHostWrite: boolean };
+      expect(result).toMatchObject({ success: false, noHostWrite: true });
+      expect(result.error).toMatch(/no track lock or track target API.*explicitly/);
+    }
+    expect(request).not.toHaveBeenCalled();
   });
 
   it("covers source-clip inspection, complete mappings, absent items, and rejection", async () => {

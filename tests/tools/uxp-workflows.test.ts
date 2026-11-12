@@ -159,6 +159,17 @@ describe("stable UXP workflow MCP catalog", () => {
     });
   });
 
+  it("maps batch effect selection_items to panel targets", async () => {
+    const request = vi.fn().mockResolvedValue({ outcome: "verified" });
+    const tool = getUxpTools({ request, getState: vi.fn() } as unknown as UxpWebSocketBridge).batch_selected_clips_uxp;
+    const item = { media_type: "video", track_index: 2, clip_index: 1, expected_project_item_id: "clip-9", expected_start_seconds: 1, expected_end_seconds: 4 };
+    const panelItem = { mediaType: "video", trackIndex: 2, clipIndex: 1, expectedProjectItemId: "clip-9", expectedStartSeconds: 1, expectedEndSeconds: 4 };
+    await tool.handler({ action: "add_effect", media_type: "video", effect_id: "PR.BW", selection_items: [item] });
+    expect(request).toHaveBeenLastCalledWith("effects.selection.add", { mediaType: "video", effectId: "PR.BW", targets: [panelItem] });
+    await tool.handler({ action: "remove_effect", media_type: "video", component_index: 3, expected_effect_id: "PR.BW", selection_items: [item] });
+    expect(request).toHaveBeenLastCalledWith("effects.selection.remove", { mediaType: "video", componentIndex: 3, expectedEffectId: "PR.BW", targets: [panelItem] });
+  });
+
   it("maps bounded track-item identity inspection without granting an edit route", async () => {
     const request = vi.fn().mockResolvedValue({ outcome: "verified" });
     const bridge = { request, getState: vi.fn() } as unknown as UxpWebSocketBridge;

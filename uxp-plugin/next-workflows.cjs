@@ -1383,6 +1383,11 @@
     }
 
     async function setTrackState(args) {
+      for (const key of ["locked", "lock", "targeted", "target", "isLocked", "isTargeted"]) {
+        if (args && typeof args === "object" && key in args) {
+          throw refuse("UXP_TARGET_UNSUPPORTED", "Premiere 27.0 UXP has no track lock or track target API. Name the tracks explicitly on each razor, extract, insert and copy.");
+        }
+      }
       assertOnlyKeys(args, ["sequenceId", "expectedSequenceId", "mediaType", "trackIndices", "muted", "expectedMuted", "operationId"]);
       const project = await activeProject(true), sequence = await resolveSequence(project, args.sequenceId, true);
       const sequenceId = guidString(sequence.guid);
@@ -1949,6 +1954,13 @@
   function commandError(code, message) {
     const error = new Error(message);
     error.code = code;
+    return error;
+  }
+
+  // A refusal thrown before any host write; the dispatcher keeps the flag.
+  function refuse(code, message) {
+    const error = commandError(code, message);
+    error.noHostWrite = true;
     return error;
   }
 

@@ -13,6 +13,7 @@ const values: Record<string, unknown> = {
   start_seconds: 1, end_seconds: 2, transcript_revision: `sha256:${"a".repeat(64)}`,
   project_guid: "project-1", expected_transcript_revision: `sha256:${"a".repeat(64)}`,
   replacement_transcript_json: '{"segments":[]}',
+  camera_tracks: { "coverage-camera_id": 1 },
   sequence_name: "Coverage Stringout", duration_seconds: 10, frame_rate: 30,
   silence_ranges: [{ start_seconds: 2, end_seconds: 4 }],
   placements: [{
@@ -30,6 +31,12 @@ function valueFor(schema: Schema, field: string, all: boolean): unknown {
   if (schema.type === "array") return [valueFor(schema.items ?? { type: "string" }, field, all)];
   if (schema.type === "object") return argsFor(schema, all);
   return `coverage-${field}`;
+}
+
+function snakeOnly(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(snakeOnly);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !/[a-z][A-Z]/.test(key)).map(([key, child]) => [key, snakeOnly(child)]));
 }
 
 function argsFor(schema: Schema, all: boolean) {
@@ -68,6 +75,10 @@ describe("UXP tool handler coverage", () => {
           delete args[unsupported];
         }
       }
+      // The snapshot schema lists every field in both spellings; one spelling per field is enough.
+      if (args.expected_snapshot && ["copy_clips_between_sequences_uxp", "apply_camera_cut_uxp"].includes(name)) args.expected_snapshot = snakeOnly(args.expected_snapshot);
+      // set_lock and set_target are always refused before any bridge call.
+      if (name === "manage_track_state_uxp" && all) args.action = "set_mute";
       const result = await tool.handler(args);
       expect(result).toBeDefined();
       if (name === "get_uxp_capabilities") expect(getState).toHaveBeenCalled();

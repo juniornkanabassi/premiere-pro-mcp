@@ -725,6 +725,16 @@ describe("next-wave UXP event workflows", () => {
     expect(frameRate).toBe(29.97);
   });
 
+  it("refuses lock and target keys on track.state.set before touching the host", async () => {
+    const getActiveProject = vi.fn();
+    const definitions = NextWorkflows.createNextWorkflowDefinitions({ ppro: { Project: { getActiveProject } } });
+    for (const key of ["locked", "targeted"]) {
+      await expect(definitions["track.state.set"].handler({ mediaType: "video", trackIndices: [0], [key]: true }))
+        .rejects.toMatchObject({ code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true, message: expect.stringContaining("no track lock or track target API") });
+    }
+    expect(getActiveProject).not.toHaveBeenCalled();
+  });
+
   it("sets caption-track mute state through direct host promises and reads it back", async () => {
     let muted = false;
     const captionTrack = {

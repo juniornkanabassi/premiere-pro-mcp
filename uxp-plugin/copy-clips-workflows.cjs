@@ -20,6 +20,21 @@
   const MAX_PLACEMENTS = 512;
   const TICKS_PER_SECOND = 254016000000n;
   const PARKING_GAP = 10n * TICKS_PER_SECOND;
+  const MAX_SEGMENTS = 256;
+  // Premiere places audio on the sample grid, so a planned audio edge can land
+  // up to one sample away; video lands within half a frame. Readback accepts
+  // exactly that and reports the largest miss. The sample comes from the
+  // sequence's audio rate; without one, the 44.1 kHz sample (the larger common one).
+  const FALLBACK_SAMPLE_TICKS = 5760000n;
+  // Parked clones are full-length source clips, so one round of parking is
+  // capped at this extent and a long cut is done in several rounds that
+  // reuse the same slot (shortcut: 3 Undo steps per round, raise if rounds are common).
+  const PARKING_BUDGET = 12n * 3600n * TICKS_PER_SECOND;
+  const SEGMENT_KEYS = ["sourceStartTicks", "sourceEndTicks", "sourceStartSeconds", "sourceEndSeconds", "videoTrack"];
+  // segments mode copies camera ranges from one video track each onto one
+  // "program" video track of the same sequence; nothing else may be given.
+  const SEGMENT_EXCLUDED = ["sourceStartTicks", "sourceEndTicks", "destinationStartTicks", "sourceStartSeconds", "sourceEndSeconds",
+    "destinationStartSeconds", "videoTracks", "audioTracks", "videoTrackOffset", "audioTrackOffset"];
 
   function createCopyClipsWorkflowDefinitions(deps) {
     const ppro = deps.ppro;
@@ -44,7 +59,7 @@
     const TIME_KEYS = ["sourceStart", "sourceEnd", "destinationStart"];
     const ARG_KEYS = ["sourceSequenceId", "destinationSequenceId", "sourceStartTicks", "sourceEndTicks", "destinationStartTicks",
       "sourceStartSeconds", "sourceEndSeconds", "destinationStartSeconds",
-      "videoTracks", "audioTracks", "videoTrackOffset", "audioTrackOffset"];
+      "videoTracks", "audioTracks", "videoTrackOffset", "audioTrackOffset", "segments", "programTrack"];
 
     function canCopy() {
       return !!(ppro.Project && typeof ppro.Project.getActiveProject === "function" &&
@@ -63,9 +78,9 @@
 
     async function applyCopy(args) {
       assertOnlyKeys(args, ARG_KEYS.concat(["expectedSnapshot", "confirmCopy", "operationId"]));
-      if (args.confirmCopy !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "sequence.copyClips requires confirmCopy: true");
+      if (args.confirmCopy !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "sequence.copyClips requires confirmCopy: true");
       if (typeof args.operationId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(args.operationId)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
       }
       assertObject(args.expectedSnapshot, "expectedSnapshot");
       const request = copyRequest(args);
@@ -73,35 +88,59 @@
       await resolveTimes(context, request);
       const plan = await planCopy(context, request);
       if (canonical(plan.snapshot) !== canonical(args.expectedSnapshot)) {
-        throw commandError("UXP_STALE_TRACK_ITEM", "The source clips or the destination changed since inspection; inspect again before copying");
+        throw refuse("UXP_STALE_TRACK_ITEM", "The source clips or the destination changed since inspection; inspect again before copying");
       }
       const editor = ppro.SequenceEditor.getEditor(context.destination);
       if (!editor || typeof editor.createCloneTrackItemAction !== "function") {
-        throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor clone actions");
+        throw refuse("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor clone actions");
       }
       const label = "Copy " + plan.snapshot.clips.length + " clip" + (plan.snapshot.clips.length === 1 ? "" : "s") + " from " + plan.snapshot.sourceSequenceName;
       const direct = plan.entries.filter(function (entry) { return !entry.trimmed; });
       const parked = plan.entries.filter(function (entry) { return entry.trimmed; });
+      const roundCount = parked.length ? parked[parked.length - 1].round + 1 : 0;
 
       // Transaction 1: every clone, direct ones at their destination and
-      // trimmed ones at the parking spot.
-      context.project.lockedAccess(function () {
-        const actions = checked(plan.entries.map(function (entry) {
-          const at = entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks);
-          return editor.createCloneTrackItemAction(entry.item, ppro.TickTime.createWithTicks(String(at - entry.sourceStart)),
-            plan.videoTrackOffset, plan.audioTrackOffset, false, false);
-        }));
-        committed(context.project.executeTransaction(function (compoundAction) {
-          for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
-        }, label), label);
-      });
+      // trimmed ones at the parking spot. A clone into a track that does not
+      // exist yet creates it (live 27.0, probe P4), so when the program track
+      // is new its first clone goes in a transaction of its own and the rest
+      // follow once the track is there.
+      function cloneTransaction(entries, name) {
+        context.project.lockedAccess(function () {
+          const actions = checked(entries.map(function (entry) {
+            const at = entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks);
+            return editor.createCloneTrackItemAction(entry.item, ppro.TickTime.createWithTicks(String(at - entry.sourceStart)),
+              entry.videoOffset, entry.audioOffset, false, false);
+          }));
+          committed(context.project.executeTransaction(function (compoundAction) {
+            for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
+          }, name), name);
+        });
+      }
+      // Round 0 of parking goes in with the direct clones; later rounds reuse
+      // the slot once the previous round has been moved into place.
+      const first = plan.entries.filter(function (entry) { return !entry.trimmed || entry.round === 0; });
+      const chunks = plan.newTrack && first.length > 1 ? [first.slice(0, 1), first.slice(1)] : [first];
+      cloneTransaction(chunks[0], label);
       let steps = 1;
       try {
-        if (parked.length) {
+        if (plan.newTrack) {
+          // Never go on unless the first clone made the track and landed on it:
+          // the rest would overwrite whatever track it really went to.
+          const entry = chunks[0][0], want = entry.placement.targetTrackIndex;
+          const count = await trackCount(context.destination, "video");
+          if (count !== want + 1) {
+            throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not create video track " + want + " (the sequence has " + count + " video tracks); the first clone may be on another track and the remaining clones were not made");
+          }
+          await findClone(context.destination, entry, entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks), plan);
+        }
+        if (chunks.length > 1) { cloneTransaction(chunks[1], label + " (rest)"); steps++; }
+        for (let round = 0; round < roundCount; round++) {
+          const mine = parked.filter(function (entry) { return entry.round === round; });
+          if (round > 0) { cloneTransaction(mine, label + " (park " + (round + 1) + ")"); steps++; }
           // Transaction 2: trim each parked clone to the range. Transaction 3:
           // move it into place.
           const clones = [];
-          for (const entry of parked) clones.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart) });
+          for (const entry of mine) clones.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart, plan) });
           context.project.lockedAccess(function () {
             const actions = [];
             for (const clone of clones) {
@@ -120,7 +159,7 @@
           });
           steps++;
           const trimmed = [];
-          for (const entry of parked) trimmed.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks)) });
+          for (const entry of mine) trimmed.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks), plan) });
           context.project.lockedAccess(function () {
             const actions = checked(trimmed.map(function (clone) {
               const from = clone.entry.parkedStart + BigInt(clone.entry.placement.trimHeadTicks);
@@ -140,16 +179,16 @@
       }
 
       try {
-        const problems = await readbackProblems(context.destination, plan);
+        const { problems, maxDeviationTicks } = await readbackProblems(context.destination, plan);
         if (problems.length) {
           return { copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
-            problems: problems.slice(0, 20), rollbackPerformed: false,
+            problems: problems.slice(0, 20), maxDeviationTicks, rollbackPerformed: false,
             verificationBoundary: "committed_transaction_with_failed_readback",
             nextStep: "The copy committed but did not read back as planned. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove it, then inspect again." };
         }
         return { copied: true, committed: true, verified: true, outcome: "verified",
           sourceSequenceName: plan.snapshot.sourceSequenceName, destinationSequenceName: plan.snapshot.destinationSequenceName,
-          clipsCopied: direct.length + parked.length, clipsTrimmed: parked.length, undoSteps: steps,
+          clipsCopied: direct.length + parked.length, clipsTrimmed: parked.length, undoSteps: steps, maxDeviationTicks,
           verificationBoundary: "placement_start_source_range_and_project_item_readback", undoLabel: label };
       } catch (error) {
         return { copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
@@ -170,14 +209,14 @@
 
     async function projectContext(request, requireTransaction) {
       const project = await ppro.Project.getActiveProject();
-      if (!project) throw commandError("UXP_NO_ACTIVE_PROJECT", "No active project");
+      if (!project) throw refuse("UXP_NO_ACTIVE_PROJECT", "No active project");
       if (requireTransaction && (typeof project.lockedAccess !== "function" || typeof project.executeTransaction !== "function")) {
-        throw commandError("UXP_COMMAND_UNAVAILABLE", "This Premiere build does not expose locked undoable transactions");
+        throw refuse("UXP_COMMAND_UNAVAILABLE", "This Premiere build does not expose locked undoable transactions");
       }
       const sequences = Array.from(await requiredMethod(project, "getSequences")() || []);
       const find = function (id, role) {
         const match = sequences.filter(function (sequence) { return identifier(sequence.guid) === id; });
-        if (match.length !== 1) throw commandError("UXP_TARGET_NOT_FOUND", "The " + role + " sequence " + id + " is not in the active project");
+        if (match.length !== 1) throw refuse("UXP_TARGET_NOT_FOUND", "The " + role + " sequence " + id + " is not in the active project");
         return match[0];
       };
       return { project, source: find(request.sourceSequenceId, "source"), destination: find(request.destinationSequenceId, "destination") };
@@ -186,15 +225,29 @@
     // Seconds snap to the nearest frame of the sequence they are measured on,
     // so a range edge never splits a frame.
     async function resolveTimes(context, request) {
-      for (const key of TIME_KEYS) {
-        if (request[key + "Ticks"] != null) continue;
-        const sequence = key === "destinationStart" ? context.destination : context.source;
+      const snap = async function (holder, key, sequence) {
+        if (holder[key + "Ticks"] != null) return;
         const frame = await timebase(sequence);
-        const exact = BigInt(Math.round(request[key + "Seconds"] * 1000000)) * TICKS_PER_SECOND;
+        const exact = BigInt(Math.round(holder[key + "Seconds"] * 1000000)) * TICKS_PER_SECOND;
         const perFrame = frame * 1000000n;
-        request[key + "Ticks"] = String((exact + perFrame / 2n) / perFrame * frame);
+        holder[key + "Ticks"] = String((exact + perFrame / 2n) / perFrame * frame);
+      };
+      if (request.segments) {
+        let previousEnd = -1n;
+        for (const [position, segment] of request.segments.entries()) {
+          await snap(segment, "sourceStart", context.source);
+          await snap(segment, "sourceEnd", context.source);
+          if (BigInt(segment.sourceEndTicks) <= BigInt(segment.sourceStartTicks)) throw refuse("UXP_INVALID_ARGUMENT", "segments[" + position + "] must end after it starts");
+          if (BigInt(segment.sourceStartTicks) < previousEnd) throw refuse("UXP_INVALID_ARGUMENT", "segments must be in time order and must not overlap (segments[" + position + "])");
+          previousEnd = BigInt(segment.sourceEndTicks);
+        }
+        // The whole cut, for the plan's header; each clip carries its own placement.
+        request.sourceStartTicks = request.destinationStartTicks = request.segments[0].sourceStartTicks;
+        request.sourceEndTicks = String(previousEnd);
+        return;
       }
-      if (BigInt(request.sourceEndTicks) <= BigInt(request.sourceStartTicks)) throw commandError("UXP_INVALID_ARGUMENT", "The source end must be after the source start");
+      for (const key of TIME_KEYS) await snap(request, key, key === "destinationStart" ? context.destination : context.source);
+      if (BigInt(request.sourceEndTicks) <= BigInt(request.sourceStartTicks)) throw refuse("UXP_INVALID_ARGUMENT", "The source end must be after the source start");
     }
 
     async function planCopy(context, request) {
@@ -203,29 +256,60 @@
       // planned time must already sit on it, and both grids must agree.
       const frame = await timebase(source);
       if (await timebase(destination) !== frame) {
-        throw commandError("UXP_TARGET_UNSUPPORTED", "The source and destination sequences have different frame rates; copying between them is not supported");
+        throw refuse("UXP_TARGET_UNSUPPORTED", "The source and destination sequences have different frame rates; copying between them is not supported");
       }
-      for (const key of TIME_KEYS) {
-        if (BigInt(request[key + "Ticks"]) % frame !== 0n) throw commandError("UXP_INVALID_ARGUMENT", key + "Ticks is not on a frame boundary of the sequence");
+      // One pass per range. Plain copies have one; a camera cut has one per
+      // segment, each reading one camera track and landing on the program
+      // track at the same time (shift 0).
+      const segments = request.segments;
+      if (segments) {
+        for (const [position, segment] of segments.entries()) {
+          for (const key of ["sourceStartTicks", "sourceEndTicks"]) {
+            if (BigInt(segment[key]) % frame !== 0n) throw refuse("UXP_INVALID_ARGUMENT", "segments[" + position + "]." + key + " is not on a frame boundary of the sequence");
+          }
+        }
+      } else {
+        for (const key of TIME_KEYS) {
+          if (BigInt(request[key + "Ticks"]) % frame !== 0n) throw refuse("UXP_INVALID_ARGUMENT", key + "Ticks is not on a frame boundary of the sequence");
+        }
       }
-      const rangeStart = BigInt(request.sourceStartTicks), rangeEnd = BigInt(request.sourceEndTicks);
-      const shift = BigInt(request.destinationStartTicks) - rangeStart;
+      const passes = segments
+        ? segments.map(function (segment) {
+          return { start: BigInt(segment.sourceStartTicks), end: BigInt(segment.sourceEndTicks), shift: 0n, video: [segment.videoTrack], audio: [] };
+        })
+        : [{ start: BigInt(request.sourceStartTicks), end: BigInt(request.sourceEndTicks),
+          shift: BigInt(request.destinationStartTicks) - BigInt(request.sourceStartTicks), video: request.videoTracks, audio: request.audioTracks }];
+      const counts = { video: await trackCount(destination, "video"), audio: await trackCount(destination, "audio") };
+      let newTrack = false;
+      if (segments) {
+        // The program track is an existing empty track, or the next index,
+        // which a clone creates (live 27.0, probe P4). Never a busy one.
+        if (request.programTrack > counts.video) {
+          throw refuse("UXP_TARGET_UNSUPPORTED", "programTrack " + request.programTrack + " does not exist; use an empty track or " + counts.video + " to create the next one");
+        }
+        newTrack = request.programTrack === counts.video;
+        if (!newTrack && (await clipItems(destination, "video", request.programTrack)).length) {
+          throw refuse("UXP_TARGET_OCCUPIED", "The program track (video " + request.programTrack + ") is not empty; choose an empty track");
+        }
+      }
       const entries = [];
+      for (const [passIndex, pass] of passes.entries()) {
+      const rangeStart = pass.start, rangeEnd = pass.end, shift = pass.shift, firstEntry = entries.length;
       for (const mediaType of ["video", "audio"]) {
-        const sourceCount = await trackCount(source, mediaType), destinationCount = await trackCount(destination, mediaType);
-        const wanted = request[mediaType + "Tracks"];
+        const sourceCount = await trackCount(source, mediaType), destinationCount = counts[mediaType];
+        const wanted = pass[mediaType];
         const offset = request[mediaType + "TrackOffset"];
         const tracks = wanted || range(sourceCount);
         for (const trackIndex of tracks) {
-          if (trackIndex >= sourceCount) throw commandError("UXP_TARGET_NOT_FOUND", "Source " + mediaType + " track " + trackIndex + " does not exist");
+          if (trackIndex >= sourceCount) throw refuse("UXP_TARGET_NOT_FOUND", "Source " + mediaType + " track " + trackIndex + " does not exist");
           const items = await clipItems(source, mediaType, trackIndex);
           for (let clipIndex = 0; clipIndex < items.length; clipIndex++) {
             const item = items[clipIndex];
             const start = BigInt(await ticksOf(item, "getStartTime")), end = BigInt(await ticksOf(item, "getEndTime"));
             if (end <= rangeStart || start >= rangeEnd) continue;
-            const targetTrackIndex = trackIndex + offset;
-            if (targetTrackIndex < 0 || targetTrackIndex >= destinationCount) {
-              throw commandError("UXP_TARGET_UNSUPPORTED", "Destination " + mediaType + " track " + targetTrackIndex + " does not exist; add a track and inspect again");
+            const targetTrackIndex = segments ? request.programTrack : trackIndex + offset;
+            if (targetTrackIndex < 0 || targetTrackIndex >= destinationCount && !(segments && newTrack)) {
+              throw refuse("UXP_TARGET_UNSUPPORTED", "Destination " + mediaType + " track " + targetTrackIndex + " does not exist; add a track and inspect again");
             }
             const name = String(await maybeCall(item, "getName") || "a clip");
             const inPoint = BigInt(await ticksOf(item, "getInPoint")), outPoint = BigInt(await ticksOf(item, "getOutPoint"));
@@ -233,11 +317,13 @@
             if (head > 0n || tail > 0n) {
               const speed = Number(await requiredMethod(item, "getSpeed")()), reversed = Boolean(await requiredMethod(item, "isSpeedReversed")());
               if (Math.abs(speed - 1) > 0.0001 || reversed) {
-                throw commandError("UXP_TARGET_UNSUPPORTED", name + " crosses the edge of the range and has a speed change or is reversed; widen the range to take it whole");
+                throw refuse("UXP_TARGET_UNSUPPORTED", name + " crosses the edge of the range and has a speed change or is reversed; widen the range to take it whole");
               }
             }
             entries.push({
               item, sourceStart: start, sourceIn: inPoint, trimmed: head > 0n || tail > 0n,
+              videoOffset: segments ? targetTrackIndex - trackIndex : request.videoTrackOffset,
+              audioOffset: segments ? 0 : request.audioTrackOffset,
               placement: {
                 mediaType, sourceTrackIndex: trackIndex, sourceClipIndex: clipIndex, targetTrackIndex, name,
                 projectItemId: await projectItemId(item),
@@ -247,13 +333,17 @@
                 disabled: Boolean(await maybeCall(item, "isDisabled"))
               }
             });
-            if (entries.length > MAX_PLACEMENTS) throw commandError("UXP_TARGET_TOO_LARGE", "The range holds more than " + MAX_PLACEMENTS + " clips");
+            if (entries.length > MAX_PLACEMENTS) throw refuse("UXP_TARGET_TOO_LARGE", "The range holds more than " + MAX_PLACEMENTS + " clips");
           }
         }
       }
-      if (!entries.length) throw commandError("UXP_TARGET_NOT_FOUND", "No clips on the chosen source tracks fall inside the range");
+      if (segments && entries.length === firstEntry) {
+        throw refuse("UXP_TARGET_NOT_FOUND", "segments[" + passIndex + "] has no clip on video track " + segments[passIndex].videoTrack + " in its range");
+      }
+      }
+      if (!entries.length) throw refuse("UXP_TARGET_NOT_FOUND", "No clips on the chosen source tracks fall inside the range");
       for (const entry of entries) {
-        if (BigInt(entry.placement.startTicks) < 0n) throw commandError("UXP_INVALID_ARGUMENT", "The destination start would place " + entry.placement.name + " before the start of the sequence");
+        if (BigInt(entry.placement.startTicks) < 0n) throw refuse("UXP_INVALID_ARGUMENT", "The destination start would place " + entry.placement.name + " before the start of the sequence");
       }
 
       // Nothing at the destination may be overwritten, and the parking spot
@@ -264,31 +354,37 @@
         const placement = entry.placement, key = placement.mediaType + ":" + placement.targetTrackIndex;
         if (!occupancy[key]) {
           occupancy[key] = [];
-          for (const item of await clipItems(destination, placement.mediaType, placement.targetTrackIndex)) {
+          // A track the cut is about to create has nothing on it yet.
+          const existing = placement.targetTrackIndex < counts[placement.mediaType] ? await clipItems(destination, placement.mediaType, placement.targetTrackIndex) : [];
+          for (const item of existing) {
             occupancy[key].push({ start: BigInt(await ticksOf(item, "getStartTime")), end: BigInt(await ticksOf(item, "getEndTime")), name: String(await maybeCall(item, "getName") || "a clip") });
           }
         }
         for (const occupant of occupancy[key]) {
           if (occupant.end > lastEnd) lastEnd = occupant.end;
           if (occupant.start < BigInt(placement.endTicks) && occupant.end > BigInt(placement.startTicks)) {
-            throw commandError("UXP_TARGET_OCCUPIED", "Destination " + placement.mediaType + " track " + placement.targetTrackIndex + " is occupied by " + occupant.name + " where " + placement.name + " would land");
+            throw refuse("UXP_TARGET_OCCUPIED", "Destination " + placement.mediaType + " track " + placement.targetTrackIndex + " is occupied by " + occupant.name + " where " + placement.name + " would land");
           }
         }
         if (BigInt(placement.endTicks) > lastEnd) lastEnd = BigInt(placement.endTicks);
       }
       const gap = (PARKING_GAP + frame - 1n) / frame * frame;
-      let parking = (lastEnd + frame - 1n) / frame * frame + gap;
+      const parkingBase = (lastEnd + frame - 1n) / frame * frame + gap;
+      let parking = parkingBase, round = 0;
       for (const entry of entries) {
         if (!entry.trimmed) continue;
+        const length = BigInt(entry.placement.endTicks) - BigInt(entry.placement.startTicks) + BigInt(entry.placement.trimHeadTicks) + BigInt(entry.placement.trimTailTicks);
+        if (length + gap > PARKING_BUDGET) throw refuse("UXP_TARGET_TOO_LARGE", entry.placement.name + " is too long to park while it is trimmed; split the range so it crosses fewer long clips");
+        if (parking - parkingBase + length > PARKING_BUDGET) { round++; parking = parkingBase; }
+        entry.round = round;
         entry.parkedStart = parking;
-        entry.parkedEnd = parking + BigInt(entry.placement.endTicks) - BigInt(entry.placement.startTicks) + BigInt(entry.placement.trimHeadTicks) + BigInt(entry.placement.trimTailTicks);
+        entry.parkedEnd = parking + length;
         parking = (entry.parkedEnd + frame - 1n) / frame * frame + gap;
       }
 
       return {
-        entries,
-        videoTrackOffset: request.videoTrackOffset,
-        audioTrackOffset: request.audioTrackOffset,
+        entries, frame, newTrack, sampleTicks: await sampleTicksOf(destination),
+        rounds: round + 1,
         snapshot: {
           projectGuid: requiredIdentifier(project.guid, "project GUID"),
           sourceSequenceId: request.sourceSequenceId,
@@ -309,20 +405,39 @@
       return BigInt(text);
     }
 
-    async function findClone(sequence, entry, startTicks) {
-      const placement = entry.placement;
-      for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) {
-        if (await ticksOf(item, "getStartTime") === String(startTicks) && await projectItemId(item) === placement.projectItemId) return item;
+    // Half a frame for video, one audio sample for audio.
+    function tolerance(mediaType, plan) { return mediaType === "audio" ? plan.sampleTicks : plan.frame / 2n; }
+    async function sampleTicksOf(sequence) {
+      let rate = Number(await maybeCall(sequence, "getAudioSampleRate"));
+      if (!(rate > 0)) {
+        const settings = await maybeCall(sequence, "getSettings");
+        rate = Number(settings ? await maybeCall(settings, "getAudioSampleRate") : NaN);
       }
+      return rate >= 8000 && rate <= 192000 ? TICKS_PER_SECOND / BigInt(Math.round(rate)) : FALLBACK_SAMPLE_TICKS;
+    }
+    function distance(left, right) { const d = BigInt(left) - BigInt(right); return d < 0n ? -d : d; }
+
+    async function findClone(sequence, entry, startTicks, plan) {
+      const placement = entry.placement, tol = tolerance(placement.mediaType, plan);
+      let best = null, bestDistance = tol + 1n;
+      for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) {
+        const away = distance(await ticksOf(item, "getStartTime"), startTicks);
+        if (away <= tol && away < bestDistance && await projectItemId(item) === placement.projectItemId) { best = item; bestDistance = away; }
+      }
+      if (best) return best;
       const seen = [];
       for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) seen.push(await ticksOf(item, "getStartTime"));
       throw commandError("UXP_VERIFICATION_FAILED", placement.name + " is not at its parking position " + startTicks + " on " + placement.mediaType + " track " + placement.targetTrackIndex + " (clip starts there: " + seen.slice(0, 8).join(", ") + ")");
     }
 
+    // Compares every start, end, source in and source out within the media
+    // type's tolerance, and reports the largest deviation seen in ticks, so a
+    // sample-grid or 1-tick landing verifies and a real miss does not.
     async function readbackProblems(sequence, plan) {
       const problems = [];
       const claimed = new Set();
       const cache = {};
+      let maxDeviation = 0n;
       async function track(mediaType, index) {
         const key = mediaType + ":" + index;
         if (!cache[key]) {
@@ -336,23 +451,27 @@
         return cache[key];
       }
       for (const entry of plan.entries) {
-        const want = entry.placement;
+        const want = entry.placement, tol = tolerance(want.mediaType, plan);
         const items = await track(want.mediaType, want.targetTrackIndex);
-        let found = -1;
+        let found = -1, foundDistance = tol + 1n;
         for (let index = 0; index < items.length; index++) {
           const key = want.mediaType + ":" + want.targetTrackIndex + ":" + index;
-          if (claimed.has(key)) continue;
-          if (items[index].projectItemId === want.projectItemId && items[index].start === want.startTicks) { found = index; claimed.add(key); break; }
+          if (claimed.has(key) || items[index].projectItemId !== want.projectItemId) continue;
+          const away = distance(items[index].start, want.startTicks);
+          if (away <= tol && away < foundDistance) { found = index; foundDistance = away; }
         }
         if (found === -1) { problems.push(want.name + " is not at its planned start on " + want.mediaType + " track " + want.targetTrackIndex); continue; }
+        claimed.add(want.mediaType + ":" + want.targetTrackIndex + ":" + found);
         const got = items[found];
-        if (got.end !== want.endTicks || got.inTicks !== want.inTicks || got.outTicks !== want.outTicks) problems.push(want.name + " on " + want.mediaType + " track " + want.targetTrackIndex + " does not have its planned source range");
+        const misses = [distance(got.start, want.startTicks), distance(got.end, want.endTicks), distance(got.inTicks, want.inTicks), distance(got.outTicks, want.outTicks)];
+        for (const miss of misses) if (miss > maxDeviation) maxDeviation = miss;
+        if (misses.some(function (miss) { return miss > tol; })) problems.push(want.name + " on " + want.mediaType + " track " + want.targetTrackIndex + " does not have its planned source range");
         if (got.disabled !== want.disabled) problems.push(want.name + " on " + want.mediaType + " track " + want.targetTrackIndex + " changed enabled state");
         if (entry.trimmed && items.some(function (item) { return BigInt(item.start) >= entry.parkedStart && item.projectItemId === want.projectItemId; })) {
           problems.push(want.name + " was left at its parking position on " + want.mediaType + " track " + want.targetTrackIndex);
         }
       }
-      return problems;
+      return { problems, maxDeviationTicks: String(maxDeviation) };
     }
 
     async function trackCount(sequence, mediaType) {
@@ -388,36 +507,67 @@
       try { return await target[name](); } catch (_) { return undefined; }
     }
 
+    // Exactly one of <key>Ticks / <key>Seconds, validated; written onto `into`.
+    function readTime(source, key, label, into) {
+      const ticks = source[key + "Ticks"], seconds = source[key + "Seconds"];
+      if ((ticks == null) === (seconds == null)) throw refuse("UXP_INVALID_ARGUMENT", "Give exactly one of " + label + key + "Ticks or " + label + key + "Seconds");
+      if (ticks != null && (typeof ticks !== "string" || !/^\d{1,30}$/.test(ticks))) throw refuse("UXP_INVALID_ARGUMENT", label + key + "Ticks must be a non-negative tick string");
+      if (seconds != null && (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0 || seconds > 86400)) throw refuse("UXP_INVALID_ARGUMENT", label + key + "Seconds must be a number from 0 to 86400");
+      into[key + "Ticks"] = ticks == null ? null : ticks;
+      into[key + "Seconds"] = seconds == null ? null : seconds;
+    }
+
     function copyRequest(args) {
       const request = {};
       for (const key of ["sourceSequenceId", "destinationSequenceId"]) {
-        if (typeof args[key] !== "string" || !args[key] || args[key].length > 512) throw commandError("UXP_INVALID_ARGUMENT", key + " is required");
+        if (typeof args[key] !== "string" || !args[key] || args[key].length > 512) throw refuse("UXP_INVALID_ARGUMENT", key + " is required");
         request[key] = args[key];
       }
-      for (const key of TIME_KEYS) {
-        const ticks = args[key + "Ticks"], seconds = args[key + "Seconds"];
-        if ((ticks == null) === (seconds == null)) throw commandError("UXP_INVALID_ARGUMENT", "Give exactly one of " + key + "Ticks or " + key + "Seconds");
-        if (ticks != null && (typeof ticks !== "string" || !/^\d{1,30}$/.test(ticks))) throw commandError("UXP_INVALID_ARGUMENT", key + "Ticks must be a non-negative tick string");
-        if (seconds != null && (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0 || seconds > 86400)) throw commandError("UXP_INVALID_ARGUMENT", key + "Seconds must be a number from 0 to 86400");
-        request[key + "Ticks"] = ticks == null ? null : ticks;
-        request[key + "Seconds"] = seconds == null ? null : seconds;
-      }
+      if (args.segments != null || args.programTrack != null) return segmentRequest(args, request);
+      for (const key of TIME_KEYS) readTime(args, key, "", request);
       for (const mediaType of ["video", "audio"]) {
         const tracks = args[mediaType + "Tracks"];
         if (tracks != null) {
           if (!Array.isArray(tracks) || tracks.length > 64 || tracks.some(function (value) { return !Number.isSafeInteger(value) || value < 0 || value > 511; }) ||
             new Set(tracks).size !== tracks.length) {
-            throw commandError("UXP_INVALID_ARGUMENT", mediaType + "Tracks must be a list of distinct track indexes from 0 to 511");
+            throw refuse("UXP_INVALID_ARGUMENT", mediaType + "Tracks must be a list of distinct track indexes from 0 to 511");
           }
         }
         request[mediaType + "Tracks"] = tracks == null ? null : tracks.slice();
         const offset = args[mediaType + "TrackOffset"] == null ? 0 : args[mediaType + "TrackOffset"];
-        if (!Number.isSafeInteger(offset) || offset < -511 || offset > 511) throw commandError("UXP_INVALID_ARGUMENT", mediaType + "TrackOffset must be an integer from -511 to 511");
+        if (!Number.isSafeInteger(offset) || offset < -511 || offset > 511) throw refuse("UXP_INVALID_ARGUMENT", mediaType + "TrackOffset must be an integer from -511 to 511");
         request[mediaType + "TrackOffset"] = offset;
       }
       if (request.videoTracks && request.audioTracks && !request.videoTracks.length && !request.audioTracks.length) {
-        throw commandError("UXP_INVALID_ARGUMENT", "Choose at least one video or audio track");
+        throw refuse("UXP_INVALID_ARGUMENT", "Choose at least one video or audio track");
       }
+      return request;
+    }
+
+    // Camera-cut mode: copy ranges of chosen video tracks onto one program
+    // track of the same sequence, at the same times.
+    function segmentRequest(args, request) {
+      for (const key of SEGMENT_EXCLUDED) {
+        if (args[key] != null) throw refuse("UXP_INVALID_ARGUMENT", "segments cannot be combined with " + key);
+      }
+      if (request.sourceSequenceId !== request.destinationSequenceId) throw refuse("UXP_INVALID_ARGUMENT", "A camera cut stays inside one sequence; sourceSequenceId and destinationSequenceId must match");
+      if (!Number.isSafeInteger(args.programTrack) || args.programTrack < 0 || args.programTrack > 511) throw refuse("UXP_INVALID_ARGUMENT", "programTrack must be an integer from 0 to 511");
+      if (!Array.isArray(args.segments) || !args.segments.length || args.segments.length > MAX_SEGMENTS) throw refuse("UXP_INVALID_ARGUMENT", "segments must hold 1-" + MAX_SEGMENTS + " ranges");
+      request.programTrack = args.programTrack;
+      request.videoTrackOffset = 0;
+      request.audioTrackOffset = 0;
+      request.videoTracks = null;
+      request.audioTracks = null;
+      request.segments = args.segments.map(function (raw, position) {
+        assertObject(raw, "segments[" + position + "]");
+        assertOnlyKeys(raw, SEGMENT_KEYS);
+        if (!Number.isSafeInteger(raw.videoTrack) || raw.videoTrack < 0 || raw.videoTrack > 511) throw refuse("UXP_INVALID_ARGUMENT", "segments[" + position + "].videoTrack must be an integer from 0 to 511");
+        if (raw.videoTrack === args.programTrack) throw refuse("UXP_INVALID_ARGUMENT", "segments[" + position + "].videoTrack is the program track itself");
+        const segment = { videoTrack: raw.videoTrack };
+        readTime(raw, "sourceStart", "segments[" + position + "].", segment);
+        readTime(raw, "sourceEnd", "segments[" + position + "].", segment);
+        return segment;
+      });
       return request;
     }
 
@@ -431,10 +581,12 @@
 
     function identifier(value) { try { return value == null ? "" : String(typeof value.toString === "function" ? value.toString() : value); } catch (_) { return ""; } }
     function requiredMethod(target, name) { if (!target || typeof target[name] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "The required item does not expose " + name); return target[name].bind(target); }
-    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an object"); }
-    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw commandError("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
+    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an object"); }
+    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw refuse("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
     function requiredIdentifier(value, name) { const id = identifier(value); if (!id || id.length > 512 || id.indexOf("\u0000") !== -1) throw commandError("UXP_VERIFICATION_FAILED", name + " is unavailable or invalid"); return id; }
     function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
+    // A refusal thrown before any host write; the dispatcher keeps the flag.
+    function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
 
     return definitions;
   }

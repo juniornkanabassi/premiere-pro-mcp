@@ -103,6 +103,14 @@ function operation(args: WorkflowArgs): Record<string, unknown> {
   return args.operation_id ? { operationId: args.operation_id } : {};
 }
 
+function panelSelectionItem(item: TimelineSelectionItemArgs) {
+  return {
+    mediaType: item.media_type, trackIndex: item.track_index, clipIndex: item.clip_index,
+    expectedProjectItemId: item.expected_project_item_id,
+    expectedStartSeconds: item.expected_start_seconds, expectedEndSeconds: item.expected_end_seconds,
+  };
+}
+
 function invalidAction(value: unknown) {
   return { success: false, error: `Unsupported workflow action: ${String(value)}` };
 }
@@ -199,7 +207,7 @@ export function getUxpWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     batch_selected_clips_uxp: {
-      description: "Inspect the current timeline selection or apply one native effect add/remove across up to 64 same-type selected clips as a single compound transaction. Effect readback verifies component-chain changes only, not rendered output.",
+      description: "Inspect the current timeline selection or apply one native effect add/remove across up to 64 same-type selected clips as a single compound transaction. Pass selection_items to name the clips directly instead of relying on the timeline selection. Effect readback verifies component-chain changes only, not rendered output.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -210,19 +218,24 @@ export function getUxpWorkflowTools(bridge: UxpWebSocketBridge) {
           insertion_index: { type: "integer", minimum: 0 },
           component_index: { type: "integer", minimum: 0 },
           expected_effect_id: effectIdentityGuardSchema,
+          selection_items: {
+            ...selectionItemSnapshotSchema,
+            description: "Optional. Clips to change, from manage_timeline_selection_uxp inspect or inspect_targets, passed unchanged. When given, the clips are resolved directly and the timeline selection is not read, so Premiere's selection state does not matter. Omit to use the current selection.",
+          },
           operation_id: operationId,
         },
         required: ["action"],
       },
       handler: async (args: WorkflowArgs) => {
+        const targets = args.selection_items === undefined ? {} : { targets: args.selection_items.map(panelSelectionItem) };
         if (args.action === "inspect") return invoke(bridge, "selection.inspect");
         if (args.action === "add_effect") return invoke(bridge, "effects.selection.add", {
           mediaType: args.media_type, effectId: args.effect_id,
           ...(args.insertion_index === undefined ? {} : { insertionIndex: args.insertion_index }),
-          ...operation(args),
+          ...targets, ...operation(args),
         });
         if (args.action === "remove_effect") return invoke(bridge, "effects.selection.remove", {
-          mediaType: args.media_type, componentIndex: args.component_index, expectedEffectId: args.expected_effect_id, ...operation(args),
+          mediaType: args.media_type, componentIndex: args.component_index, expectedEffectId: args.expected_effect_id, ...targets, ...operation(args),
         });
         return invalidAction(args.action);
       },
@@ -292,14 +305,7 @@ export function getUxpWorkflowTools(bridge: UxpWebSocketBridge) {
             mode: args.action,
             expectedSequenceGuid: args.expected_sequence_guid,
             ...(args.selection_items === undefined ? {} : {
-              items: args.selection_items.map((item) => ({
-                mediaType: item.media_type,
-                trackIndex: item.track_index,
-                clipIndex: item.clip_index,
-                expectedProjectItemId: item.expected_project_item_id,
-                expectedStartSeconds: item.expected_start_seconds,
-                expectedEndSeconds: item.expected_end_seconds,
-              })),
+              items: args.selection_items.map(panelSelectionItem),
             }),
             ...operation(args),
           });
