@@ -534,6 +534,60 @@ describe("stable Premiere UXP workflow expansion", () => {
     expect(value.selectedItems()).toEqual([]);
   });
 
+  it("builds the selection and calls setSelection inside one lockedAccess callback", async () => {
+    const value = stableHost();
+    let locked = false;
+    const seen: Record<string, boolean> = {};
+    value.project.lockedAccess.mockImplementation((callback: () => void) => { locked = true; try { callback(); } finally { locked = false; } });
+    const create = value.ppro.TrackItemSelection.createEmptySelection.getMockImplementation();
+    value.ppro.TrackItemSelection.createEmptySelection.mockImplementation(((callback: (selection: unknown) => void) => {
+      seen.created = locked;
+      return create?.(callback as never);
+    }) as never);
+    const set = value.sequence.setSelection.getMockImplementation();
+    value.sequence.setSelection.mockImplementation(((selection: never) => { seen.set = locked; return set?.(selection); }) as never);
+    await expect(value.registry.dispatch("selection.update", {
+      mode: "replace", expectedSequenceGuid: "sequence-1", operationId: "locked-1",
+      items: [{ mediaType: "audio", trackIndex: 0, clipIndex: 0, expectedProjectItemId: "source-1", expectedStartSeconds: 10, expectedEndSeconds: 20 }],
+    })).resolves.toMatchObject({ outcome: "verified", count: 1 });
+    expect(seen).toEqual({ created: true, set: true });
+  });
+
+  it("refuses a clip Premiere will not add to the selection as a no-write refusal", async () => {
+    const value = stableHost();
+    value.ppro.TrackItemSelection.createEmptySelection.mockImplementation(((callback: (selection: unknown) => void) => {
+      callback({ addItem: vi.fn(() => false) });
+      return true;
+    }) as never);
+    await expect(value.registry.dispatch("selection.update", {
+      mode: "replace", expectedSequenceGuid: "sequence-1", operationId: "rejected-1",
+      items: [{ mediaType: "audio", trackIndex: 0, clipIndex: 0, expectedProjectItemId: "source-1", expectedStartSeconds: 10, expectedEndSeconds: 20 }],
+    })).rejects.toMatchObject({ code: "UXP_SELECTION_REJECTED", noHostWrite: true });
+    expect(value.sequence.setSelection).not.toHaveBeenCalled();
+  });
+
+  it("applies and removes a batch effect on named targets without reading the timeline selection", async () => {
+    const value = stableHost();
+    value.selectMany(0);
+    const target = { mediaType: "video", trackIndex: 0, clipIndex: 0, expectedProjectItemId: "source-1", expectedStartSeconds: 10, expectedEndSeconds: 20 };
+    await expect(value.registry.dispatch("effects.selection.add", {
+      mediaType: "video", effectId: "PR.Test", targets: [target],
+    })).resolves.toMatchObject({ applied: 1, outcome: "verified" });
+    await expect(value.registry.dispatch("effects.selection.remove", {
+      mediaType: "video", componentIndex: 1, expectedEffectId: "PR.Test", targets: [target],
+    })).resolves.toMatchObject({ removed: 1, outcome: "verified" });
+    expect(value.sequence.getSelection).not.toHaveBeenCalled();
+    // A target that is the wrong media type, or whose fingerprint is stale, is refused.
+    await expect(value.registry.dispatch("effects.selection.add", {
+      mediaType: "audio", effectId: "Test Audio Effect", targets: [target],
+    })).rejects.toMatchObject({ code: "UXP_SELECTION_TYPE_MISMATCH" });
+    // Fresh host: the refusal above would otherwise fence later writes (Batch A's fix).
+    await expect(stableHost().registry.dispatch("effects.selection.add", {
+      mediaType: "video", effectId: "PR.Test", targets: [{ ...target, expectedEndSeconds: 99 }],
+    })).rejects.toMatchObject({ code: "UXP_STALE_SELECTION_TARGET" });
+    expect(value.project.executeTransaction).toHaveBeenCalledTimes(2);
+  });
+
   it("supports the pre-26.3 Promise form of Sequence.setSelection", async () => {
     const value = stableHost();
     const implementation = value.sequence.setSelection.getMockImplementation();

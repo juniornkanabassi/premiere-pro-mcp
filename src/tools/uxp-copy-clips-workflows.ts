@@ -51,7 +51,7 @@ const clipSchema: Schema = {
 /** The plan returned by inspect, passed back unchanged to apply. */
 const expectedSnapshotSchema: Schema = {
   type: "object",
-  description: "The expected_snapshot object returned by inspect, passed unchanged.",
+  description: "The expected_snapshot object returned by inspect, passed unchanged. Pass expected_snapshot, not result.",
   additionalProperties: false,
   required: ["project_guid", "source_sequence_id", "source_sequence_name", "destination_sequence_id", "destination_sequence_name",
     "source_start_ticks", "source_end_ticks", "destination_start_ticks", "clips"],
@@ -72,7 +72,11 @@ function camelKey(snakeKey: string): string {
   return snakeKey.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
 }
 
-/** Convert a snake_case snapshot to the panel's camelCase shape, rejecting unknown or missing fields. */
+/**
+ * Convert a snapshot to the panel's camelCase shape, rejecting unknown or missing fields.
+ * Each field may arrive as its snake_case key (expected_snapshot) or its camelCase twin
+ * (the raw inspect result); giving both with different values is refused.
+ */
 function toPanelShape(value: unknown, schema: Schema, name: string): unknown {
   if (schema.type === "array") {
     if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
@@ -82,13 +86,20 @@ function toPanelShape(value: unknown, schema: Schema, name: string): unknown {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
     const record = value as Record<string, unknown>;
     const properties = schema.properties ?? {};
-    for (const key of Object.keys(record)) if (!(key in properties)) throw new Error(`${name} has an unknown field: ${key}`);
+    const known = new Set(Object.keys(properties).flatMap((key) => [key, camelKey(key)]));
+    for (const key of Object.keys(record)) if (!known.has(key)) throw new Error(`${name} has an unknown field: ${key}`);
     const out: Record<string, unknown> = {};
     for (const key of schema.required ?? []) {
-      if (!(key in record)) throw new Error(`${name}.${key} is required`);
+      if (!(key in record) && !(camelKey(key) in record)) throw new Error(`${name}.${key} is required`);
     }
     for (const [key, child] of Object.entries(properties)) {
-      if (key in record) out[camelKey(key)] = toPanelShape(record[key], child, `${name}.${key}`);
+      const camel = camelKey(key);
+      const both = camel !== key && key in record && camel in record;
+      if (both && JSON.stringify(record[key]) !== JSON.stringify(record[camel])) {
+        throw new Error(`${name}.${key} was given as both ${key} and ${camel} with different values`);
+      }
+      const given = key in record ? key : camel;
+      if (given in record) out[camel] = toPanelShape(record[given], child, `${name}.${key}`);
     }
     return out;
   }
@@ -108,6 +119,17 @@ const REQUEST_KEYS = [
   "video_tracks", "audio_tracks", "video_track_offset", "audio_track_offset",
 ] as const;
 
+type CameraCutArgs = {
+  action: "inspect" | "apply";
+  sequence_id: string;
+  cuts: Array<{ camera_id: string; start_seconds: number; end_seconds: number }>;
+  camera_tracks: Record<string, number>;
+  program_track_index: number;
+  expected_snapshot?: Record<string, unknown>;
+  confirm_copy?: boolean;
+  operation_id?: string;
+};
+
 function panelRequest(args: CopyClipsArgs): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of REQUEST_KEYS) if (args[key] !== undefined) out[camelKey(key)] = args[key];
@@ -115,9 +137,73 @@ function panelRequest(args: CopyClipsArgs): Record<string, unknown> {
 }
 
 export function getUxpCopyClipsWorkflowTools(bridge: UxpWebSocketBridge) {
+  /** Run a prepared panel request as inspect, or as apply with the reviewed plan. */
+  const run = (args: { action: string; expected_snapshot?: Record<string, unknown>; confirm_copy?: boolean; operation_id?: string }, request: Record<string, unknown>) => {
+    if (args.action === "inspect") return withApplySnapshot(invoke(bridge, "sequence.copyClips.inspect", request), expectedSnapshotSchema);
+    if (args.action === "apply") {
+      if (!args.expected_snapshot) throw new Error("expected_snapshot is required for action: apply");
+      return invoke(bridge, "sequence.copyClips", {
+        ...request,
+        expectedSnapshot: toPanelShape(args.expected_snapshot, expectedSnapshotSchema, "expected_snapshot"),
+        confirmCopy: args.confirm_copy,
+        operationId: args.operation_id,
+      });
+    }
+    return { success: false, error: `Unsupported workflow action: ${String(args.action)}` };
+  };
   return {
+    apply_camera_cut_uxp: {
+      description: "Build a camera cut on a new or empty 'program' video track from a plan_multicam_angle_switches cut list, by cloning each planned range from its camera's video track onto the program track at the same time, with the camera stack left untouched. Pass the plan's cuts, camera_tracks (camera_id to video track index) and program_track_index (an empty track, or the next track number to create one). Inspect returns the exact clip placements; apply needs that unchanged expected_snapshot, confirm_copy: true and an operation_id. A busy program track is refused. Only the picture is cut; audio tracks, and the picture's linked audio, are not touched. A clip that crosses a cut is trimmed to it (this adds two Undo steps; undo_steps says how many); retimed clips are refused. Each clone is read back (start, end, source in and out within half a frame, enabled state); outcome is verified or committed_unverified. It does not prove playback or rendered frames.",
+      parameters: {
+        type: "object" as const,
+        additionalProperties: false,
+        properties: {
+          action: { type: "string", enum: ["inspect", "apply"] },
+          sequence_id: { ...sequenceId, description: "GUID of the sequence that holds the stacked cameras and will hold the program track." },
+          cuts: {
+            type: "array", minItems: 1, maxItems: 256,
+            description: "The cuts array from plan_multicam_angle_switches, in time order.",
+            items: {
+              type: "object", additionalProperties: true,
+              properties: {
+                camera_id: { type: "string", minLength: 1, maxLength: 64 },
+                start_seconds: { ...seconds, description: "Cut start in sequence seconds, snapped to the nearest frame." },
+                end_seconds: { ...seconds, description: "Cut end in sequence seconds, snapped to the nearest frame." },
+              },
+              required: ["camera_id", "start_seconds", "end_seconds"],
+            },
+          },
+          camera_tracks: { type: "object", maxProperties: 64, additionalProperties: index, description: "Video track index of each camera_id, for example {\"cam1\": 1, \"cam2\": 2}." },
+          program_track_index: { ...index, description: "Video track to build the cut on. Must be empty, or equal to the sequence's video track count to create a new one." },
+          expected_snapshot: expectedSnapshotSchema,
+          confirm_copy: { type: "boolean", description: "Must be true for action: apply." },
+          operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: apply." },
+        },
+        required: ["action", "sequence_id", "cuts", "camera_tracks", "program_track_index"],
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      availability: {
+        backend: "uxp", minimumPremiereVersion: "25.6.0", capability: "sequence.copyClips.inspect|sequence.copyClips",
+        notes: [
+          "Requires an authenticated UXP bridge whose runtime capability handshake advertises sequence.copyClips.inspect and sequence.copyClips.",
+          "A verification failure can follow a committed host transaction; undo_steps Premiere Undos remove the cut.",
+        ],
+      },
+      handler: async (args: CameraCutArgs) => {
+        const segments = [];
+        for (const cut of args.cuts ?? []) {
+          const track = args.camera_tracks?.[cut.camera_id];
+          if (track === undefined) return { success: false, noHostWrite: true, error: `camera_tracks has no video track for camera_id ${cut.camera_id}` };
+          segments.push({ sourceStartSeconds: cut.start_seconds, sourceEndSeconds: cut.end_seconds, videoTrack: track });
+        }
+        return run(args, {
+          sourceSequenceId: args.sequence_id, destinationSequenceId: args.sequence_id,
+          segments, programTrack: args.program_track_index,
+        });
+      },
+    },
     copy_clips_between_sequences_uxp: {
-      description: "Inspect or apply a copy of every clip in a time range of one sequence into another sequence (or elsewhere in the same one), the way an editor's copy and paste does, by cloning each clip with documented UXP SequenceEditor actions. Unlike placing a clip from its project item, a clone keeps the clip's effects (Motion, Opacity, Lumetri including curves and LUTs), keyframes, enabled state and source range. Choose the source range and the destination start in ticks or in seconds (seconds snap to the nearest frame of their sequence), which source tracks to copy (default all), and an optional track offset per media type. The relative layout of the copied clips is kept. A clip that crosses an edge of the range is trimmed to it; one that is retimed or reversed is refused instead. Inspect returns the full plan: every clip with its source track and clip index, destination track, tick-exact start and end, source in and out, trim, and enabled state. It refuses a missing track, an empty range, and any destination range already occupied, so nothing is ever overwritten. Apply requires that unchanged plan, confirm_copy: true and an operation_id; whole clips are cloned in one locked undoable transaction, and clips that need a trim are cloned to a parking spot past the end of the destination, trimmed there and moved into place, which adds two more Undo steps (undo_steps in the result says how many). It reads back each copy's start, end, source range, project item and enabled state. Transitions and links between a clip's picture and sound are not copied. It does not prove rendered frames, playback or persistence.",
+      description: "Inspect or apply a copy of every clip in a time range of one sequence into another sequence (or elsewhere in the same one), the way an editor's copy and paste does, by cloning each clip with documented UXP SequenceEditor actions. Unlike placing a clip from its project item, a clone keeps the clip's effects (Motion, Opacity, Lumetri including curves and LUTs), keyframes, enabled state and source range. Choose the source range and the destination start in ticks or in seconds (seconds snap to the nearest frame of their sequence), which source tracks to copy (default all), and an optional track offset per media type. The relative layout of the copied clips is kept. A clip that crosses an edge of the range is trimmed to it; one that is retimed or reversed is refused instead. Inspect returns the full plan: every clip with its source track and clip index, destination track, tick-exact start and end, source in and out, trim, and enabled state. It refuses a missing track, an empty range, and any destination range already occupied, so nothing is ever overwritten. Apply requires that unchanged plan (pass expected_snapshot, not result), confirm_copy: true and an operation_id; whole clips are cloned in one locked undoable transaction, and clips that need a trim are cloned to a parking spot past the end of the destination, trimmed there and moved into place, which adds two more Undo steps (undo_steps in the result says how many). It reads back each copy's start, end, source range, project item and enabled state. Transitions and links between a clip's picture and sound are not copied. It does not prove rendered frames, playback or persistence.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -149,20 +235,7 @@ export function getUxpCopyClipsWorkflowTools(bridge: UxpWebSocketBridge) {
           "A verification failure can follow a committed host transaction; undo_steps Premiere Undos remove the copy.",
         ],
       },
-      handler: async (args: CopyClipsArgs) => {
-        const request = panelRequest(args);
-        if (args.action === "inspect") return withApplySnapshot(invoke(bridge, "sequence.copyClips.inspect", request), expectedSnapshotSchema);
-        if (args.action === "apply") {
-          if (!args.expected_snapshot) throw new Error("expected_snapshot is required for action: apply");
-          return invoke(bridge, "sequence.copyClips", {
-            ...request,
-            expectedSnapshot: toPanelShape(args.expected_snapshot, expectedSnapshotSchema, "expected_snapshot"),
-            confirmCopy: args.confirm_copy,
-            operationId: args.operation_id,
-          });
-        }
-        return { success: false, error: `Unsupported workflow action: ${String(args.action)}` };
-      },
+      handler: async (args: CopyClipsArgs) => run(args, panelRequest(args)),
     },
   };
 }

@@ -13,6 +13,7 @@ const values: Record<string, unknown> = {
   start_seconds: 1, end_seconds: 2, transcript_revision: `sha256:${"a".repeat(64)}`,
   project_guid: "project-1", expected_transcript_revision: `sha256:${"a".repeat(64)}`,
   replacement_transcript_json: '{"segments":[]}',
+  camera_tracks: { "coverage-camera_id": 1 },
   sequence_name: "Coverage Stringout", duration_seconds: 10, frame_rate: 30,
   silence_ranges: [{ start_seconds: 2, end_seconds: 4 }],
   placements: [{
@@ -68,6 +69,8 @@ describe("UXP tool handler coverage", () => {
           delete args[unsupported];
         }
       }
+      // set_lock and set_target are always refused before any bridge call.
+      if (name === "manage_track_state_uxp" && all) args.action = "set_mute";
       const result = await tool.handler(args);
       expect(result).toBeDefined();
       if (name === "get_uxp_capabilities") expect(getState).toHaveBeenCalled();

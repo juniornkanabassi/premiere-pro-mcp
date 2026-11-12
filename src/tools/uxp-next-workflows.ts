@@ -103,6 +103,8 @@ type SourceMediaOverridesArgs = {
   operation_id?: string;
 };
 
+const TRACK_LOCK_TARGET_UNSUPPORTED = "Premiere 27.0 UXP has no track lock or track target API, and this server does not fake one. Name the tracks explicitly with track_indices (or the track parameters) on each razor, extract, insert and copy.";
+
 type TrackStateArgs = {
   action?: string;
   sequence_id?: string;
@@ -578,7 +580,7 @@ export function getUxpNextWorkflowTools(bridge: UxpWebSocketBridge) {
         type: "object" as const,
         additionalProperties: false,
         properties: {
-          action: { type: "string", enum: ["inspect", "set_mute"] },
+          action: { type: "string", enum: ["inspect", "set_mute", "set_lock", "set_target"], description: `set_lock and set_target are always refused. ${TRACK_LOCK_TARGET_UNSUPPORTED}` },
           sequence_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
           expected_sequence_id: ownerIdentityGuardSchema,
           media_type: { type: "string", enum: ["all", "video", "audio", "caption"] },
@@ -593,6 +595,9 @@ export function getUxpNextWorkflowTools(bridge: UxpWebSocketBridge) {
         required: ["action"],
       },
       handler: async (args: TrackStateArgs) => {
+        if (args.action === "set_lock" || args.action === "set_target") {
+          return { success: false, error: TRACK_LOCK_TARGET_UNSUPPORTED, code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true };
+        }
         const common = {
           ...(args.sequence_id !== undefined ? { sequenceId: args.sequence_id } : {}),
           ...(args.expected_sequence_id !== undefined ? { expectedSequenceId: args.expected_sequence_id } : {}),
