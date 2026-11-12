@@ -402,7 +402,7 @@ describe("UXP copy clips between sequences", () => {
       expect(value.sequence.tracks.video[2]).toHaveLength(40);
       // Nothing ever sat further out than the cut, one gap and the 12 hour budget.
       expect(value.latestEnd()).toBeLessThanOrEqual(BigInt(tick(400 + 10 + 3600 * 12 + 3600)));
-      expect(result.undoSteps).toBeLessThan(20);
+      expect(result.undoSteps).toBe(13); // 4 parking rounds (11, 11, 11, 7 clones)
     });
 
     it("refuses a trimmed clip too long to park", async () => {
