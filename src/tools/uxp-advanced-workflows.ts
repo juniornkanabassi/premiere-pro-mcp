@@ -36,8 +36,8 @@ function operation(args: AdvancedArgs): Record<string, unknown> {
 
 function startTrack(value: unknown) {
   if (!value || typeof value !== "object") return undefined;
-  const track = value as { media_type?: unknown; track_index?: unknown };
-  return { mediaType: track.media_type, trackIndex: track.track_index };
+  const track = value as { media_type?: unknown; track_index?: unknown; sequence_id?: unknown };
+  return { mediaType: track.media_type, trackIndex: track.track_index, sequenceId: track.sequence_id };
 }
 
 // A refusal made here, before anything is sent to Premiere (shared contract: noHostWrite).
@@ -848,12 +848,12 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           include_source_project_item_classification: { type: "boolean", description: "Requires include_source_project_items. Also return documented read-only source flags for sequence, merged-clip, multicam-clip, and offline status; unavailable flags are null. It never reads Project-panel metadata, names, types, paths, or project-tree state." },
           include_source_project_item_content_type: { type: "boolean", description: "Requires include_source_project_items. Also return only the documented ClipProjectItem content category: any, sequence, or media; unavailable or unrecognized values are null. It never returns a Project-panel type code, name, metadata, path, or tree state." },
           include_source_nested_sequence_identity: { type: "boolean", description: "Requires source Project-item IDs and classification. For a source classified exactly as a sequence, return only its documented nested sequence GUID; unavailable or non-sequence sources return null. It never reads the nested sequence's content or Project-panel state." },
-          max_items: { type: "integer", minimum: 1, maximum: 512, description: "Maximum clip snapshots per page; defaults to 512. When the next track would exceed it, the result stops between tracks with complete=false and next_start_track (pass it back as start_track). A single track larger than max_items fails." },
+          max_items: { type: "integer", minimum: 1, maximum: 512, description: "Maximum clip snapshots per page; defaults to 512. When the next track would exceed it, the result stops between tracks with complete=false and nextStartTrack {mediaType, trackIndex, sequenceId} (pass them back as start_track media_type, track_index, sequence_id). A single track larger than max_items fails." },
           start_track: {
             type: "object", additionalProperties: false,
-            properties: { media_type: { type: "string", enum: ["video", "audio"] }, track_index: { type: "integer", minimum: 0, maximum: 1023 } },
-            required: ["media_type", "track_index"],
-            description: "Resume from this track, using next_start_track from a previous incomplete page. Pages are separate reads, not one atomic snapshot.",
+            properties: { media_type: { type: "string", enum: ["video", "audio"] }, track_index: { type: "integer", minimum: 0, maximum: 1023 }, sequence_id: { type: "string", description: "The sequence the previous page read; the page is refused if this read is of another one." } },
+            required: ["media_type", "track_index", "sequence_id"],
+            description: "Resume from this track, using nextStartTrack from a previous incomplete page. Pages are separate reads, not one atomic snapshot.",
           },
         },
       },
@@ -1002,6 +1002,9 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           close: ["sequence_id", "operation_id"],
           delete: ["sequence_id", "expected_name", "confirm_non_undoable", "operation_id"],
         };
+        if ((args.action === "clone" || args.action === "subsequence") && args.sequence_id == null) {
+          return refuse(`manage_sequences_uxp action "${args.action}" requires sequence_id; the active sequence is never assumed. Call action inspect to get the ID.`);
+        }
         const allowed = accepted[args.action];
         const rejected = Object.keys(supplied).filter((key) => !allowed.includes(key));
         if (rejected.length) {

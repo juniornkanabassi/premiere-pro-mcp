@@ -1595,13 +1595,16 @@ describe("advanced stable Premiere UXP workflows", () => {
     // A page stops between tracks and says where to resume; it never fails a multi-track timeline.
     await expect(value.registry.dispatch("timeline.structure.inspect", {
       mediaType: "all", maxItems: 1,
-    })).resolves.toMatchObject({ itemCount: 1, complete: false, nextStartTrack: { mediaType: "audio", trackIndex: 0 }, tracks: [{ mediaType: "video" }] });
+    })).resolves.toMatchObject({ itemCount: 1, complete: false, nextStartTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" }, tracks: [{ mediaType: "video" }] });
     await expect(value.registry.dispatch("timeline.structure.inspect", {
-      mediaType: "all", maxItems: 1, startTrack: { mediaType: "audio", trackIndex: 0 },
+      mediaType: "all", maxItems: 1, startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" },
     })).resolves.toMatchObject({ itemCount: 1, complete: true, nextStartTrack: null, tracks: [{ mediaType: "audio" }] });
     await expect(value.registry.dispatch("timeline.structure.inspect", {
-      mediaType: "video", startTrack: { mediaType: "audio", trackIndex: 0 },
+      mediaType: "video", startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" },
     })).rejects.toMatchObject({ code: "UXP_TARGET_NOT_FOUND" });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "all", startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "another-sequence" },
+    })).rejects.toMatchObject({ code: "UXP_STALE_SEQUENCE" });
     expect(value.project.lockedAccess).not.toHaveBeenCalled();
   });
 
@@ -1868,10 +1871,27 @@ describe("advanced stable Premiere UXP workflows", () => {
     await expect(unreadable.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
       .resolves.toMatchObject({ activated: true, outcome: "committed_unverified", verified: false });
 
+    // A sequence whose GUID will not stringify cannot be verified, so nothing is activated.
+    const unnamed = advancedHost();
+    (unnamed.sequences[0] as any).guid = {};
+    await expect(unnamed.registry.dispatch("sequences.activate", { sequenceId: "[object Object]" }))
+      .rejects.toMatchObject({ code: expect.stringMatching(/UXP_TARGET_NOT_FOUND|UXP_VERIFICATION_FAILED/) });
+    expect(unnamed.project.setActiveSequence).not.toHaveBeenCalled();
+
     const rejected = advancedHost();
     rejected.project.setActiveSequence.mockResolvedValue(false);
     await expect(rejected.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
       .rejects.toMatchObject({ code: "UXP_HOST_REJECTED" });
+  });
+
+  it("never falls back to the active sequence for clone or subsequence", async () => {
+    const value = advancedHost(), second = advancedHost();
+    await expect(value.registry.dispatch("sequences.clone", { operationId: "no-sequence" }))
+      .rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(second.registry.dispatch("sequences.subsequence", { confirmNonUndoable: true }))
+      .rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    expect(value.sequence.createCloneAction).not.toHaveBeenCalled();
+    expect(second.sequence.createSubsequence).not.toHaveBeenCalled();
   });
 
   it("keeps direct sequence actions unverified with stable result keys and probes host methods", async () => {
@@ -2102,7 +2122,7 @@ describe("advanced stable Premiere UXP workflows", () => {
       name: `Sequence ${index + 1}`,
     })));
     await expect(sequenceValue.registry.dispatch("sequences.clone", {
-      operationId: "sequence-capacity",
+      sequenceId: "sequence-1", operationId: "sequence-capacity",
     })).rejects.toMatchObject({ code: "UXP_PROJECT_TOO_LARGE" });
     expect(sequenceValue.sequence.createCloneAction).not.toHaveBeenCalled();
     expect(sequenceValue.project.lockedAccess).not.toHaveBeenCalled();
@@ -2141,8 +2161,8 @@ describe("advanced stable Premiere UXP workflows", () => {
       name: `Existing Sequence ${index}`,
     })));
     const sequenceResults = await Promise.allSettled([
-      sequenceValue.registry.dispatch("sequences.clone", { operationId: "sequence-first" }),
-      sequenceValue.registry.dispatch("sequences.clone", { operationId: "sequence-second" }),
+      sequenceValue.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "sequence-first" }),
+      sequenceValue.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "sequence-second" }),
     ]);
     expect(sequenceResults.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
     expect(sequenceResults.find((result) => result.status === "rejected")).toMatchObject({ reason: { code: "UXP_PROJECT_TOO_LARGE" } });

@@ -217,7 +217,7 @@
     // Raw ProjectItems from getItems() have no getItems(); nested bins need FolderItem.cast (see commands.cjs findProjectItem).
     function folderOrNull(item) {
       if (!ppro.FolderItem || typeof ppro.FolderItem.cast !== "function") return null;
-      try { return ppro.FolderItem.cast(item) || null; } catch (_) { return null; }
+      try { const folder = ppro.FolderItem.cast(item); return folder && typeof folder.getItems === "function" ? folder : null; } catch (_) { return null; }
     }
 
     function asFolder(item, label) {
@@ -402,8 +402,8 @@
     }
 
     function timelineStartTrack(value) {
-      assertObject(value); assertOnlyKeys(value, ["mediaType", "trackIndex"]);
-      return { mediaType: enumValue(value.mediaType, "startTrack.mediaType", ["video", "audio"]), trackIndex: boundedInt(value.trackIndex, "startTrack.trackIndex", 0, 1023) };
+      assertObject(value); assertOnlyKeys(value, ["mediaType", "trackIndex", "sequenceId"]);
+      return { mediaType: enumValue(value.mediaType, "startTrack.mediaType", ["video", "audio"]), trackIndex: boundedInt(value.trackIndex, "startTrack.trackIndex", 0, 1023), sequenceId: boundedString(value.sequenceId, "startTrack.sequenceId", 128) };
     }
 
     async function inspectTimelineStructure(args) {
@@ -411,6 +411,7 @@
       const startTrack = args.startTrack == null ? null : timelineStartTrack(args.startTrack);
       const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId);
       const sequenceId = guidString(sequence.guid), expectedSequenceId = args.expectedSequenceId == null ? null : boundedString(args.expectedSequenceId, "expectedSequenceId", 128);
+      if (startTrack && startTrack.sequenceId !== sequenceId) throw commandError("UXP_STALE_SEQUENCE", "startTrack belongs to sequence " + startTrack.sequenceId + " but this read is of " + sequenceId + "; start again from the first track");
       if (expectedSequenceId && expectedSequenceId !== sequenceId) {
         throw commandError("UXP_STALE_SEQUENCE", "The requested sequence identity no longer matches; inspect the current timeline and retry");
       }
@@ -458,7 +459,7 @@
           if (!track || typeof track.getTrackItems !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", currentMediaType + " track-item APIs are unavailable");
           const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
           if (itemCount + items.length > maxItems) {
-            if (itemCount > 0) { nextStartTrack = { mediaType: currentMediaType, trackIndex }; break scan; }
+            if (itemCount > 0) { nextStartTrack = { mediaType: currentMediaType, trackIndex, sequenceId }; break scan; }
             throw commandError("UXP_TIMELINE_TOO_LARGE", currentMediaType + " track " + trackIndex + " alone exceeds maxItems (" + maxItems + "); raise maxItems up to " + MAX_TIMELINE_ITEMS);
           }
           if (!items.length && !includeEmptyTracks) { emptyTracksOmitted += 1; continue; }
@@ -1103,7 +1104,7 @@
       const result = [];
       for (const time of Array.from(param.getKeyframeListAsTickTimes() || []).slice(0, MAX_KEYFRAMES)) {
         let value = null;
-        try { const keyframe = await param.getKeyframePtr(time); value = keyframe ? unwrapValue(keyframe.value) : null; } catch (_) {}
+        try { const keyframe = await param.getKeyframePtr(tick(tickSeconds(time))); value = keyframe ? unwrapValue(keyframe.value) : null; } catch (_) {}
         result.push({ seconds: tickSeconds(time), value: value === undefined ? null : value });
       }
       return result;
@@ -2099,6 +2100,7 @@
 
     async function cloneSequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "operationId"]);
+      if (args.sequenceId == null) throw refuse("UXP_INVALID_ARGUMENT", "sequenceId is required; the active sequence is never assumed");
       const project = await activeProject(true), sequence = await resolveSequence(project, args.sequenceId);
       return withAppendLock(appendLockKey(project, "sequences", "all"), async () => {
         const before = await listSequences(project);
@@ -2113,6 +2115,7 @@
 
     async function createSubsequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "ignoreTrackTargeting", "confirmNonUndoable", "operationId"]);
+      if (args.sequenceId == null) throw refuse("UXP_INVALID_ARGUMENT", "sequenceId is required; the active sequence is never assumed");
       requireConfirmation(args.confirmNonUndoable, "Creating a subsequence is a direct Sequence call without an Action boundary");
       const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), ignoreTrackTargeting = optionalBoolean(args.ignoreTrackTargeting, false, "ignoreTrackTargeting");
       return withAppendLock(appendLockKey(project, "sequences", "all"), async () => {
@@ -2152,10 +2155,12 @@
     async function activateSequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "operationId"]);
       const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), wanted = guidString(sequence.guid);
+      if (!wanted || wanted === "[object Object]" || wanted.length > 128) throw commandError("UXP_VERIFICATION_FAILED", "The sequence has no readable GUID, so activation cannot be verified");
       if (typeof project.openSequence === "function") { try { await project.openSequence(sequence); } catch (_) {} } // best effort; the readback below decides
       if (!await project.setActiveSequence(sequence)) throw commandError("UXP_HOST_REJECTED", "Premiere rejected sequence activate");
       let activeId = null;
       try { if (typeof project.getActiveSequence === "function") activeId = guidString((await project.getActiveSequence() || {}).guid) || null; } catch (_) {}
+      if (activeId === "[object Object]") activeId = null;
       if (activeId && wanted && activeId !== wanted) throw commandError("UXP_ACTIVATION_NOT_HELD", "Premiere reports sequence " + activeId + " as active after activating " + wanted);
       const verified = !!activeId && activeId === wanted;
       return { activated: true, outcome: verified ? "verified" : "committed_unverified", verified, sequence: await sequenceSnapshot(sequence), activeSequenceId: activeId, verificationBoundary: "active_sequence_readback",

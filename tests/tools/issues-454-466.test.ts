@@ -280,6 +280,13 @@ describe("issue #459 — manage_sequences_uxp forwards only each action's own pa
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("refuses clone and subsequence without a sequence_id before sending anything", async () => {
+    for (const action of ["clone", "subsequence"]) {
+      await expect(tools.manage_sequences_uxp.handler({ action, confirm_non_undoable: true })).resolves.toMatchObject({ success: false, noHostWrite: true, error: expect.stringContaining("requires sequence_id") });
+    }
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("names the accepted parameters when an action is given one it does not take", async () => {
     const result = await tools.manage_sequences_uxp.handler({
       action: "clone",
