@@ -401,30 +401,22 @@ function connect() {
   setStatus("Connecting to " + url.origin + url.pathname);
   try { socket = new WebSocket(url); } catch (e) { return scheduleReconnect(e.message); }
   socket.onopen = async () => {
+    serverConfig.reset();
     persistBridgeSession(configuredUrl, token);
     setStatus("Connected");
     send(Protocol.envelope("hello", await capabilities()));
     publishState("connected");
   };
-  socket.onmessage = (event) => { if (!applyServerConfig(event.data)) dispatch(event.data); };
+  socket.onmessage = (event) => { if (!serverConfig.receive(event.data)) dispatch(event.data); };
   socket.onerror = () => setStatus("Bridge connection error");
   socket.onclose = () => { void commandRegistry.dispose(); scheduleReconnect("Disconnected"); };
 }
-// After the handshake the server may send its approved workspace root (PREMIERE_UXP_WORKSPACE_ROOT).
-// Returns true when the frame was a config frame. The root is applied through the same path guard as a picked folder.
-function applyServerConfig(raw) {
-  if (typeof raw !== "string" || raw.indexOf('"config"') === -1) return false;
-  let frame;
-  try { frame = JSON.parse(raw); } catch (_) { return false; }
-  if (!frame || frame.type !== "config") return false;
-  const root = frame.payload && frame.payload.workspaceRoot;
-  if (typeof root === "string" && root) {
-    workspaceBroker.configureRoot(root)
-      .then(() => { renderWorkspaceStatus(); setStatus("Workspace root set by the MCP server"); })
-      .catch((error) => setStatus(error.message || String(error)));
-  }
-  return true;
-}
+// After the handshake the server may send its approved root (PREMIERE_UXP_WORKSPACE_ROOT), once per connection.
+// The root goes through the same path guard as a picked folder; the receiver ignores any later config frame.
+const serverConfig = workspaceBroker.createConfigReceiver({
+  onApplied: () => { renderWorkspaceStatus(); setStatus("Workspace root set by the MCP server"); },
+  onError: (error) => { renderWorkspaceStatus(); setStatus(error.message || String(error)); }
+});
 function scheduleReconnect(message) { setStatus(message + "; retrying in 2s"); reconnectTimer = setTimeout(connect, 2000); }
 function send(value) { if (socket && socket.readyState === WebSocket.OPEN) socket.send(Protocol.serializeEnvelope(value)); }
 function disconnect() {
@@ -614,6 +606,6 @@ async function revokeWorkspace() {
 function renderWorkspaceStatus() {
   const element = document.getElementById("workspace-status"), value = workspaceBroker.status();
   if (element) element.textContent = value.configured
-    ? "Approved folder: " + value.rootName + (value.accessMode === "configured" ? " (set by the MCP server)" : "") + "\nPersistent access: " + (value.persistent ? "yes" : "no") + "\nNative path: redacted\nCanonical path validation: " + value.canonicalPathValidation
-    : "No approved workspace folder. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server, or choose one here";
+    ? "Approved folder: " + value.rootName + (value.accessMode === "configured" ? " (set by the MCP server)" : "") + (value.pickedFolderIgnored ? "\nIgnored picked folder: " + value.pickedFolderIgnored + " (the server's root wins)" : "") + "\nPersistent access: " + (value.persistent ? "yes" : "no") + "\nNative path: redacted\nCanonical path validation: " + value.canonicalPathValidation
+    : (value.configError ? "Server workspace root refused: " + value.configError + "\n" : "") + "No approved workspace folder. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server, or choose one here";
 }

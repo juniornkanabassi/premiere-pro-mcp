@@ -406,7 +406,7 @@ export function buildPlatformCapabilityReport(
           "encoder.file",
         ],
         unsupportedCommands: {
-          "captions.create": "No documented Premiere UXP caption creation API.",
+          "captions.create": "Caption track creation is not possible through UXP on Premiere 27.0: an imported .srt placed in a sequence leaves the caption track count at 0, and Sequence has no caption track creator. Use the Captions panel, burned-in text clips, or a transcript import.",
           "captions.update": "No documented Premiere UXP caption text/timing mutation API.",
           "captions.delete": "No documented Premiere UXP caption deletion API.",
         },

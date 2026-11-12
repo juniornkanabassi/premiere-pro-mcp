@@ -74,7 +74,7 @@ describe("server-configured workspace root (item 3)", () => {
     await expect(bare.configureRoot("/Users/j/Workspace")).rejects.toMatchObject({ code: "UXP_WORKSPACE_UNAVAILABLE" });
   });
 
-  it("keeps a folder picked in the panel as the fallback and lets revoke clear a configured one", async () => {
+  it("uses the configured root when a different folder was also picked, and reports the conflict", async () => {
     const picked = folder("/Users/j/Picked");
     const root = folder("/Users/j/Workspace");
     const files = new Map<string, string>();
@@ -83,13 +83,68 @@ describe("server-configured workspace root (item 3)", () => {
       createFile: vi.fn(async (name: string) => ({ write: async (value: string) => { files.set(name, value); } })),
     };
     const fs = fsFor(root, { getFolder: vi.fn(async () => picked), getDataFolder: vi.fn(async () => dataFolder) });
-    const broker = Workspace.createWorkspaceBroker({ fs });
-    await broker.requestRoot();
-    await expect(broker.configureRoot("/Users/j/Workspace")).resolves.toMatchObject({ rootName: "Picked", accessMode: "request", persistent: true });
+    const pickedFirst = Workspace.createWorkspaceBroker({ fs });
+    await pickedFirst.requestRoot();
+    await expect(pickedFirst.configureRoot("/Users/j/Workspace")).resolves.toMatchObject({
+      rootName: "Workspace", accessMode: "configured", pickedFolderIgnored: "Picked", configError: null,
+    });
+    // Picking after the server's root was applied cannot displace it either.
+    const configuredFirst = Workspace.createWorkspaceBroker({ fs });
+    await configuredFirst.configureRoot("/Users/j/Workspace");
+    await expect(configuredFirst.requestRoot()).resolves.toMatchObject({ rootName: "Workspace", accessMode: "configured", pickedFolderIgnored: "Picked" });
+    // Picking the same folder is no conflict.
+    const same = Workspace.createWorkspaceBroker({ fs: fsFor(root, { getFolder: vi.fn(async () => root), getDataFolder: vi.fn(async () => dataFolder) }) });
+    await same.configureRoot("/Users/j/Workspace");
+    await expect(same.requestRoot()).resolves.toMatchObject({ pickedFolderIgnored: null });
 
     const fresh = Workspace.createWorkspaceBroker({ fs: fsFor(root) });
     await fresh.configureRoot("/Users/j/Workspace");
     await expect(fresh.revoke()).resolves.toMatchObject({ configured: false, accessMode: "request" });
+  });
+
+  it("refuses a depth-1 root and the home folder, and carries the reason as configError", async () => {
+    const broker = Workspace.createWorkspaceBroker({ fs: fsFor(folder("/Users/j/Workspace")) });
+    for (const bad of ["/Users", "/Users/j", "/home/j", "C:/Users/j"]) {
+      await expect(broker.configureRoot(bad)).rejects.toMatchObject({ code: "UXP_WORKSPACE_TOO_BROAD" });
+    }
+    expect(broker.status()).toMatchObject({ configured: false, configError: expect.stringContaining("home folder") });
+    await broker.configureRoot("/Users/j/Workspace");
+    expect(broker.status().configError).toBeNull();
+    const missing = Workspace.createWorkspaceBroker({ fs: { getEntryWithUrl: async () => { throw new Error("nope"); } } });
+    await expect(missing.configureRoot("/Users/j/Gone")).rejects.toBeTruthy();
+    expect(missing.status().configError).toContain("fullAccess");
+  });
+
+  it("keeps /root and /root-evil apart", async () => {
+    const evil = { isFolder: false, name: "x.png", nativePath: "/Users/j/Workspace-evil/x.png" };
+    const root = folder("/Users/j/Workspace", {});
+    const broker = Workspace.createWorkspaceBroker({ fs: fsFor(root) });
+    await broker.configureRoot("/Users/j/Workspace");
+    await expect(broker.assertPathAllowed(evil.nativePath, { label: "path", kind: "file" })).rejects.toMatchObject({ code: "UXP_PATH_OUTSIDE_WORKSPACE" });
+    await expect(broker.assertPathAllowed("/Users/j/Workspace-evil", { label: "path", kind: "directory" })).rejects.toMatchObject({ code: "UXP_PATH_OUTSIDE_WORKSPACE" });
+    await expect(broker.assertPathAllowed("/Users/j/Workspace", { label: "path", kind: "directory" })).resolves.toBe("/Users/j/Workspace");
+  });
+
+  it("applies only the first config frame per connection and passes other frames through", async () => {
+    const root = folder("/Users/j/Workspace");
+    const other = folder("/Users/j/Other");
+    const fs = fsFor(root, { getEntryWithUrl: vi.fn(async (url: string) => url.endsWith("/Other") ? other : root) });
+    const broker = Workspace.createWorkspaceBroker({ fs });
+    const applied: unknown[] = [];
+    const receiver = broker.createConfigReceiver({ onApplied: (value: unknown) => applied.push(value) });
+    const frame = (workspaceRoot: string) => JSON.stringify({ protocolVersion: 2, type: "config", payload: { workspaceRoot } });
+    expect(receiver.receive(JSON.stringify({ type: "command", command: "state.get" }))).toBe(false);
+    expect(receiver.receive("not json but mentions \"config\"")).toBe(false);
+    expect(receiver.receive(frame("/Users/j/Workspace"))).toBe(true);
+    expect(receiver.receive(frame("/Users/j/Other"))).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(applied).toHaveLength(1);
+    expect(broker.status().rootName).toBe("Workspace");
+    // A new connection may configure again.
+    receiver.reset();
+    expect(receiver.receive(frame("/Users/j/Other"))).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(broker.status().rootName).toBe("Other");
   });
 
   it("names the server setting and the panel button when no folder is approved", async () => {
@@ -104,8 +159,9 @@ describe("server-configured workspace root (item 3)", () => {
 describe("panel source (items 3, 4, 13)", () => {
   const panel = readFileSync(join(process.cwd(), "uxp-plugin", "index.cjs"), "utf8");
   it("applies the server's config frame through the broker", () => {
-    expect(panel).toContain("workspaceBroker.configureRoot(root)");
-    expect(panel).toContain("applyServerConfig(event.data)");
+    expect(panel).toContain("workspaceBroker.createConfigReceiver(");
+    expect(panel).toContain("serverConfig.receive(event.data)");
+    expect(panel).toContain("serverConfig.reset()");
   });
   it("keeps captions.create unsupported with the real reason and alternatives", () => {
     const line = panel.split("\n").find((entry) => entry.includes('"captions.create"')) ?? "";

@@ -253,27 +253,35 @@
       // A typed code alone cannot prove that a handler did not already write.
       return !!(error && error.noHostDispatch === true && error.dispatchEvidence === "panel_pre_dispatch");
     }
-    // Shared contract 13: the server pins the sequence outside args. Re-activate and read back before
-    // the handler runs; refuse with noHostWrite if the pinned sequence cannot be made active.
+    // Shared contract 13: the server pins the sequence outside args. Runs inside the mutation queue, just before
+    // the handler, so another request cannot switch sequence under a running handler. Returns a receipt note
+    // when it had to re-activate the pinned sequence. A refusal before any activation call wrote nothing; once
+    // openSequence/setActiveSequence has run, the active sequence may have changed, so that refusal is untagged.
     async function enforceSequencePin(pinnedSequenceId) {
       const project = await ppro.Project.getActiveProject();
       const guidOf = (sequence) => { try { return sequence && sequence.guid != null ? String(sequence.guid.toString()) : ""; } catch (_) { return ""; } };
       const active = project && await project.getActiveSequence();
-      if (guidOf(active) === pinnedSequenceId) return;
+      const from = guidOf(active);
+      if (from === pinnedSequenceId) return null;
       const target = project && Array.from(await project.getSequences() || []).find((sequence) => guidOf(sequence) === pinnedSequenceId);
       if (!target) throw refuse("UXP_PINNED_SEQUENCE_MISSING", "The pinned sequence is not in the active project; call sequences.activate on the sequence you want to edit. Nothing was changed");
       try {
         if (typeof project.openSequence === "function") await project.openSequence(target);
         if (typeof project.setActiveSequence === "function") await project.setActiveSequence(target);
       } catch (_) { /* the readback below decides */ }
-      const after = await project.getActiveSequence();
-      if (guidOf(after) !== pinnedSequenceId) throw refuse("UXP_PIN_MISMATCH", "Premiere would not re-activate the pinned sequence (active is " + (guidOf(after) || "unknown") + "). Nothing was changed");
+      const after = guidOf(await project.getActiveSequence());
+      if (after !== pinnedSequenceId) {
+        const error = commandError("UXP_PIN_MISMATCH", "Premiere would not re-activate the pinned sequence (active is now " + (after || "unknown") + ", was " + (from || "unknown") + "). The active sequence may have changed; inspect it before editing. The command was not run");
+        error.hostMayHaveChanged = true;
+        throw error;
+      }
+      return { resequenced: true, from: from || null, to: pinnedSequenceId };
     }
     async function dispatch(command, args, meta) {
       const invocation = { handlerEntered: false };
       try { return await dispatchInvocation(command, args, invocation, meta || {}); }
       catch (error) {
-        if (!invocation.handlerEntered && error && typeof error === "object") {
+        if (!invocation.handlerEntered && error && typeof error === "object" && error.hostMayHaveChanged !== true) {
           error.noHostDispatch = true;
           error.dispatchEvidence = "panel_pre_dispatch";
         }
@@ -288,8 +296,10 @@
       const operationId = validateOperationId(input.operationId);
       if (definition.readOnly) return definition.handler(input);
       if (!invocationSession || !operationLedger.secureIdentityAvailable) throw commandError("UXP_SECURE_IDENTITY_UNAVAILABLE", "Documented UXP cryptographic entropy is unavailable; no host mutation was dispatched. Run the matching panel in a supported Premiere host");
-      if (typeof meta.pinnedSequenceId === "string" && meta.pinnedSequenceId) await enforceSequencePin(meta.pinnedSequenceId);
+      const pin = typeof meta.pinnedSequenceId === "string" && meta.pinnedSequenceId ? meta.pinnedSequenceId : null;
       const identity = await operationIdentity(false);
+      // A pinned command runs on the pinned sequence, whatever is active when it is queued.
+      if (pin) identity.sequenceGuid = pin;
       const operationKey = operationId || "anonymous:" + operationLedger.sessionId + ":" + invocationSession + ":" + (++anonymousOperation);
       const binding = operationLedger.bind(command, input, identity);
       const record = operationLedger.get(operationKey, binding);
@@ -300,6 +310,7 @@
       }
       if (record) throw commandError("UXP_OPERATION_CONSUMED", "Operation ID was consumed; its result is unavailable or unknown. Inspect current state; replay is not authorized");
       const execute = async () => {
+        const sequencePin = pin ? await enforceSequencePin(pin) : null;
         const current = await operationIdentity(false);
         if (Ledger.canonical(current) !== Ledger.canonical(identity)) throw commandError("UXP_STALE_PROJECT", "Active project or sequence changed while waiting; no host mutation was dispatched");
         operationLedger.assertReady(current);
@@ -307,7 +318,8 @@
         try {
           invocation.handlerEntered = true;
           const result = await definition.handler(input);
-          const envelope = { operationId: operationId || null, outcome: result && result.outcome ? result.outcome : "verified", ...result };
+          // ranOnSequenceId is the sequence that was active when the handler started.
+          const envelope = { operationId: operationId || null, outcome: result && result.outcome ? result.outcome : "verified", ranOnSequenceId: current.sequenceGuid || null, ...(sequencePin ? { sequencePin } : {}), ...result };
           operationLedger.finish(operationKey, envelope.outcome);
           completedOperations.set(operationKey, envelope);
           if (completedOperations.size > 256) completedOperations.delete(completedOperations.keys().next().value);
@@ -358,6 +370,8 @@
         else if (!replaySupported) commands[name].reason = "Persistent operation storage is unavailable; mutations are disabled";
         else if (!pathValidationSupported) commands[name].reason = workspaceState.configured
           ? "The approved workspace folder cannot be walked on this host, so paths cannot be checked. Re-select it with Choose folder in the MCP panel"
+          : workspaceState.configError
+          ? "The workspace root configured on the MCP server was refused by the panel: " + workspaceState.configError
           : "No workspace folder is approved. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server and reconnect (the panel manifest uses fullAccess), or click Choose folder in the MCP panel and pick a folder that contains the paths you will use";
         if (definition.nonFencing === true) commands[name].nonFencing = true;
       }

@@ -130,6 +130,8 @@
     let rootEntry = null;
     let persistentToken = null;
     let configuredRoot = false;
+    let configError = null;
+    let pickedFolderName = null;
     let initialized = false;
 
     function nativePathFor(entry) {
@@ -203,42 +205,90 @@
         throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "Premiere did not return a persistent workspace token");
       }
       await writeConfiguration(token);
-      rootEntry = entry;
       persistentToken = token;
-      configuredRoot = false;
       initialized = true;
+      if (configuredRoot && rootEntry) {
+        // The server's configured root wins. The picked folder is stored but not used, and the conflict is reported.
+        pickedFolderName = samePath(entry, rootEntry) ? null : entry.name || "picked folder";
+        return status();
+      }
+      rootEntry = entry;
+      configuredRoot = false;
       return status();
     }
 
+    function samePath(a, b) {
+      const left = nativePathFor(a), right = nativePathFor(b);
+      return !!(left && right && parseAbsolutePath(left, "folder").comparison === parseAbsolutePath(right, "folder").comparison);
+    }
+
+    // A user's home folder (or its Windows/Linux equivalent) is far too broad to approve for file access.
+    function isHomeFolder(parsed) {
+      return /^(?:[A-Za-z]:)?\/(?:Users|home)\/[^/]+$/i.test(parsed.normalized);
+    }
+
     // The MCP server sends its approved root (PREMIERE_UXP_WORKSPACE_ROOT) after the handshake. It needs
-    // the manifest's "fullAccess" file permission, so no picker click is required. A folder the
-    // operator picked in the panel stays in force: the picker is the fallback, not a competitor.
+    // the manifest's "fullAccess" file permission, so no picker click is required. If the operator also
+    // picked a different folder in the panel, the server's root wins and the conflict is reported in status().
     async function configureRoot(value) {
-      if (persistentToken && rootEntry) return status();
-      if (!fs || typeof fs.getEntryWithUrl !== "function") {
-        throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "This UXP runtime cannot open a configured workspace folder; use Choose folder in the MCP panel");
+      try {
+        if (!fs || typeof fs.getEntryWithUrl !== "function") {
+          throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "This UXP runtime cannot open a configured workspace folder; use Choose folder in the MCP panel");
+        }
+        const parsed = parseAbsolutePath(value, "configured workspace root");
+        if (parsed.depth < 2 || isHomeFolder(parsed)) {
+          throw workspaceError("UXP_WORKSPACE_TOO_BROAD", "Configure a project subfolder, not a filesystem root, share root or home folder");
+        }
+        await initialize();
+        let entry;
+        try { entry = await fs.getEntryWithUrl(toFileUrl(parsed.normalized)); } catch (_) {
+          throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "Premiere could not open the configured workspace folder. Check that it exists and that the panel manifest uses localFileSystem fullAccess");
+        }
+        if (!entry || !entry.isFolder || !nativePathFor(entry)) {
+          throw workspaceError("UXP_WORKSPACE_NOT_SELECTED", "The configured workspace root is not a folder");
+        }
+        const picked = persistentToken && rootEntry && !configuredRoot ? rootEntry : null;
+        pickedFolderName = picked && !samePath(picked, entry) ? picked.name || "picked folder" : null;
+        rootEntry = entry;
+        configuredRoot = true;
+        configError = null;
+        return status();
+      } catch (error) {
+        configError = error && error.message ? String(error.message) : String(error);
+        throw error;
       }
-      const parsed = parseAbsolutePath(value, "configured workspace root");
-      if (parsed.depth < 1) {
-        throw workspaceError("UXP_WORKSPACE_TOO_BROAD", "Configure a project subfolder instead of a filesystem or share root");
-      }
-      let entry;
-      try { entry = await fs.getEntryWithUrl(toFileUrl(parsed.normalized)); } catch (_) {
-        throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "Premiere could not open the configured workspace folder. Check that it exists and that the panel manifest uses localFileSystem fullAccess");
-      }
-      if (!entry || !entry.isFolder || !nativePathFor(entry)) {
-        throw workspaceError("UXP_WORKSPACE_NOT_SELECTED", "The configured workspace root is not a folder");
-      }
-      rootEntry = entry;
-      configuredRoot = true;
-      initialized = true;
-      return status();
+    }
+
+    /**
+     * Applies the server's one config frame per connection. Later frames on the same connection are swallowed
+     * and ignored. Returns true when the frame was a config frame (so the caller does not dispatch it).
+     */
+    function createServerConfigReceiver(broker, hooks) {
+      let applied = false;
+      return {
+        reset() { applied = false; },
+        receive(raw) {
+          if (typeof raw !== "string" || raw.indexOf('"config"') === -1) return false;
+          let frame;
+          try { frame = JSON.parse(raw); } catch (_) { return false; }
+          if (!frame || frame.type !== "config") return false;
+          if (applied) return true;
+          applied = true;
+          const root = frame.payload && frame.payload.workspaceRoot;
+          if (typeof root === "string" && root) {
+            broker.configureRoot(root).then((value) => hooks && hooks.onApplied && hooks.onApplied(value), (error) => hooks && hooks.onError && hooks.onError(error));
+          }
+          return true;
+        }
+      };
     }
 
     async function revoke() {
       rootEntry = null;
       persistentToken = null;
       configuredRoot = false;
+      configError = null;
+      pickedFolderName = null;
       initialized = true;
       await deleteConfiguration();
       return status();
@@ -253,7 +303,9 @@
         configured: !!rootEntry,
         accessMode: configuredRoot ? "configured" : "request",
         rootName: rootEntry && typeof rootEntry.name === "string" ? rootEntry.name : null,
-        persistent: !!persistentToken,
+        persistent: !!persistentToken && !configuredRoot,
+        configError: configError,
+        pickedFolderIgnored: configuredRoot && pickedFolderName ? pickedFolderName : null,
         pathDisclosure: "redacted",
         canonicalPathValidation: typeof resolveCanonicalPath === "function" || canWalkGrantedFolder() ? "available" : "unavailable"
       };
@@ -364,7 +416,7 @@
       return !!(entry && !entry.isFolder);
     }
 
-    return { initialize, requestRoot, configureRoot, revoke, status, assertPathAllowed, fileExists };
+    return { initialize, requestRoot, configureRoot, createConfigReceiver: (hooks) => createServerConfigReceiver({ configureRoot }, hooks), revoke, status, assertPathAllowed, fileExists };
   }
 
   return { createWorkspaceBroker, createCanonicalPathResolver, parseAbsolutePath, isContained, validateLoopbackBridgeUrl, workspaceError };

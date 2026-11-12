@@ -74,6 +74,8 @@ describe("least-privilege UXP workspace broker", () => {
       accessMode: "request",
       rootName: "Approved Media",
       persistent: true,
+      configError: null,
+      pickedFolderIgnored: null,
       pathDisclosure: "redacted",
       canonicalPathValidation: "available",
     });

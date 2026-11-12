@@ -4,7 +4,9 @@ import { assertInvocationNotCancelled, currentInvocation, markHostDispatch, meas
 import { getTempDir, withBridgeWorkflow, type BridgeOptions } from "./file-bridge.js";
 import { inspectHostRecovery, markHostRecovery } from "./host-lease.js";
 import { EventEmitter } from "node:events";
-import { isAbsolute, parse } from "node:path";
+import { homedir } from "node:os";
+import { realpathSync } from "node:fs";
+import { isAbsolute, parse, resolve as resolvePath } from "node:path";
 import { createServer, type Server } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { assertNoSymlinkedPaths, SymlinkPathError } from "../security/path-guard.js";
@@ -136,12 +138,25 @@ export class UxpWebSocketBridge extends EventEmitter {
       throw new Error("PREMIERE_UXP_TOKEN must contain at least 16 characters");
     }
     const workspaceRoot = (options.workspaceRoot ?? process.env.PREMIERE_UXP_WORKSPACE_ROOT)?.trim();
-    // Same shape as the panel guard: absolute, and never a filesystem root.
-    const trimmedRoot = workspaceRoot?.replace(/[\\/]+$/, "");
-    if (workspaceRoot && (!isAbsolute(workspaceRoot) || !trimmedRoot || trimmedRoot === parse(workspaceRoot).root.replace(/[\\/]+$/, ""))) {
-      throw new Error("PREMIERE_UXP_WORKSPACE_ROOT must be an absolute project folder, not a filesystem root");
+    // Same shape as the panel guard: absolute, never a filesystem root, a share root or the home folder.
+    // The path must also be free of symlinks, so the panel's lexical guard cannot be walked out of the root.
+    let approvedRoot: string | null = null;
+    if (workspaceRoot) {
+      if (!isAbsolute(workspaceRoot)) throw new Error("PREMIERE_UXP_WORKSPACE_ROOT must be an absolute project folder");
+      const trimmed = resolvePath(workspaceRoot);
+      if (trimmed.split(/[\\/]+/).filter(Boolean).length < 2 || trimmed === resolvePath(homedir())) {
+        throw new Error("PREMIERE_UXP_WORKSPACE_ROOT must be an absolute project folder, not a filesystem root, share root or home folder");
+      }
+      let real: string;
+      try { real = realpathSync(trimmed); } catch (error) {
+        throw new Error(`PREMIERE_UXP_WORKSPACE_ROOT cannot be resolved (${(error as NodeJS.ErrnoException).code ?? "unknown error"}); create the folder first`);
+      }
+      if (real !== trimmed) {
+        throw new Error(`PREMIERE_UXP_WORKSPACE_ROOT is or contains a symlink (it resolves to ${real}); set it to the resolved path`);
+      }
+      approvedRoot = real;
     }
-    this.workspaceRoot = workspaceRoot || null;
+    this.workspaceRoot = approvedRoot;
     this.hostBridgeOptions = { tempDir: options.tempDir ?? getTempDir() };
     this.options = {
       token,
@@ -372,7 +387,6 @@ export class UxpWebSocketBridge extends EventEmitter {
     this.socket = client;
     this.hello = null;
     this.connectedAt = null;
-    this.pinnedSequenceId = null;
     this.handshakeTimer = setTimeout(() => {
       client.close(1008, "Versioned hello required");
     }, this.options.handshakeTimeoutMs);
@@ -438,7 +452,7 @@ export class UxpWebSocketBridge extends EventEmitter {
     if (message.payload?.ok === true) {
       const result = message.payload.result;
       if (pending.mutating && (result?.recoveryRequired === true || result?.outcome === "unknown" || result?.mutationOutcome === "unknown")) this.recordUncertain(message.requestId, pending.command);
-      this.learnPin(pending.command, result);
+      this.learnPin(pending.command, result, pending.mutating);
       pending.resolve(message.payload.result);
     } else {
       const error = message.payload?.error;
@@ -455,12 +469,15 @@ export class UxpWebSocketBridge extends EventEmitter {
     }, pending.context);
   }
 
-  /** Pin the sequence after a verified activate; forget it once that sequence is closed or deleted. */
-  private learnPin(command: string, result: any): void {
+  /**
+   * A verified activate sets the pin. Any other successful mutating sequence command (create, clone, open,
+   * close, delete, createPreset, an unverified activate) may change the active sequence, so it clears the
+   * pin rather than let the next edit be switched back to a stale sequence. Reads never touch it.
+   */
+  private learnPin(command: string, result: any, mutating: boolean | undefined): void {
+    if (!mutating || !/^(?:sequences\.|sequence\.createPreset$)/.test(command)) return;
     const id = typeof result?.sequence?.id === "string" ? result.sequence.id : null;
-    if (!id) return;
-    if (command === "sequences.activate" && result?.outcome === "verified") this.pinnedSequenceId = id;
-    else if ((command === "sequences.close" || command === "sequences.delete") && this.pinnedSequenceId === id) this.pinnedSequenceId = null;
+    this.pinnedSequenceId = command === "sequences.activate" && result?.outcome === "verified" && id ? id : null;
   }
 
   private clearConnection(error: Error): void {

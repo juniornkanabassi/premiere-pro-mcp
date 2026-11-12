@@ -1,4 +1,7 @@
 import { once } from "node:events";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 import { UxpWebSocketBridge } from "../../src/bridge/uxp-websocket-bridge.js";
@@ -32,6 +35,9 @@ async function connected(options: { workspaceRoot?: string; commands?: Record<st
         "state.get": { supported: true, readOnly: true },
         "sequences.activate": { supported: true, readOnly: false },
         "sequences.close": { supported: true, readOnly: false },
+        "sequences.createEmpty": { supported: true, readOnly: false },
+        "sequences.inspect": { supported: true, readOnly: true },
+        "sequence.createPreset": { supported: true, readOnly: false },
         "frame.export": { supported: false, readOnly: false, reason: "No workspace folder is approved. Set PREMIERE_UXP_WORKSPACE_ROOT on the MCP server." },
         ...options.commands,
       },
@@ -40,6 +46,8 @@ async function connected(options: { workspaceRoot?: string; commands?: Record<st
   await ready;
   return { bridge, client, frames };
 }
+
+const realTemp = () => realpathSync(mkdtempSync(join(tmpdir(), "uxp-root-")));
 
 const reply = (client: WebSocket, frame: Frame, payload: unknown) =>
   client.send(JSON.stringify({ protocolVersion: 2, type: "result", requestId: frame.requestId, payload }));
@@ -136,6 +144,25 @@ describe("sequence pin (item 13)", () => {
     expect(bridge.getPinnedSequence()).toBeNull();
   });
 
+  it("clears the pin after any successful mutating sequence command, but not after a read", async () => {
+    const { bridge, client } = await connected();
+    client.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Frame;
+      if (frame.type !== "command") return;
+      if (frame.command === "sequences.activate") reply(client, frame, { ok: true, result: { outcome: "verified", sequence: { id: "seq-A", name: "A" } } });
+      else if (frame.command === "sequences.createEmpty") reply(client, frame, { ok: true, result: { outcome: "verified", sequence: { id: "seq-B", name: "B" } } });
+      else reply(client, frame, { ok: true, result: { outcome: "verified" } });
+    });
+    await bridge.request("sequences.activate", {});
+    await bridge.request("sequences.inspect", {});
+    expect(bridge.getPinnedSequence()).toBe("seq-A");
+    await bridge.request("sequences.createEmpty", {});
+    expect(bridge.getPinnedSequence()).toBeNull();
+    await bridge.request("sequences.activate", {});
+    await bridge.request("sequence.createPreset", {});
+    expect(bridge.getPinnedSequence()).toBeNull();
+  });
+
   it("lets the caller pin and clear explicitly", async () => {
     const { bridge } = await connected();
     bridge.pinSequence("seq-C");
@@ -147,9 +174,10 @@ describe("sequence pin (item 13)", () => {
 
 describe("configured workspace root (item 3)", () => {
   it("sends the approved root to the panel after the handshake", async () => {
-    const { frames, client } = await connected({ workspaceRoot: "/Users/example/Workspace" });
+    const root = realTemp();
+    const { frames, client } = await connected({ workspaceRoot: root });
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(frames.find((frame) => frame.type === "config")).toMatchObject({ protocolVersion: 2, payload: { workspaceRoot: "/Users/example/Workspace" } });
+    expect(frames.find((frame) => frame.type === "config")).toMatchObject({ protocolVersion: 2, payload: { workspaceRoot: root } });
     client.close();
   });
 
@@ -165,9 +193,24 @@ describe("configured workspace root (item 3)", () => {
     }
   });
 
-  it("reads PREMIERE_UXP_WORKSPACE_ROOT and refuses a relative path or a filesystem root", () => {
-    expect(() => new UxpWebSocketBridge({ token: "x".repeat(16), workspaceRoot: "relative/dir" })).toThrow(/absolute project folder/);
-    expect(() => new UxpWebSocketBridge({ token: "x".repeat(16), workspaceRoot: "/" })).toThrow(/absolute project folder/);
+  it("refuses a relative path, a filesystem root, a share root and the home folder", () => {
+    const make = (workspaceRoot: string) => () => new UxpWebSocketBridge({ token: "x".repeat(16), workspaceRoot });
+    expect(make("relative/dir")).toThrow(/absolute project folder/);
+    expect(make("/")).toThrow(/not a filesystem root/);
+    expect(make("/Volumes")).toThrow(/not a filesystem root/);
+    expect(make(homedir())).toThrow(/home folder/);
+  });
+
+  it("fails closed when the root is missing, is a symlink, or sits under one", () => {
+    const real = realTemp();
+    mkdirSync(join(real, "target"));
+    symlinkSync(join(real, "target"), join(real, "link"));
+    const make = (workspaceRoot: string) => () => new UxpWebSocketBridge({ token: "x".repeat(16), workspaceRoot });
+    expect(make(join(real, "missing"))).toThrow(/cannot be resolved/);
+    expect(make(join(real, "link"))).toThrow(/is or contains a symlink.*resolves to/);
+    mkdirSync(join(real, "target", "inner"));
+    expect(make(join(real, "link", "inner"))).toThrow(/is or contains a symlink/);
+    expect(make(join(real, "target"))).not.toThrow();
   });
 
   it("puts the panel's own reason in the unsupported-command error", async () => {

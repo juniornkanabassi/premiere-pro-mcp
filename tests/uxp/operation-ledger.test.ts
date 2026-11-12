@@ -243,6 +243,35 @@ describe("sequence pin (item 13)", () => {
     expect(value.setActiveSequence).toHaveBeenCalledWith(value.first);
     expect(value.mutation).toHaveBeenCalledOnce();
   });
+  it("reports resequenced and the sequence the mutation ran on in the receipt", async () => {
+    const moved = pinHost("sequence-2");
+    await expect(moved.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" })).resolves.toMatchObject({
+      ranOnSequenceId: "sequence-1", sequencePin: { resequenced: true, from: "sequence-2", to: "sequence-1" },
+    });
+    const same = pinHost("sequence-1");
+    const receipt = await same.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" });
+    expect(receipt.ranOnSequenceId).toBe("sequence-1");
+    expect(receipt.sequencePin).toBeUndefined();
+    const unpinned = await pinHost("sequence-2").registry.dispatch("test.mutate", {});
+    expect(unpinned.ranOnSequenceId).toBe("sequence-2");
+  });
+  it("runs the pin check inside the mutation queue, after an earlier command has finished", async () => {
+    const value = pinHost("sequence-2");
+    const order: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    value.mutation.mockImplementationOnce(async () => { order.push("first-start"); await gate; order.push("first-end"); return { outcome: "verified" }; });
+    const activate = value.setActiveSequence.getMockImplementation() as (sequence: unknown) => Promise<boolean>;
+    value.setActiveSequence.mockImplementation(async (sequence: unknown) => { order.push("reactivate"); return activate(sequence); });
+    const first = value.registry.dispatch("test.mutate", { operationId: "first" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = value.registry.dispatch("test.mutate", { operationId: "second" }, { pinnedSequenceId: "sequence-1" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(order).toEqual(["first-start"]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-start", "first-end", "reactivate"]);
+  });
   it("leaves Premiere alone when the pinned sequence is already active, and for reads", async () => {
     const value = pinHost("sequence-1");
     await value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" });
@@ -253,7 +282,11 @@ describe("sequence pin (item 13)", () => {
   });
   it("refuses with noHostWrite and never runs the handler when the pin will not activate", async () => {
     const value = pinHost("sequence-2", false);
-    await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" })).rejects.toMatchObject({ code: "UXP_PIN_MISMATCH", noHostWrite: true });
+    await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" })).rejects.toMatchObject({ code: "UXP_PIN_MISMATCH", hostMayHaveChanged: true, message: expect.stringContaining("may have changed") });
+    const error = await value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "sequence-1" }).catch((caught: any) => caught);
+    expect(error.noHostWrite).toBeUndefined();
+    expect(error.noHostDispatch).toBeUndefined();
+    expect(error.dispatchEvidence).toBeUndefined();
     expect(value.mutation).not.toHaveBeenCalled();
     await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
   });
