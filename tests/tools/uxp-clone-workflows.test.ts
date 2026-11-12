@@ -34,4 +34,18 @@ describe("public guarded append-only track-item duplicate MCP tool", () => {
     })).rejects.toThrow("expected_snapshot.source has an unknown field: unexpected");
     expect(request).not.toHaveBeenCalled();
   });
+
+  it("passes the optional destination to inspect and apply", async () => {
+    const request = vi.fn().mockResolvedValue({ outcome: "verified" });
+    const tool = getUxpCloneWorkflowTools({ request } as unknown as UxpWebSocketBridge).duplicate_track_item_uxp;
+    expect(tool.parameters.properties).toMatchObject({ destination_seconds: { type: "number" }, destination_track_index: { type: "integer" } });
+    await tool.handler({ action: "inspect", media_type: "video", track_index: 0, clip_index: 1, destination_seconds: 40, destination_track_index: 2 });
+    expect(request).toHaveBeenCalledWith("trackItem.clone.inspect", { mediaType: "video", trackIndex: 0, clipIndex: 1, destinationSeconds: 40, destinationTrackIndex: 2 });
+    await tool.handler({
+      action: "apply", media_type: "video", track_index: 0, clip_index: 1, destination_seconds: 40, confirm_duplicate: true, operation_id: "clone-dest-1",
+      expected_snapshot: { project_guid: "project-1", sequence_id: "sequence-1", media_type: "video", track_index: 0, clip_index: 1, track_item_count: 3, source },
+    });
+    expect(request).toHaveBeenLastCalledWith("trackItem.clone", expect.objectContaining({ clipIndex: 1, destinationSeconds: 40, operationId: "clone-dest-1" }));
+    expect(request.mock.calls[1]![1]).not.toHaveProperty("destinationTrackIndex");
+  });
 });

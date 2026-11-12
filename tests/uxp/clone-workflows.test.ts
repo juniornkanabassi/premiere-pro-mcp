@@ -176,3 +176,110 @@ describe("guarded documented UXP append-only track-item duplicate workflow", () 
     expect(value.states).toHaveLength(2);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Destination mode: copy a clip into an empty range, on any track, not only after the last clip.
+// ---------------------------------------------------------------------------------------------
+
+type DestState = { projectItemId: string; start: number; end: number; inPoint: number; outPoint: number };
+const TICKS = 254016000000;
+const FRAME_TICKS = TICKS / 25;
+
+function destinationHost(tracks: DestState[][]) {
+  const lists = tracks.map((track) => track.map((state) => ({ ...state })));
+  const itemFor = (state: DestState) => ({
+    state,
+    getProjectItem: vi.fn(async () => ({ getId: vi.fn(async () => state.projectItemId) })),
+    getStartTime: vi.fn(async () => ({ seconds: state.start })),
+    getEndTime: vi.fn(async () => ({ seconds: state.end })),
+    getInPoint: vi.fn(async () => ({ seconds: state.inPoint })),
+    getOutPoint: vi.fn(async () => ({ seconds: state.outPoint })),
+    getDuration: vi.fn(async () => ({ seconds: state.end - state.start })),
+    getSpeed: vi.fn(async () => 1),
+    isSpeedReversed: vi.fn(async () => false),
+  });
+  const items = lists.map((track) => track.map(itemFor));
+  const sorted = (index: number) => [...items[index]!].sort((a, b) => a.state.start - b.state.start);
+  const sequence = {
+    guid: "sequence-1",
+    getTimebase: vi.fn(async () => String(FRAME_TICKS)),
+    getVideoTrackCount: vi.fn(async () => items.length),
+    getVideoTrack: vi.fn(async (index: number) => ({ getTrackItems: vi.fn(async () => sorted(index)) })),
+    getAudioTrackCount: vi.fn(async () => 0), getAudioTrack: vi.fn(async () => null),
+  };
+  const cloneAction = vi.fn((item: ReturnType<typeof itemFor>, offset: { seconds: number }, videoOffset: number, _audio: number, _align: boolean, isInsert: boolean) => ({
+    apply: () => {
+      const trackIndex = items.findIndex((track) => track.includes(item));
+      const target = trackIndex + videoOffset;
+      if (!items[target]) items[target] = [];
+      items[target]!.push(itemFor({ ...item.state, start: item.state.start + offset.seconds, end: item.state.end + offset.seconds }));
+    },
+    isInsert,
+  }));
+  const addAction = vi.fn((action: { apply: () => void }) => { action.apply(); return true; });
+  const project = {
+    guid: "project-1", getActiveSequence: vi.fn(async () => sequence), lockedAccess: vi.fn((callback: () => void) => callback()),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }),
+  };
+  const ppro = {
+    Project: { getActiveProject: vi.fn(async () => project) }, TickTime: { createWithSeconds: vi.fn((seconds: number) => ({ seconds })) },
+    SequenceEditor: { getEditor: vi.fn(() => ({ createCloneTrackItemAction: cloneAction })) }, Constants: { TrackItemType: { CLIP: 1 } },
+  };
+  const track = (index: number) => sorted(index).map((item) => [item.state.start, item.state.end, item.state.inPoint]);
+  return { items, cloneAction, project, track, registry: Commands.createCommandRegistry({ ppro, Protocol }) };
+}
+
+const snapshotOf = (value: ReturnType<typeof destinationHost>, trackIndex: number, clipIndex: number) => {
+  const items = [...value.items[trackIndex]!].sort((a, b) => a.state.start - b.state.start), state = items[clipIndex]!.state;
+  return {
+    projectGuid: "project-1", sequenceId: "sequence-1", mediaType: "video", trackIndex, clipIndex, trackItemCount: items.length,
+    source: { projectItemId: state.projectItemId, startSeconds: state.start, endSeconds: state.end, inSeconds: state.inPoint, outSeconds: state.outPoint, durationSeconds: state.end - state.start, speed: 1, reversed: false },
+  };
+};
+
+describe("trackItem.clone with a destination", () => {
+  const apply = (value: ReturnType<typeof destinationHost>, trackIndex: number, clipIndex: number, extra: Record<string, unknown>, operationId: string) =>
+    value.registry.dispatch("trackItem.clone", { mediaType: "video", trackIndex, clipIndex, expectedSnapshot: snapshotOf(value, trackIndex, clipIndex), confirmDuplicate: true, operationId, ...extra });
+
+  it("copies a middle clip into an empty gap on the same track, frame-snapped, without inserting", async () => {
+    const value = destinationHost([[
+      { projectItemId: "a", start: 0, end: 10, inPoint: 0, outPoint: 10 },
+      { projectItemId: "b", start: 10, end: 20, inPoint: 5, outPoint: 15 },
+      { projectItemId: "c", start: 20, end: 30, inPoint: 0, outPoint: 10 },
+      { projectItemId: "d", start: 60, end: 70, inPoint: 0, outPoint: 10 },
+    ]]);
+    const result = await apply(value, 0, 1, { destinationSeconds: 40.013 }, "dest-1");
+    expect(result).toMatchObject({ duplicated: true, outcome: "verified", verificationBoundary: "source_and_destination_track_item_readback", after: { duplicateClipIndex: 3, destinationTrackIndex: 0, duplicate: { projectItemId: "b", startSeconds: 40, endSeconds: 50, inSeconds: 5, outSeconds: 15 } } });
+    expect(value.track(0)).toEqual([[0, 10, 0], [10, 20, 5], [20, 30, 0], [40, 50, 5], [60, 70, 0]]);
+    // Offset is relative to the source start, vertical offset 0, isInsert false.
+    expect(value.cloneAction).toHaveBeenCalledWith(expect.anything(), { seconds: 30 }, 0, 0, false, false);
+    expect(value.project.executeTransaction.mock.calls[0]?.[1]).toBe("Duplicate timeline item to destination");
+  });
+
+  it("copies to another track at the same time, and creates a new track when the index equals the track count", async () => {
+    const value = destinationHost([[{ projectItemId: "a", start: 0, end: 10, inPoint: 0, outPoint: 10 }], [{ projectItemId: "x", start: 20, end: 30, inPoint: 0, outPoint: 10 }]]);
+    await expect(apply(value, 0, 0, { destinationTrackIndex: 1 }, "dest-2")).resolves.toMatchObject({ outcome: "verified", after: { destinationTrackIndex: 1, duplicate: { projectItemId: "a", startSeconds: 0, endSeconds: 10 } } });
+    expect(value.track(1)).toEqual([[0, 10, 0], [20, 30, 0]]);
+    await expect(apply(value, 0, 0, { destinationTrackIndex: 2, destinationSeconds: 5 }, "dest-3")).resolves.toMatchObject({ outcome: "verified", after: { destinationTrackIndex: 2 } });
+    expect(value.track(2)).toEqual([[5, 15, 0]]);
+  });
+
+  it("refuses an occupied destination, or one more than a track past the end, before any action, tagged noHostWrite", async () => {
+    const make = () => destinationHost([[{ projectItemId: "a", start: 0, end: 10, inPoint: 0, outPoint: 10 }, { projectItemId: "b", start: 10, end: 20, inPoint: 0, outPoint: 10 }]]);
+    const attempts: Array<[Record<string, unknown>, string]> = [
+      [{ destinationSeconds: 15 }, "UXP_TARGET_OCCUPIED"],
+      [{ destinationSeconds: 5 }, "UXP_TARGET_OCCUPIED"],
+      [{ destinationTrackIndex: 3 }, "UXP_TARGET_NOT_FOUND"],
+    ];
+    for (const [extra, code] of attempts) {
+      const value = make();
+      await expect(apply(value, 0, 0, extra, "dest-refuse")).rejects.toMatchObject({ code, noHostWrite: true });
+      expect(value.cloneAction).not.toHaveBeenCalled();
+      expect(value.project.executeTransaction).not.toHaveBeenCalled();
+    }
+    // Inspect refuses the same way and still returns the plain snapshot when the range is free.
+    await expect(make().registry.dispatch("trackItem.clone.inspect", { mediaType: "video", trackIndex: 0, clipIndex: 0, destinationSeconds: 15 })).rejects.toMatchObject({ code: "UXP_TARGET_OCCUPIED" });
+    const free = make();
+    await expect(free.registry.dispatch("trackItem.clone.inspect", { mediaType: "video", trackIndex: 0, clipIndex: 0, destinationSeconds: 30 })).resolves.toEqual(snapshotOf(free, 0, 0));
+  });
+});
