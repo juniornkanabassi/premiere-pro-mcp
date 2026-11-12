@@ -11,6 +11,8 @@ const Protocol = require("../../uxp-plugin/protocol.cjs");
 // replay of the refused operation or changes the production recovery guard.
 async function acknowledgeReviewedRefusal(value: { registry: { dispatch: (...args: any[]) => Promise<any> } }, expectedIds?: string[]) {
   const recovery = await value.registry.dispatch("operations.recovery.inspect", {});
+  // Pre-write refusals are tagged noHostWrite and release the ledger (fix plan item 10), so nothing may be left to reconcile.
+  if (!recovery.recoveryRequired) { expect(recovery.operations).toEqual([]); return; }
   expect(recovery.recoveryRequired).toBe(true);
   expect(recovery.operations.length).toBeGreaterThan(0);
   expect(recovery.operations.every((operation: { outcome: string }) => operation.outcome === "unknown")).toBe(true);
@@ -437,6 +439,16 @@ describe("advanced stable Premiere UXP workflows", () => {
     await expect(value.registry.dispatch("bins.create", {
       parentBinId: "bin-1", name: "Selects", operationId: "bin-create",
     })).resolves.toMatchObject({ created: true, outcome: "verified", item: { name: "Selects" } });
+  });
+
+  it("descends into nested bins when raw children have no getItems and only a cast folder does", async () => {
+    const value = advancedHost();
+    const { getItems: _hidden, ...rawBin } = value.bin as any;
+    (value.root as any).getItems = vi.fn(async () => [rawBin]);
+    value.ppro.FolderItem.cast.mockImplementation((item: any) => { if (item === rawBin) return value.bin; if (!item.isFolder) throw new Error("not folder"); return item; });
+    await expect(value.registry.dispatch("projectTree.inspect", { maxDepth: 2 })).resolves.toMatchObject({
+      items: [{ id: "bin-1", depth: 1, isBin: true }, { id: "clip-1", parentId: "bin-1", depth: 2 }],
+    });
   });
 
   it("verifies project-item removal from the tree even when the removed item is still selected (#642)", async () => {
@@ -1582,9 +1594,19 @@ describe("advanced stable Premiere UXP workflows", () => {
     await expect(value.registry.dispatch("timeline.structure.inspect", {
       includeSourceProjectItems: true, includeSourceNestedSequenceIdentity: true,
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
+    // A page stops between tracks and says where to resume; it never fails a multi-track timeline.
     await expect(value.registry.dispatch("timeline.structure.inspect", {
       mediaType: "all", maxItems: 1,
-    })).rejects.toMatchObject({ code: "UXP_TIMELINE_TOO_LARGE" });
+    })).resolves.toMatchObject({ itemCount: 1, complete: false, nextStartTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" }, tracks: [{ mediaType: "video" }] });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "all", maxItems: 1, startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" },
+    })).resolves.toMatchObject({ itemCount: 1, complete: true, nextStartTrack: null, tracks: [{ mediaType: "audio" }] });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "video", startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "sequence-1" },
+    })).rejects.toMatchObject({ code: "UXP_TARGET_NOT_FOUND" });
+    await expect(value.registry.dispatch("timeline.structure.inspect", {
+      mediaType: "all", startTrack: { mediaType: "audio", trackIndex: 0, sequenceId: "another-sequence" },
+    })).rejects.toMatchObject({ code: "UXP_STALE_SEQUENCE" });
     expect(value.project.lockedAccess).not.toHaveBeenCalled();
   });
 
@@ -1777,6 +1799,20 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
   });
 
+  it("unwraps Premiere 27.0 {value} readbacks and lists each keyframe's own value", async () => {
+    const value = advancedHost();
+    value.parameterState.keyframes = [1, 3];
+    value.parameter.getValueAtTime.mockResolvedValue({ value: 130 });
+    value.parameter.getKeyframePtr.mockImplementation((time: { seconds: number }) => value.parameterState.keyframes.includes(time.seconds)
+      ? { position: { seconds: time.seconds }, getTemporalInterpolationMode: async () => 1, value: { value: time.seconds * 10 } } : null);
+    const target = { mediaType: "video", trackIndex: 0, clipIndex: 0, componentIndex: 0, paramIndex: 0, expectedComponentId: "ADBE Opacity", expectedParamName: "Opacity" };
+    await expect(value.registry.dispatch("parameters.inspect", { ...target, timeSeconds: 3 })).resolves.toMatchObject({
+      value: 130, keyframes: [{ seconds: 1, value: 10 }, { seconds: 3, value: 30 }],
+    });
+    await expect(value.registry.dispatch("parameters.keyframe.inspect", { ...target, direction: "at", timeSeconds: 3 }))
+      .resolves.toMatchObject({ found: true, keyframe: { positionSeconds: 3, value: 30 } });
+  });
+
   it("locates one exact, directional, or bounded-nearest keyframe with native position and interpolation readback", async () => {
     const value = advancedHost();
     value.parameterState.keyframes = [1, 3, 7];
@@ -1818,10 +1854,51 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(staleTarget.parameter.getKeyframePtr).not.toHaveBeenCalled();
   });
 
+  it("activates a sequence verified only when getActiveSequence reads it back", async () => {
+    const held = advancedHost();
+    await expect(held.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .resolves.toMatchObject({ activated: true, outcome: "verified", verified: true, activeSequenceId: "sequence-1", verificationBoundary: "active_sequence_readback" });
+    expect(held.project.openSequence).toHaveBeenCalledBefore(held.project.setActiveSequence);
+
+    // Premiere says a different sequence is active: failed, not committed_unverified.
+    const drifted = advancedHost();
+    drifted.project.getActiveSequence.mockResolvedValue({ guid: "sequence-other", name: "Other" });
+    await expect(drifted.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .rejects.toMatchObject({ code: "UXP_ACTIVATION_NOT_HELD" });
+
+    // The readback itself fails: committed_unverified.
+    const unreadable = advancedHost();
+    // Only after activation: the panel's own pre-dispatch check reads the active sequence first.
+    unreadable.project.setActiveSequence.mockImplementation(async () => { unreadable.project.getActiveSequence.mockRejectedValue(new Error("no active sequence")); return true; });
+    await expect(unreadable.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .resolves.toMatchObject({ activated: true, outcome: "committed_unverified", verified: false });
+
+    // A sequence whose GUID will not stringify cannot be verified, so nothing is activated.
+    const unnamed = advancedHost();
+    (unnamed.sequences[0] as any).guid = {};
+    await expect(unnamed.registry.dispatch("sequences.activate", { sequenceId: "[object Object]" }))
+      .rejects.toMatchObject({ code: expect.stringMatching(/UXP_TARGET_NOT_FOUND|UXP_VERIFICATION_FAILED/) });
+    expect(unnamed.project.setActiveSequence).not.toHaveBeenCalled();
+
+    const rejected = advancedHost();
+    rejected.project.setActiveSequence.mockResolvedValue(false);
+    await expect(rejected.registry.dispatch("sequences.activate", { sequenceId: "sequence-1" }))
+      .rejects.toMatchObject({ code: "UXP_HOST_REJECTED" });
+  });
+
+  it("never falls back to the active sequence for clone or subsequence", async () => {
+    const value = advancedHost(), second = advancedHost();
+    await expect(value.registry.dispatch("sequences.clone", { operationId: "no-sequence" }))
+      .rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(second.registry.dispatch("sequences.subsequence", { confirmNonUndoable: true }))
+      .rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    expect(value.sequence.createCloneAction).not.toHaveBeenCalled();
+    expect(second.sequence.createSubsequence).not.toHaveBeenCalled();
+  });
+
   it("keeps direct sequence actions unverified with stable result keys and probes host methods", async () => {
     const value = advancedHost();
     for (const [command, resultField] of [
-      ["sequences.activate", "activated"],
       ["sequences.open", "opened"],
       ["sequences.close", "closed"],
     ]) {
@@ -2047,7 +2124,7 @@ describe("advanced stable Premiere UXP workflows", () => {
       name: `Sequence ${index + 1}`,
     })));
     await expect(sequenceValue.registry.dispatch("sequences.clone", {
-      operationId: "sequence-capacity",
+      sequenceId: "sequence-1", operationId: "sequence-capacity",
     })).rejects.toMatchObject({ code: "UXP_PROJECT_TOO_LARGE" });
     expect(sequenceValue.sequence.createCloneAction).not.toHaveBeenCalled();
     expect(sequenceValue.project.lockedAccess).not.toHaveBeenCalled();
@@ -2086,8 +2163,8 @@ describe("advanced stable Premiere UXP workflows", () => {
       name: `Existing Sequence ${index}`,
     })));
     const sequenceResults = await Promise.allSettled([
-      sequenceValue.registry.dispatch("sequences.clone", { operationId: "sequence-first" }),
-      sequenceValue.registry.dispatch("sequences.clone", { operationId: "sequence-second" }),
+      sequenceValue.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "sequence-first" }),
+      sequenceValue.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "sequence-second" }),
     ]);
     expect(sequenceResults.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
     expect(sequenceResults.find((result) => result.status === "rejected")).toMatchObject({ reason: { code: "UXP_PROJECT_TOO_LARGE" } });

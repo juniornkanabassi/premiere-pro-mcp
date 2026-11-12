@@ -704,8 +704,8 @@ describe("UXP MCP tools", () => {
       // and caption style guidance (get_caption_style_guidance) add three more tools; paste_clip_attributes, set_clip_duration, and compute_mask_fit_motion each add one core tool.
       // Premiere 26.5 WorkAreaUtils adds manage_work_area_uxp.
       // Clone-based unnest adds unnest_sequence_uxp.
-      // The stacked camera cut adds apply_camera_cut_uxp.
-        expect(tools.tools).toHaveLength(544);
+      // The stacked camera cut adds apply_camera_cut_uxp; razor, remove and extract add three; the MCP-side undo stack adds undo_last_edit_uxp and inspect_undo_stack_uxp.
+        expect(tools.tools).toHaveLength(549);
     } finally {
       await client.close();
       await server.close();

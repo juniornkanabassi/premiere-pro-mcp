@@ -5412,5 +5412,76 @@
       "export",
       "filesystem"
     ]
+  },
+  {
+    "tool": "remove_track_items_uxp",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "razor_track_item_uxp",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "extract_timeline_range_uxp",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "inspect_undo_stack_uxp",
+    "args": {},
+    "required": [
+      "inspect"
+    ]
+  },
+  {
+    "tool": "undo_last_edit_uxp",
+    "args": {},
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "apply_camera_cut_uxp",
+    "args": {
+      "action": "inspect"
+    },
+    "required": [
+      "inspect"
+    ]
+  },
+  {
+    "tool": "apply_camera_cut_uxp",
+    "args": {
+      "action": "apply"
+    },
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "manage_track_state_uxp",
+    "args": {
+      "action": "set_lock"
+    },
+    "required": [
+      "edit"
+    ]
+  },
+  {
+    "tool": "manage_track_state_uxp",
+    "args": {
+      "action": "set_target"
+    },
+    "required": [
+      "edit"
+    ]
   }
 ]

@@ -67,14 +67,16 @@
       value.segments.forEach(function (s, i) { only(s, ["id", "source_project_item_id", "transcript_revision", "source_start_seconds", "source_end_seconds", "speaker_label", "master_audio_start_seconds", "master_audio_end_seconds"]); text(s.id, "id", 128); text(s.source_project_item_id, "source_project_item_id", 512); const a = secs(s.source_start_seconds), b = secs(s.source_end_seconds); if (b <= a) fail("UXP_INVALID_ARGUMENT", "Segment " + i + " has no duration"); if (value.mode === "podcast") { const c = secs(s.master_audio_start_seconds), d = secs(s.master_audio_end_seconds); if (d <= c || Math.abs((d-c)-(b-a)) > .001) fail("UXP_INVALID_ARGUMENT", "Podcast audio mismatch at segment " + i); } });
       return value;
     }
-    async function find(project, wanted) { const queue = [await project.getRootItem()]; let count = 0; while (queue.length) { const item = queue.shift(); if (++count > 4096) fail("UXP_PROJECT_TOO_LARGE", "Project search exceeded 4096 items"); if (await id(item) === wanted) return item; if (item && item.getItems) queue.push.apply(queue, Array.from(await item.getItems() || [])); } fail("UXP_PROJECT_ITEM_NOT_FOUND", "Project item not found: " + wanted); }
+    // Raw ProjectItems have no getItems(); nested bins only expose it after FolderItem.cast (commands.cjs findProjectItem).
+    function folderOrNull(item) { if (!item) return null; if (ppro.FolderItem && ppro.FolderItem.cast) try { const cast = ppro.FolderItem.cast(item); if (cast) return cast; } catch (_) {} return item.getItems ? item : null; }
+    async function find(project, wanted) { const queue = [await project.getRootItem()]; let count = 0; while (queue.length) { const item = queue.shift(); if (++count > 4096) fail("UXP_PROJECT_TOO_LARGE", "Project search exceeded 4096 items"); if (await id(item) === wanted) return item; const folder = folderOrNull(item); if (folder) queue.push.apply(queue, Array.from(await folder.getItems() || [])); } fail("UXP_PROJECT_ITEM_NOT_FOUND", "Project item not found: " + wanted); }
     async function sequences(project) { const out = []; for (const item of Array.from(await project.getSequences() || [])) out.push(await snap(item)); return out; }
     async function addedSequence(project, before) { const known = new Set(before.map(function (x) { return x.id; })); for (const item of Array.from(await project.getSequences() || [])) if (!known.has(await id(item))) return item; return null; }
     function commit(project, label, actions) {
       // Callers construct actions and invoke this helper inside lockedAccess.
       // eslint-disable-next-line @adobe/premierepro/prefer-locked-access-wrapper
-      const ok = project.executeTransaction(function (compound) { actions.forEach(function (action) { if (!action || compound.addAction(action) === false) fail("UXP_ACTION_REJECTED", "Premiere rejected " + label); }); }, label);
-      if (!ok) fail("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);
+      const ok = project.executeTransaction(function (compound) { actions.forEach(function (action) { if (!action || compound.addAction(action) === false) failAfterWrite("UXP_ACTION_REJECTED", "Premiere rejected " + label); }); }, label);
+      if (!ok) failAfterWrite("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);
     }
     function asClip(item, name) { try { const cast = ppro.ClipProjectItem.cast(item); if (cast) return cast; } catch (_) {} fail("UXP_INVALID_PROJECT_ITEM", name + " is not a clip"); }
     function asFolder(item, name) { if (ppro.FolderItem && ppro.FolderItem.cast) try { const cast = ppro.FolderItem.cast(item); if (cast) return cast; } catch (_) {} if (item && item.getItems) return item; fail("UXP_INVALID_PROJECT_ITEM", name + " is not a folder"); }
@@ -99,7 +101,8 @@
         for (let i = 0; i < children.length; i += 1) {
           const child = children[i];
           if ((await id(child)) === wanted) return asFolder(folder, "source parent");
-          if (child && child.getItems) queue.push(child);
+          const sub = folderOrNull(child);
+          if (sub) queue.push(sub);
         }
       }
       fail("UXP_TARGET_UNSUPPORTED", "Could not resolve source parent; Premiere did not expose getParentBin for " + itemId);
@@ -133,7 +136,10 @@
     function only(value, keys) { if (!value || typeof value !== "object" || Array.isArray(value)) fail("UXP_INVALID_ARGUMENT", "Arguments must be an object"); Object.keys(value).forEach(function (key) { if (keys.indexOf(key) < 0) fail("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }); }
     function text(value, name, max, pattern) { if (typeof value !== "string" || !value || value.length > max || (pattern && !pattern.test(value))) fail("UXP_INVALID_ARGUMENT", name + " is invalid"); return value; }
     function secs(value) { if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 86400) fail("UXP_INVALID_ARGUMENT", "Time must be 0-86400 seconds"); return value; }
-    function fail(code, message) { const error = new Error(message); error.code = code; throw error; }
+    function failAfterWrite(code, message) { const error = new Error(message); error.code = code; throw error; }
+    // Every other failure here comes before the first host write (commit() is the only writer), so it is tagged noHostWrite.
+    function refuse(code, message) { const error = new Error(message); error.code = code; error.noHostWrite = true; throw error; }
+    function fail(code, message) { refuse(code, message); }
   }
   return { createDialogueWorkflowDefinitions: createDialogueWorkflowDefinitions };
 });

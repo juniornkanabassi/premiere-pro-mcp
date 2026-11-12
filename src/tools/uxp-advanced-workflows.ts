@@ -34,8 +34,19 @@ function operation(args: AdvancedArgs): Record<string, unknown> {
   return args.operation_id ? { operationId: args.operation_id } : {};
 }
 
+function startTrack(value: unknown) {
+  if (!value || typeof value !== "object") return undefined;
+  const track = value as { media_type?: unknown; track_index?: unknown; sequence_id?: unknown };
+  return { mediaType: track.media_type, trackIndex: track.track_index, sequenceId: track.sequence_id };
+}
+
+// A refusal made here, before anything is sent to Premiere (shared contract: noHostWrite).
+function refuse(error: string) {
+  return { success: false, error, noHostWrite: true };
+}
+
 function invalidAction(value: unknown) {
-  return { success: false, error: `Unsupported workflow action: ${String(value)}` };
+  return refuse(`Unsupported workflow action: ${String(value)}`);
 }
 
 type ReviewedMarkerSnapshot = {
@@ -315,7 +326,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         if (args.action === "remove_many") {
           try {
             if (args.confirm_destructive !== true) {
-              return { success: false, error: "remove_many is destructive; pass confirm_destructive=true after reviewing every marker snapshot" };
+              return refuse("remove_many is destructive; pass confirm_destructive=true after reviewing every marker snapshot");
             }
             return invoke(bridge, "markers.removeMany", {
               ...markerOwner,
@@ -382,7 +393,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
             keepHandleFrames: args.keep_handle_frames as number | undefined,
             maximumRemovals: args.maximum_removals as number | undefined,
           });
-          if (plan.keepRanges.length > 64) return { success: false, error: "Source stringout requires more than 64 keep segments; narrow the reviewed plan." };
+          if (plan.keepRanges.length > 64) return refuse("Source stringout requires more than 64 keep segments; narrow the reviewed plan.");
           const keepRanges = plan.keepRanges.map((range) => ({ ...range, startSeconds: range.startFrame / plan.frameRate, endSeconds: range.endFrame / plan.frameRate }));
           const result = await invoke(bridge, "silence.deriveSequence", {
             sourceProjectItemId: args.source_project_item_id, name: args.sequence_name, keepRanges,
@@ -516,7 +527,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         });
         if (args.action !== "update") return invalidAction(args.action);
         if (typeof args.expected_sequence_guid !== "string" || !args.expected_sequence_guid.trim() || args.expected_sequence_guid.length > 128) {
-          return { success: false, error: "update requires expected_sequence_guid from inspect" };
+          return refuse("update requires expected_sequence_guid from inspect");
         }
         try {
           const expectedDisplayFormats = reviewedDisplayFormats(args.expected_display_formats);
@@ -734,7 +745,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         if (args.action === "set_point_value") {
           const raw = args.expected_point_snapshot;
           const snapshot = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
-          if (!snapshot) return { success: false, error: "set_point_value requires expected_point_snapshot from inspect_point_value" };
+          if (!snapshot) return refuse("set_point_value requires expected_point_snapshot from inspect_point_value");
           return invoke(bridge, commands[args.action], {
             mediaType: args.media_type, trackIndex: args.track_index, clipIndex: args.clip_index,
             componentIndex: args.component_index, paramIndex: args.param_index,
@@ -761,7 +772,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         if (args.action === "set_color_value") {
           const raw = args.expected_color_snapshot;
           const snapshot = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
-          if (!snapshot) return { success: false, error: "set_color_value requires expected_color_snapshot from inspect_color_value" };
+          if (!snapshot) return refuse("set_color_value requires expected_color_snapshot from inspect_color_value");
           return invoke(bridge, commands[args.action], {
             mediaType: args.media_type, trackIndex: args.track_index, clipIndex: args.clip_index,
             componentIndex: args.component_index, paramIndex: args.param_index,
@@ -837,7 +848,13 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           include_source_project_item_classification: { type: "boolean", description: "Requires include_source_project_items. Also return documented read-only source flags for sequence, merged-clip, multicam-clip, and offline status; unavailable flags are null. It never reads Project-panel metadata, names, types, paths, or project-tree state." },
           include_source_project_item_content_type: { type: "boolean", description: "Requires include_source_project_items. Also return only the documented ClipProjectItem content category: any, sequence, or media; unavailable or unrecognized values are null. It never returns a Project-panel type code, name, metadata, path, or tree state." },
           include_source_nested_sequence_identity: { type: "boolean", description: "Requires source Project-item IDs and classification. For a source classified exactly as a sequence, return only its documented nested sequence GUID; unavailable or non-sequence sources return null. It never reads the nested sequence's content or Project-panel state." },
-          max_items: { type: "integer", minimum: 1, maximum: 512, description: "Hard limit for all returned clip snapshots; the request fails rather than returning a partial timeline." },
+          max_items: { type: "integer", minimum: 1, maximum: 512, description: "Maximum clip snapshots per page; defaults to 512. When the next track would exceed it, the result stops between tracks with complete=false and nextStartTrack {mediaType, trackIndex, sequenceId} (pass them back as start_track media_type, track_index, sequence_id). A single track larger than max_items fails." },
+          start_track: {
+            type: "object", additionalProperties: false,
+            properties: { media_type: { type: "string", enum: ["video", "audio"] }, track_index: { type: "integer", minimum: 0, maximum: 1023 }, sequence_id: { type: "string", description: "The sequence the previous page read; the page is refused if this read is of another one." } },
+            required: ["media_type", "track_index", "sequence_id"],
+            description: "Resume from this track, using nextStartTrack from a previous incomplete page. Pages are separate reads, not one atomic snapshot.",
+          },
         },
       },
       handler: async (args: AdvancedArgs) => invoke(bridge, "timeline.structure.inspect", compact({
@@ -847,6 +864,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         includeSourceProjectItemClassification: args.include_source_project_item_classification,
         includeSourceProjectItemContentType: args.include_source_project_item_content_type,
         includeSourceNestedSequenceIdentity: args.include_source_nested_sequence_identity, maxItems: args.max_items,
+        startTrack: startTrack(args.start_track),
       })),
     },
 
@@ -898,22 +916,37 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         required: ["action"],
       },
       handler: async (args: AdvancedArgs) => {
-        const common = compact({
-          projectItemId: args.project_item_id, timeSeconds: args.time_seconds,
-          videoTrackIndex: args.video_track_index, audioTrackIndex: args.audio_track_index,
-          limitShift: args.limit_shift, timeOffsetSeconds: args.time_offset_seconds,
-          videoTrackOffset: args.video_track_offset, audioTrackOffset: args.audio_track_offset,
-          alignToVideo: args.align_to_video, insert: args.insert, ripple: args.ripple,
-          mediaType: args.media_type, shiftOverlapping: args.shift_overlapping,
-          filePath: args.file_path, libraryName: args.library_name, elementName: args.element_name,
-          confirmNonUndoable: args.confirm_non_undoable,
-        });
+        const hostNames: Record<string, string> = {
+          project_item_id: "projectItemId", time_seconds: "timeSeconds",
+          video_track_index: "videoTrackIndex", audio_track_index: "audioTrackIndex",
+          limit_shift: "limitShift", time_offset_seconds: "timeOffsetSeconds",
+          video_track_offset: "videoTrackOffset", audio_track_offset: "audioTrackOffset",
+          align_to_video: "alignToVideo", insert: "insert", ripple: "ripple",
+          media_type: "mediaType", shift_overlapping: "shiftOverlapping",
+          file_path: "filePath", library_name: "libraryName", element_name: "elementName",
+          confirm_non_undoable: "confirmNonUndoable",
+        };
         const commands: Record<string, string> = {
           insert: "timeline.insert", overwrite: "timeline.overwrite", clone_selection: "timeline.cloneSelection",
           remove_selection: "timeline.removeSelection", insert_mogrt_path: "timeline.mogrtPath",
           insert_mogrt_library: "timeline.mogrtLibrary",
         };
         if (!args.action || !commands[args.action]) return invalidAction(args.action);
+        // Each host command rejects any argument it does not take, so refuse a stray one here, before sending.
+        const accepted: Record<string, readonly string[]> = {
+          insert: ["project_item_id", "time_seconds", "video_track_index", "audio_track_index", "limit_shift"],
+          overwrite: ["project_item_id", "time_seconds", "video_track_index", "audio_track_index"],
+          clone_selection: ["time_offset_seconds", "video_track_offset", "audio_track_offset", "align_to_video", "insert"],
+          remove_selection: ["ripple", "media_type", "shift_overlapping"],
+          insert_mogrt_path: ["file_path", "time_seconds", "video_track_index", "audio_track_index", "confirm_non_undoable"],
+          insert_mogrt_library: ["library_name", "element_name", "time_seconds", "video_track_index", "audio_track_index", "confirm_non_undoable"],
+        };
+        const allowed = accepted[args.action];
+        const rejected = Object.keys(hostNames).filter((key) => args[key] !== undefined && !allowed.includes(key));
+        if (rejected.length) {
+          return refuse(`edit_timeline_uxp action "${args.action}" does not accept ${rejected.join(", ")}. It accepts: ${allowed.join(", ")}, operation_id.`);
+        }
+        const common = compact(Object.fromEntries(allowed.map((key) => [hostNames[key], args[key]])));
         return invoke(bridge, commands[args.action], { ...common, ...operation(args) });
       },
     },
@@ -969,15 +1002,15 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           close: ["sequence_id", "operation_id"],
           delete: ["sequence_id", "expected_name", "confirm_non_undoable", "operation_id"],
         };
+        if ((args.action === "clone" || args.action === "subsequence") && args.sequence_id == null) {
+          return refuse(`manage_sequences_uxp action "${args.action}" requires sequence_id; the active sequence is never assumed. Call action inspect to get the ID.`);
+        }
         const allowed = accepted[args.action];
         const rejected = Object.keys(supplied).filter((key) => !allowed.includes(key));
         if (rejected.length) {
-          return {
-            success: false,
-            error: allowed.length
-              ? `manage_sequences_uxp action "${args.action}" does not accept ${rejected.join(", ")}. It accepts: ${allowed.join(", ")}.`
-              : `manage_sequences_uxp action "${args.action}" takes no other parameters, so ${rejected.join(", ")} cannot be used. Call it with action alone; it returns every sequence in the active project with its ID and name.`,
-          };
+          return refuse(allowed.length
+            ? `manage_sequences_uxp action "${args.action}" does not accept ${rejected.join(", ")}. It accepts: ${allowed.join(", ")}.`
+            : `manage_sequences_uxp action "${args.action}" takes no other parameters, so ${rejected.join(", ")} cannot be used. Call it with action alone; it returns every sequence in the active project with its ID and name.`);
         }
 
         return invoke(

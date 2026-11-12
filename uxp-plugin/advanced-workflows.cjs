@@ -214,6 +214,12 @@
       try { return !!ppro.FolderItem.cast(item); } catch (_) { return false; }
     }
 
+    // Raw ProjectItems from getItems() have no getItems(); nested bins need FolderItem.cast (see commands.cjs findProjectItem).
+    function folderOrNull(item) {
+      if (!ppro.FolderItem || typeof ppro.FolderItem.cast !== "function") return null;
+      try { const folder = ppro.FolderItem.cast(item); return folder && typeof folder.getItems === "function" ? folder : null; } catch (_) { return null; }
+    }
+
     function asFolder(item, label) {
       if (!ppro.FolderItem || typeof ppro.FolderItem.cast !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Folder APIs are unavailable");
       try {
@@ -259,7 +265,8 @@
           visited += 1;
           if (visited > MAX_PROJECT_ITEMS) throw commandError("UXP_PROJECT_TOO_LARGE", "Parent-bin lookup exceeded " + MAX_PROJECT_ITEMS + " entries");
           if (await projectItemId(child) === wantedId) return asFolder(folder, label);
-          if (isFolder(child)) queue.push(child);
+          const sub = folderOrNull(child);
+          if (sub) queue.push(sub);
         }
       }
       throw commandError("UXP_TARGET_UNSUPPORTED", "Could not resolve " + label + "; Premiere did not expose getParentBin for this clip");
@@ -299,7 +306,8 @@
           visited += 1;
           if (visited > MAX_PROJECT_ITEMS) throw commandError("UXP_PROJECT_TOO_LARGE", "Project-item lookup exceeded " + MAX_PROJECT_ITEMS + " entries; select the target in its Project view");
           if (await projectItemId(item) === id) return item;
-          if (isFolder(item)) queue.push(item);
+          const sub = folderOrNull(item);
+          if (sub) queue.push(sub);
         }
       }
       throw commandError("UXP_TARGET_NOT_FOUND", "projectItemId was not found");
@@ -393,10 +401,17 @@
       return indices.sort((left, right) => left - right);
     }
 
+    function timelineStartTrack(value) {
+      assertObject(value); assertOnlyKeys(value, ["mediaType", "trackIndex", "sequenceId"]);
+      return { mediaType: enumValue(value.mediaType, "startTrack.mediaType", ["video", "audio"]), trackIndex: boundedInt(value.trackIndex, "startTrack.trackIndex", 0, 1023), sequenceId: boundedString(value.sequenceId, "startTrack.sequenceId", 128) };
+    }
+
     async function inspectTimelineStructure(args) {
-      assertObject(args); assertOnlyKeys(args, ["sequenceId", "expectedSequenceId", "mediaType", "trackIndices", "includeEmptyTracks", "includeSourceProjectItems", "includeSourceProjectItemClassification", "includeSourceProjectItemContentType", "includeSourceNestedSequenceIdentity", "maxItems"]);
+      assertObject(args); assertOnlyKeys(args, ["sequenceId", "expectedSequenceId", "mediaType", "trackIndices", "includeEmptyTracks", "includeSourceProjectItems", "includeSourceProjectItemClassification", "includeSourceProjectItemContentType", "includeSourceNestedSequenceIdentity", "maxItems", "startTrack"]);
+      const startTrack = args.startTrack == null ? null : timelineStartTrack(args.startTrack);
       const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId);
       const sequenceId = guidString(sequence.guid), expectedSequenceId = args.expectedSequenceId == null ? null : boundedString(args.expectedSequenceId, "expectedSequenceId", 128);
+      if (startTrack && startTrack.sequenceId !== sequenceId) throw commandError("UXP_STALE_SEQUENCE", "startTrack belongs to sequence " + startTrack.sequenceId + " but this read is of " + sequenceId + "; start again from the first track");
       if (expectedSequenceId && expectedSequenceId !== sequenceId) {
         throw commandError("UXP_STALE_SEQUENCE", "The requested sequence identity no longer matches; inspect the current timeline and retry");
       }
@@ -411,7 +426,7 @@
       if (includeSourceNestedSequenceIdentity && (!includeSourceProjectItems || !includeSourceProjectItemClassification)) {
         throw commandError("UXP_INVALID_ARGUMENT", "includeSourceNestedSequenceIdentity requires source Project-item IDs and classification");
       }
-      const maxItems = args.maxItems == null ? 128 : boundedInt(args.maxItems, "maxItems", 1, MAX_TIMELINE_ITEMS);
+      const maxItems = args.maxItems == null ? MAX_TIMELINE_ITEMS : boundedInt(args.maxItems, "maxItems", 1, MAX_TIMELINE_ITEMS);
       const itemType = ppro.Constants && ppro.Constants.TrackItemType;
       if (!itemType || itemType.CLIP == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Clip track-item APIs are unavailable");
       const groups = mediaType === "all" ? ["video", "audio"] : [mediaType], tracks = [], trackCounts = {};
@@ -429,16 +444,23 @@
       if (requestedTrackCount > MAX_TIMELINE_TRACKS) {
         throw commandError("UXP_TIMELINE_TOO_LARGE", "Requested timeline scope exceeds " + MAX_TIMELINE_TRACKS + " tracks; filter mediaType or trackIndices");
       }
-      for (const currentMediaType of groups) {
+      // Paging stops between tracks, never inside one, so every page holds whole tracks.
+      let started = !startTrack, nextStartTrack = null;
+      scan: for (const currentMediaType of groups) {
         const title = currentMediaType === "video" ? "Video" : "Audio", trackMethod = "get" + title + "Track", count = trackCounts[currentMediaType];
         const indices = trackIndices == null ? Array.from({ length: count }, (_, index) => index) : trackIndices;
         for (const trackIndex of indices) {
           if (trackIndex >= count) throw commandError("UXP_TARGET_NOT_FOUND", currentMediaType + " trackIndices contains an out-of-range index");
+          if (!started) {
+            if (currentMediaType !== startTrack.mediaType || trackIndex !== startTrack.trackIndex) continue;
+            started = true;
+          }
           const track = await sequence[trackMethod](trackIndex);
           if (!track || typeof track.getTrackItems !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", currentMediaType + " track-item APIs are unavailable");
           const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
           if (itemCount + items.length > maxItems) {
-            throw commandError("UXP_TIMELINE_TOO_LARGE", "Requested timeline scope exceeds maxItems; filter trackIndices or raise maxItems up to " + MAX_TIMELINE_ITEMS);
+            if (itemCount > 0) { nextStartTrack = { mediaType: currentMediaType, trackIndex, sequenceId }; break scan; }
+            throw commandError("UXP_TIMELINE_TOO_LARGE", currentMediaType + " track " + trackIndex + " alone exceeds maxItems (" + maxItems + "); raise maxItems up to " + MAX_TIMELINE_ITEMS);
           }
           if (!items.length && !includeEmptyTracks) { emptyTracksOmitted += 1; continue; }
           const snapshots = [];
@@ -449,10 +471,13 @@
           tracks.push({ mediaType: currentMediaType, trackIndex, name: String(track.name || ""), itemCount: snapshots.length, items: snapshots });
         }
       }
+      if (!started) throw refuse("UXP_TARGET_NOT_FOUND", "startTrack is not among the requested tracks");
       return {
         sequence: { id: sequenceId, name: String(sequence.name || "") }, mediaType, trackIndices, maxItems,
         trackCounts, trackCount: tracks.length, itemCount, emptyTracksOmitted, tracks,
-        verificationBoundary: "bounded_track_item_readback"
+        complete: nextStartTrack == null, nextStartTrack,
+        verificationBoundary: "bounded_track_item_readback",
+        ...(startTrack || nextStartTrack ? { pageNote: "Pages are separate reads, not one atomic snapshot; apply tools keep their own guards." } : {})
       };
     }
 
@@ -509,7 +534,8 @@
           items.push(snapshot);
           if (snapshot.idUnavailable) skippedWithoutId += 1;
           if (snapshot.isBin) {
-            if (snapshot.depth < maxDepth && typeof child.getItems === "function") pending.push({ folder: child, id: snapshot.id || current.id, depth: snapshot.depth });
+            const sub = folderOrNull(child);
+            if (snapshot.depth < maxDepth && sub) pending.push({ folder: sub, id: snapshot.id || current.id, depth: snapshot.depth });
             else if (snapshot.depth >= maxDepth) depthLimitApplied = true;
           }
         }
@@ -1046,7 +1072,7 @@
       const rawTimes = typeof context.param.getKeyframeListAsTickTimes === "function" ? Array.from(context.param.getKeyframeListAsTickTimes() || []) : [];
       const times = rawTimes.slice(0, MAX_KEYFRAMES).map(tickSeconds);
       let value = null;
-      if (timeSeconds != null && typeof context.param.getValueAtTime === "function") value = await context.param.getValueAtTime(tick(finiteNumber(timeSeconds, "timeSeconds", 0, 86400), "timeSeconds"));
+      if (timeSeconds != null && typeof context.param.getValueAtTime === "function") value = unwrapValue(await context.param.getValueAtTime(tick(finiteNumber(timeSeconds, "timeSeconds", 0, 86400), "timeSeconds")));
       else if (typeof context.param.getStartValue === "function") value = keyframeValue(await context.param.getStartValue());
       return {
         mediaType: context.mediaType, trackIndex: context.trackIndex, clipIndex: context.clipIndex,
@@ -1068,8 +1094,20 @@
     }
 
     async function inspectParameter(args) {
-      const context = await parameterContext(args, false);
-      return parameterSnapshot(context, args.timeSeconds);
+      const context = await parameterContext(args, false), snapshot = await parameterSnapshot(context, args.timeSeconds);
+      return { ...snapshot, keyframes: await keyframeValues(context.param) };
+    }
+
+    // Each keyframe's own value (probe P9: getKeyframePtr(t).value), bounded by MAX_KEYFRAMES; null when the host will not read one.
+    async function keyframeValues(param) {
+      if (!param || typeof param.getKeyframeListAsTickTimes !== "function" || typeof param.getKeyframePtr !== "function") return [];
+      const result = [];
+      for (const time of Array.from(param.getKeyframeListAsTickTimes() || []).slice(0, MAX_KEYFRAMES)) {
+        let value = null;
+        try { const keyframe = await param.getKeyframePtr(tick(tickSeconds(time))); value = keyframe ? unwrapValue(keyframe.value) : null; } catch (_) {}
+        result.push({ seconds: tickSeconds(time), value: value === undefined ? null : value });
+      }
+      return result;
     }
 
     async function pointParameterContext(args, mutation) {
@@ -1421,7 +1459,8 @@
       if (!Number.isFinite(Number(temporalInterpolationMode))) {
         throw commandError("UXP_INVALID_HOST_STATE", "Premiere returned an invalid keyframe interpolation mode");
       }
-      return { ...base, found: true, keyframe: { positionSeconds, temporalInterpolationMode: Number(temporalInterpolationMode) } };
+      const value = unwrapValue(keyframe.value);
+      return { ...base, found: true, keyframe: { positionSeconds, temporalInterpolationMode: Number(temporalInterpolationMode), value: value === undefined ? null : value } };
     }
 
     async function parameterTimeVaryingContext(args, mutation) {
@@ -2061,6 +2100,7 @@
 
     async function cloneSequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "operationId"]);
+      if (args.sequenceId == null) throw refuse("UXP_INVALID_ARGUMENT", "sequenceId is required; the active sequence is never assumed");
       const project = await activeProject(true), sequence = await resolveSequence(project, args.sequenceId);
       return withAppendLock(appendLockKey(project, "sequences", "all"), async () => {
         const before = await listSequences(project);
@@ -2075,6 +2115,7 @@
 
     async function createSubsequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "ignoreTrackTargeting", "confirmNonUndoable", "operationId"]);
+      if (args.sequenceId == null) throw refuse("UXP_INVALID_ARGUMENT", "sequenceId is required; the active sequence is never assumed");
       requireConfirmation(args.confirmNonUndoable, "Creating a subsequence is a direct Sequence call without an Action boundary");
       const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), ignoreTrackTargeting = optionalBoolean(args.ignoreTrackTargeting, false, "ignoreTrackTargeting");
       return withAppendLock(appendLockKey(project, "sequences", "all"), async () => {
@@ -2109,7 +2150,22 @@
       });
     }
 
-    async function activateSequence(args) { return sequenceDirectAction(args, "activate", "setActiveSequence"); }
+    // Open then activate, then read getActiveSequence() back: verified when it is the requested sequence,
+    // failed when Premiere reports a different one, committed_unverified when it cannot be read (probe P8).
+    async function activateSequence(args) {
+      assertObject(args); assertOnlyKeys(args, ["sequenceId", "operationId"]);
+      const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), wanted = guidString(sequence.guid);
+      if (!wanted || wanted === "[object Object]" || wanted.length > 128) throw commandError("UXP_VERIFICATION_FAILED", "The sequence has no readable GUID, so activation cannot be verified");
+      if (typeof project.openSequence === "function") { try { await project.openSequence(sequence); } catch (_) {} } // best effort; the readback below decides
+      if (!await project.setActiveSequence(sequence)) throw commandError("UXP_HOST_REJECTED", "Premiere rejected sequence activate");
+      let activeId = null;
+      try { if (typeof project.getActiveSequence === "function") activeId = guidString((await project.getActiveSequence() || {}).guid) || null; } catch (_) {}
+      if (activeId === "[object Object]") activeId = null;
+      if (activeId && wanted && activeId !== wanted) throw commandError("UXP_ACTIVATION_NOT_HELD", "Premiere reports sequence " + activeId + " as active after activating " + wanted);
+      const verified = !!activeId && activeId === wanted;
+      return { activated: true, outcome: verified ? "verified" : "committed_unverified", verified, sequence: await sequenceSnapshot(sequence), activeSequenceId: activeId, verificationBoundary: "active_sequence_readback",
+        operation: operationSemantics({ mutatesProject: false, verificationStatus: verified ? "verified" : "not_verified", verificationBoundary: "active_sequence_readback", verificationEvidence: [{ type: "active_sequence_readback", verified }] }) };
+    }
     async function openSequence(args) { return sequenceDirectAction(args, "open", "openSequence"); }
     async function closeSequence(args) { return sequenceDirectAction(args, "close", "closeSequence"); }
 
@@ -2479,6 +2535,8 @@
     function rectValue(value) { return value ? { width: Number(value.width), height: Number(value.height) } : null; }
     async function maybeCall(target, method) { try { return typeof target[method] === "function" ? await target[method]() : null; } catch (_) { return null; } }
     function settingMatches(after, key, value) { if (key === "videoWidth") return after.videoFrame && numbersEqual(after.videoFrame.width, value); if (key === "videoHeight") return after.videoFrame && numbersEqual(after.videoFrame.height, value); return valuesEqual(after[key], value); }
+    // Premiere 27.0 returns scalar parameter values as {value: n} (probe P9); older hosts return n. Point and colour objects have no "value" key and pass through.
+    function unwrapValue(value) { return value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "value") ? value.value : value; }
     function keyframeValue(value) { return value && value.value && Object.prototype.hasOwnProperty.call(value.value, "value") ? value.value.value : value && value.value !== undefined ? value.value : null; }
     function scalarValue(value) { if (typeof value !== "number" && typeof value !== "string" && typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "value must be a number, string, or boolean"); if (typeof value === "number" && !Number.isFinite(value)) throw commandError("UXP_INVALID_ARGUMENT", "value must be finite"); if (typeof value === "string" && value.length > 4000) throw commandError("UXP_INVALID_ARGUMENT", "value string exceeds 4000 characters"); return value; }
     // Host reads may expose arrays or native objects. Keep client input validation separate.
@@ -2615,19 +2673,19 @@
     return definitions;
   }
 
-  function assertObject(value) { if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", "args must be an object"); }
-  function assertOnlyKeys(value, allowed) { const unknown = Object.keys(value).filter((key) => !allowed.includes(key)); if (unknown.length) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]); }
-  function boundedString(value, name, maximum) { if (typeof value !== "string" || !value.trim() || value.length > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty string of at most " + maximum + " characters"); return value; }
-  function boundedStringAllowEmpty(value, name, maximum) { if (typeof value !== "string" || value.length > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a string of at most " + maximum + " characters"); return value; }
-  function boundedStringArray(value, name, maximum, itemMaximum) { if (!Array.isArray(value) || !value.length || value.length > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must contain 1-" + maximum + " values"); return value.map((item, index) => boundedString(item, name + "[" + index + "]", itemMaximum)); }
+  function assertObject(value) { if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", "args must be an object"); }
+  function assertOnlyKeys(value, allowed) { const unknown = Object.keys(value).filter((key) => !allowed.includes(key)); if (unknown.length) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]); }
+  function boundedString(value, name, maximum) { if (typeof value !== "string" || !value.trim() || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty string of at most " + maximum + " characters"); return value; }
+  function boundedStringAllowEmpty(value, name, maximum) { if (typeof value !== "string" || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a string of at most " + maximum + " characters"); return value; }
+  function boundedStringArray(value, name, maximum, itemMaximum) { if (!Array.isArray(value) || !value.length || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must contain 1-" + maximum + " values"); return value.map((item, index) => boundedString(item, name + "[" + index + "]", itemMaximum)); }
   function nonNegativeInt(value, name) { if (!Number.isInteger(value) || value < 0) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-negative integer"); return value; }
-  function boundedInt(value, name, minimum, maximum) { if (!Number.isInteger(value) || value < minimum || value > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum); return value; }
-  function finiteNumber(value, name, minimum, maximum) { const number = Number(value); if (!Number.isFinite(number) || number < minimum || number > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must be from " + minimum + " to " + maximum); return number; }
-  function requiredBoolean(value, name) { if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
+  function boundedInt(value, name, minimum, maximum) { if (!Number.isInteger(value) || value < minimum || value > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum); return value; }
+  function finiteNumber(value, name, minimum, maximum) { const number = Number(value); if (!Number.isFinite(number) || number < minimum || number > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be from " + minimum + " to " + maximum); return number; }
+  function requiredBoolean(value, name) { if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
   function optionalBoolean(value, fallback, name) { return value == null ? fallback : requiredBoolean(value, name); }
-  function enumValue(value, name, allowed) { if (!allowed.includes(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
-  function requireConfirmation(value, message) { if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
-  function requireDestructiveConfirmation(value) { if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "Removing reviewed marker snapshots is destructive; pass confirmDestructive=true after review"); }
+  function enumValue(value, name, allowed) { if (!allowed.includes(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
+  function requireConfirmation(value, message) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
+  function requireDestructiveConfirmation(value) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "Removing reviewed marker snapshots is destructive; pass confirmDestructive=true after review"); }
   function reviewedMarkerSnapshots(value) {
     if (!Array.isArray(value) || !value.length || value.length > 128) throw commandError("UXP_INVALID_ARGUMENT", "markerSnapshots must contain 1-128 reviewed marker snapshots");
     const seen = new Set(), snapshots = [];
@@ -2655,6 +2713,9 @@
   function colorsEqual(left, right) { return !!left && !!right && numbersEqual(left.red, right.red) && numbersEqual(left.green, right.green) && numbersEqual(left.blue, right.blue) && numbersEqual(left.alpha, right.alpha); }
   function valuesEqual(left, right) { return typeof right === "number" ? numbersEqual(left, right) : left === right; }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
+  // Refusal raised before any host write (argument validation, confirmations): the recovery fence need not treat it as unknown.
+  // Use only where call order rules out a prior write; never after an executeTransaction, setMute, setActiveSequence, import or save.
+  function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
 
   return { createAdvancedWorkflowDefinitions };
 });

@@ -79,6 +79,12 @@ describe("UXP tool handler coverage", () => {
       if (args.expected_snapshot && ["copy_clips_between_sequences_uxp", "apply_camera_cut_uxp"].includes(name)) args.expected_snapshot = snakeOnly(args.expected_snapshot);
       // set_lock and set_target are always refused before any bridge call.
       if (name === "manage_track_state_uxp" && all) args.action = "set_mute";
+      // edit_timeline_uxp refuses arguments its action does not take; keep one action's set.
+      if (name === "edit_timeline_uxp" && all) {
+        for (const unsupported of ["project_item_id", "limit_shift", "time_offset_seconds", "video_track_offset", "audio_track_offset", "align_to_video", "insert", "ripple", "media_type", "shift_overlapping", "file_path"]) {
+          delete args[unsupported];
+        }
+      }
       const result = await tool.handler(args);
       expect(result).toBeDefined();
       if (name === "get_uxp_capabilities") expect(getState).toHaveBeenCalled();
