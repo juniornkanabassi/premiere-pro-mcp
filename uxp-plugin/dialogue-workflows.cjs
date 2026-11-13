@@ -137,7 +137,7 @@
     function text(value, name, max, pattern) { if (typeof value !== "string" || !value || value.length > max || (pattern && !pattern.test(value))) fail("UXP_INVALID_ARGUMENT", name + " is invalid"); return value; }
     function secs(value) { if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 86400) fail("UXP_INVALID_ARGUMENT", "Time must be 0-86400 seconds"); return value; }
     function failAfterWrite(code, message) { const error = new Error(message); error.code = code; throw error; }
-    // Every other failure here comes before the first host write (commit() is the only writer), so it is tagged noHostWrite.
+    // Host writes are commit() and project.createSequenceFromMedia. Plan, argument and lookup failures all come before the first of them, so they are tagged noHostWrite; failures after a write use failAfterWrite or plain errors.
     function refuse(code, message) { const error = new Error(message); error.code = code; error.noHostWrite = true; throw error; }
     function fail(code, message) { refuse(code, message); }
   }

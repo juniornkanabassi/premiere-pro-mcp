@@ -1670,6 +1670,22 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(value.project.executeTransaction).toHaveBeenCalledTimes(2);
   });
 
+  it("builds both edge times before the first commit, so a refusal cannot fire after it", async () => {
+    const value = advancedHost();
+    const seconds: number[] = [];
+    const real = value.ppro.TickTime.createWithSeconds.getMockImplementation()!;
+    value.ppro.TickTime.createWithSeconds.mockImplementation(((time: number) => { seconds.push(time); return real(time); }) as never);
+    let builtBeforeFirstCommit: number[] = [];
+    const commit = value.project.executeTransaction.getMockImplementation()!;
+    value.project.executeTransaction.mockImplementation(((callback: never, label: string) => { if (!builtBeforeFirstCommit.length) builtBeforeFirstCommit = [...seconds]; return commit(callback, label); }) as never);
+    await value.registry.dispatch("trackItem.splitEdit", {
+      kind: "l_cut", audioTrackIndex: 0, audioClipIndex: 0, videoTrackIndex: 0, videoClipIndex: 0,
+      extensionSeconds: 2, operationId: "l-cut-ticks",
+    });
+    // The timeline edge (22 s) and the source out (12 s) both exist before the first commit.
+    expect(builtBeforeFirstCommit).toEqual(expect.arrayContaining([22, 12]));
+  });
+
   it("creates an L-cut in one transaction when the end action carries the source out (Premiere 26.5.2)", async () => {
     const value = advancedHost();
     value.trackItem.createSetEndAction = vi.fn((time: { seconds: number }) => ({ apply: () => {
@@ -1914,6 +1930,26 @@ describe("advanced stable Premiere UXP workflows", () => {
       cloned: true, outcome: "verified", verified: true, requestedName: "Assembly v2", nameApplied: true,
       sequence: { id: "sequence-2", name: "Assembly v2" }, verificationBoundary: "sequence_identity_and_name_readback",
     });
+  });
+
+  it("returns committed_unverified, never a throw, when the sequence list cannot be read after the clone committed", async () => {
+    const value = advancedHost();
+    let cloned = false;
+    value.sequence.createCloneAction.mockImplementation(() => ({ apply: () => { cloned = true; value.sequences.push({ guid: "sequence-2", name: "Assembly Copy" }); } }));
+    value.project.getSequences.mockImplementation((async () => { if (cloned) throw new Error("project went away"); return value.sequences; }) as never);
+    await expect(value.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", name: "Assembly v2", operationId: "clone-readback-fails" })).resolves.toMatchObject({
+      cloned: true, committed: true, partial: true, outcome: "committed_unverified", verified: false, undoSteps: 1,
+      readbackError: "project went away", nextStep: expect.stringContaining("Undo 1 time"),
+    });
+  });
+
+  it("counts the rename transaction in undoSteps when it ran", async () => {
+    const value = advancedHost();
+    const clone = { guid: "sequence-2", name: "Assembly Copy" } as { guid: string; name: string; getProjectItem?: () => Promise<unknown> };
+    clone.getProjectItem = async () => ({ createSetNameAction: (name: string) => ({ apply: () => { clone.name = name; } }) });
+    value.sequence.createCloneAction.mockImplementation(() => ({ apply: () => value.sequences.push(clone) }));
+    await expect(value.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", name: "Assembly v2", operationId: "clone-two-steps" })).resolves.toMatchObject({ outcome: "verified", undoSteps: 2 });
+    await expect(advancedHost().registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "clone-one-step" })).resolves.toMatchObject({ undoSteps: 1 });
   });
 
   it("reports an unapplied clone name as committed_unverified instead of claiming it", async () => {

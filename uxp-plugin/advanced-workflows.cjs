@@ -1792,20 +1792,23 @@
       // Premiere 26.5 applies a start/end action like a trim, moving the source point with it;
       // sending the source action as well extended the audio twice. Write the source point
       // separately only when it did not follow the edge.
+      // Both edge times are built before the first commit, so no refusal (which claims "nothing was written") can fire after it.
+      const edgeTick = tick(timelineValue), sourceTick = tick(sourceValue);
+      const audioTrackIndex = nonNegativeInt(args.audioTrackIndex, "audioTrackIndex"), audioClipIndex = nonNegativeInt(args.audioClipIndex, "audioClipIndex");
       context.project.lockedAccess(() => {
-        const edgeAction = kind === "j_cut" ? audioContext.item.createSetStartAction(tick(timelineValue)) : audioContext.item.createSetEndAction(tick(timelineValue));
+        const edgeAction = kind === "j_cut" ? audioContext.item.createSetStartAction(edgeTick) : audioContext.item.createSetEndAction(edgeTick);
         commitActions(context.project, kind === "j_cut" ? "Create J-cut" : "Create L-cut", [edgeAction]);
       });
-      let afterItem = await trackItemAt(context.sequence, "audio", nonNegativeInt(args.audioTrackIndex, "audioTrackIndex"), nonNegativeInt(args.audioClipIndex, "audioClipIndex"));
+      let afterItem = await trackItemAt(context.sequence, "audio", audioTrackIndex, audioClipIndex);
       let after = await trackItemSnapshot({ ...audioContext, item: afterItem });
       let undoSteps = 1;
       if (numbersEqual(after[edge], timelineValue) && !numbersEqual(after[sourceField], sourceValue)) {
         context.project.lockedAccess(() => {
-          const sourceAction = kind === "j_cut" ? afterItem.createSetInPointAction(tick(sourceValue)) : afterItem.createSetOutPointAction(tick(sourceValue));
+          const sourceAction = kind === "j_cut" ? afterItem.createSetInPointAction(sourceTick) : afterItem.createSetOutPointAction(sourceTick);
           commitActions(context.project, kind === "j_cut" ? "Set J-cut source in" : "Set L-cut source out", [sourceAction]);
         });
         undoSteps = 2;
-        afterItem = await trackItemAt(context.sequence, "audio", nonNegativeInt(args.audioTrackIndex, "audioTrackIndex"), nonNegativeInt(args.audioClipIndex, "audioClipIndex"));
+        afterItem = await trackItemAt(context.sequence, "audio", audioTrackIndex, audioClipIndex);
         after = await trackItemSnapshot({ ...audioContext, item: afterItem });
       }
       const timelineMatched = FrameTime.withinHalfFrame(after[edge], timelineValue, extensionTime.ticksPerFrame);
@@ -2111,27 +2114,40 @@
         project.lockedAccess(() => {
           commitActions(project, "Clone sequence", [sequence.createCloneAction()]);
         });
-        let after = await listSequences(project);
-        const added = after.filter((value) => !before.some((old) => old.id === value.id));
-        let renamed = {};
-        if (name != null && added.length === 1) {
-          // The clone is renamed through its Project item (Sequence has no name setter); the readback decides.
-          try {
-            const clone = (await boundedSequences(project)).find((value) => guidString(value.guid) === added[0].id);
-            const item = clone && typeof clone.getProjectItem === "function" ? await clone.getProjectItem() : null;
-            if (!item || typeof item.createSetNameAction !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose a rename action for the cloned sequence");
-            project.lockedAccess(() => {
-              commitActions(project, "Rename cloned sequence", [item.createSetNameAction(name)]);
-            });
-          } catch (error) {
-            renamed = { renameError: error && error.message ? error.message : String(error) };
-          }
+        // The clone has committed: nothing below may throw, or a retry would clone twice.
+        let undoSteps = 1, after = null, added = [], renamed = {}, readbackError = null;
+        try {
           after = await listSequences(project);
-          const applied = after.find((value) => value.id === added[0].id);
-          renamed = { requestedName: name, nameApplied: !!applied && applied.name === name, ...renamed };
-        } else if (name != null) renamed = { requestedName: name, nameApplied: false };
-        const clonedSequence = added.length === 1 ? after.find((value) => value.id === added[0].id) || added[0] : null;
-        return mutationResult(added.length === 1 && (name == null || renamed.nameApplied === true), { cloned: true, source: await sequenceSnapshot(sequence), sequence: clonedSequence, ...renamed }, name == null ? "sequence_identity_readback" : "sequence_identity_and_name_readback", "Clone sequence");
+          added = after.filter((value) => !before.some((old) => old.id === value.id));
+          if (name != null && added.length === 1) {
+            // The clone is renamed through its Project item (Sequence has no name setter); the readback decides.
+            try {
+              const clone = (await boundedSequences(project)).find((value) => guidString(value.guid) === added[0].id);
+              const item = clone && typeof clone.getProjectItem === "function" ? await clone.getProjectItem() : null;
+              if (!item || typeof item.createSetNameAction !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose a rename action for the cloned sequence");
+              project.lockedAccess(() => {
+                commitActions(project, "Rename cloned sequence", [item.createSetNameAction(name)]);
+              });
+              undoSteps++;
+            } catch (error) {
+              renamed = { renameError: error && error.message ? error.message : String(error) };
+            }
+            after = await listSequences(project);
+            const applied = after.find((value) => value.id === added[0].id);
+            renamed = { requestedName: name, nameApplied: !!applied && applied.name === name, ...renamed };
+          } else if (name != null) renamed = { requestedName: name, nameApplied: false };
+        } catch (error) {
+          readbackError = error && error.message ? error.message : String(error);
+        }
+        const clonedSequence = added.length === 1 ? (after && after.find((value) => value.id === added[0].id)) || added[0] : null;
+        const source = await safeSequenceSnapshot(sequence);
+        if (readbackError) {
+          return mutationResult(false, {
+            cloned: true, committed: true, partial: true, source, sequence: clonedSequence, undoSteps, readbackError, ...(name != null ? { requestedName: name, nameApplied: false, ...renamed } : {}),
+            nextStep: "The clone committed but could not be read back. List the sequences before any retry, and use Premiere Undo " + undoSteps + " time" + (undoSteps === 1 ? "" : "s") + " to remove it."
+          }, "sequence_clone_readback_failed", "Clone sequence");
+        }
+        return mutationResult(added.length === 1 && (name == null || renamed.nameApplied === true), { cloned: true, source, sequence: clonedSequence, undoSteps, ...renamed }, name == null ? "sequence_identity_readback" : "sequence_identity_and_name_readback", "Clone sequence");
       });
     }
 

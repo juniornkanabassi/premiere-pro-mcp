@@ -337,6 +337,17 @@
           if (completedOperations.size > 256) completedOperations.delete(completedOperations.keys().next().value);
           return envelope;
         } catch (error) {
+          // The pin check already switched the active sequence, so no refusal here proves "nothing changed":
+          // drop the no-write claim, say why, and keep the fence.
+          if (sequencePin && error && typeof error === "object") {
+            error.noHostWrite = false;
+            error.hostMayHaveChanged = true;
+            if (!/pinned sequence was re-activated/.test(String(error.message))) {
+              error.message = (error.message || String(error)) + " (the pinned sequence was re-activated from " + (sequencePin.from || "unknown") + " to " + sequencePin.to + " first, so the active sequence may have changed)";
+            }
+            operationLedger.unknown(operationKey);
+            throw error;
+          }
           // noHostWrite is set only on refusals thrown before the handler's first host write (shared contract 1).
           // A command marked nonFencing (a selection-only change) never needs recovery review.
           if (provenPreflightRefusal(error) || (error && error.noHostWrite === true) || definition.nonFencing === true) operationLedger.releasePreflight(operationKey);

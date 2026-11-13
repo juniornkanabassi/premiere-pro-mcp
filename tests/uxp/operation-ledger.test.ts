@@ -305,6 +305,32 @@ describe("sequence pin (item 13)", () => {
     expect(value.mutation).not.toHaveBeenCalled();
     await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
   });
+  it("keeps the fence when the pin switched the sequence and the handler then refuses (razor without confirmRazor)", async () => {
+    const first = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const second = { guid: "sequence-2", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    let active = second;
+    const project = {
+      guid: "project-1", getActiveSequence: async () => active, getSequences: async () => [first, second],
+      openSequence: async () => true, setActiveSequence: async (sequence: typeof first) => { active = sequence; return true; },
+      lockedAccess: () => undefined, executeTransaction: () => true,
+    };
+    const ppro = {
+      Project: { getActiveProject: async () => project },
+      SequenceEditor: { getEditor: () => ({}) },
+      TrackItemSelection: { createEmptySelection: () => true },
+      TickTime: { createWithTicks: () => ({}) },
+      Constants: { MediaType: { VIDEO: 1, AUDIO: 2 }, TrackItemType: { CLIP: 1 } },
+    };
+    const registry = Commands.createCommandRegistry({ ppro, Protocol });
+    const error = await registry.dispatch("trackItem.razor", { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4, operationId: "razor-pinned" }, { pinnedSequenceId: "sequence-1" }).catch((caught: any) => caught);
+    expect(error).toMatchObject({ code: "UXP_CONFIRMATION_REQUIRED", hostMayHaveChanged: true, noHostWrite: false });
+    expect(error.message).toContain("re-activated from sequence-2 to sequence-1");
+    await expect(registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true });
+    // Unpinned (or already on the pinned sequence), the same refusal leaves no fence.
+    const plain = Commands.createCommandRegistry({ ppro, Protocol });
+    await expect(plain.dispatch("trackItem.razor", { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4, operationId: "razor-plain" }, { pinnedSequenceId: "sequence-1" })).rejects.toMatchObject({ noHostWrite: true });
+    await expect(plain.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+  });
   it("refuses when the pinned sequence is not in the active project", async () => {
     const value = pinHost("sequence-1");
     await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "gone" })).rejects.toMatchObject({ code: "UXP_PINNED_SEQUENCE_MISSING", noHostWrite: true });
