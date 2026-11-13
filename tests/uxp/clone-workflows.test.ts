@@ -122,8 +122,10 @@ describe("guarded documented UXP append-only track-item duplicate workflow", () 
     const value = cloneHost();
     const unrelatedGetter = vi.fn(async () => { throw new Error("unrelated item must not be read"); });
     value.states.unshift({ projectItemId: "unrelated-1", start: 0, end: 5, inPoint: 0, outPoint: 5, speed: 1, reversed: false });
+    // Only the start is read, to order the track (the host lists items in creation order); nothing else of it is.
+    const startOnly = vi.fn(async () => ({ ticks: "0", seconds: 0 }));
     value.items.unshift({
-      getProjectItem: unrelatedGetter, getStartTime: unrelatedGetter, getEndTime: unrelatedGetter,
+      getProjectItem: unrelatedGetter, getStartTime: startOnly, getEndTime: unrelatedGetter,
       getInPoint: unrelatedGetter, getOutPoint: unrelatedGetter, getDuration: unrelatedGetter,
       getSpeed: unrelatedGetter, isSpeedReversed: unrelatedGetter,
       createSetInPointAction: unrelatedGetter, createSetOutPointAction: unrelatedGetter,

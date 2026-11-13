@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // Copy a time range of clips from one sequence to another (or to another
   // place in the same sequence) the way an editor's copy and paste does: each
   // clip is cloned with SequenceEditor.createCloneTrackItemAction, so it keeps
@@ -559,7 +561,7 @@
       const method = mediaType === "video" ? "getVideoTrack" : "getAudioTrack";
       const track = await requiredMethod(sequence, method)(trackIndex);
       if (!track || typeof track.getTrackItems !== "function") throw commandError("UXP_TARGET_NOT_FOUND", mediaType + " track " + trackIndex + " is unavailable");
-      const items = Array.from(await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false));
       if (items.length > MAX_PLACEMENTS) throw commandError("UXP_TARGET_TOO_LARGE", "A track has more than " + MAX_PLACEMENTS + " clip items");
       return items;
     }

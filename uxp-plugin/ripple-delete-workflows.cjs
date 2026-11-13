@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // Premiere's own ripple flag is not trusted (live 27.0: shiftOverLapping behaves
   // oppositely to its name, and the shift is whole frames, which left a 17 ms gap).
   // So every ripple here removes without ripple and then moves each later item by
@@ -204,7 +206,7 @@
           if (mediaType === target.mediaType && trackIndex === target.trackIndex) continue;
           const track = await sequence[trackMethod](trackIndex);
           if (!track || typeof track.getTrackItems !== "function") throw refuse("UXP_COMMAND_UNAVAILABLE", "Premiere cannot inspect a track while checking the ripple range");
-          const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+          const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
           for (let clipIndex = 0; clipIndex < items.length; clipIndex++) {
             if (++scanned > 4096) throw refuse("UXP_TARGET_UNSUPPORTED", "Too many timeline items to check the ripple range safely");
             const start = tickSeconds(await items[clipIndex].getStartTime()), end = tickSeconds(await items[clipIndex].getEndTime());
@@ -230,7 +232,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw refuse("UXP_COMMAND_UNAVAILABLE", "Clip track-item APIs are unavailable");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (!items.length) throw refuse("UXP_TARGET_NOT_FOUND", "The target track has no clip items");
       if (items.length > 512) throw refuse("UXP_TARGET_TOO_LARGE", "The target track has more than 512 clip items");
       return { items };
@@ -396,7 +398,7 @@
     async function clipItemsOf(sequence, mediaType, trackIndex) {
       const track = await requiredMethod(sequence, mediaType === "video" ? "getVideoTrack" : "getAudioTrack")(trackIndex);
       if (!track || typeof track.getTrackItems !== "function") throw refuse("UXP_TARGET_NOT_FOUND", mediaType + " track " + trackIndex + " is unavailable");
-      const items = Array.from(await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false));
       if (items.length > MAX_TRACK_ITEMS) throw refuse("UXP_TARGET_TOO_LARGE", "A track has more than " + MAX_TRACK_ITEMS + " clip items");
       return items;
     }

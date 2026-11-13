@@ -118,7 +118,8 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     });
     return proxy;
   }
-  const served = (list: Item[]) => (options.reverseOrder ? sorted(list).reverse() : sorted(list)).map(view);
+  // The host lists a track in creation order, so a clone or a razor half appended later comes last (live 27.0).
+  const served = (list: Item[]) => (options.reverseOrder ? sorted(list).reverse() : [...list]).map(view);
   const sequence = {
     guid: "sequence-1",
     getTimebase: vi.fn(async () => String(FRAME)),
@@ -264,7 +265,8 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
     const value = timelineHost([[clip("unrelated-1", 0, 5, 0), clip("target-1", 5, 15, 20), clip("following-1", 15, 25, 40)]]);
     const unrelatedGetter = vi.fn(async () => { throw new Error("unrelated item must not be read"); });
     const unrelated = value.lists.video[0]![0]! as unknown as Record<string, unknown>;
-    for (const key of ["getProjectItem", "getStartTime", "getEndTime", "getInPoint", "getOutPoint", "getDuration", "getSpeed", "isSpeedReversed"]) unrelated[key] = unrelatedGetter;
+    // Only its start is read (to put the track in time order); nothing else of it is.
+    for (const key of ["getProjectItem", "getEndTime", "getInPoint", "getOutPoint", "getDuration", "getSpeed", "isSpeedReversed"]) unrelated[key] = unrelatedGetter;
     const shifted = (item: typeof target) => ({ ...item, startSeconds: item.startSeconds + 5, endSeconds: item.endSeconds + 5 });
     await expect(value.registry.dispatch("trackItem.rippleDelete", {
       mediaType: "video", trackIndex: 0, clipIndex: 1, confirmRippleDelete: true, operationId: "bounded-readback",
@@ -609,11 +611,11 @@ describe("timeline.range.extract", () => {
   });
 
   describe("on every track of a large timeline, with host objects that die", () => {
-    // 6 video and 6 audio tracks of 30 ten second clips each. A host object dies after 400 further host calls
-    // (one whole-track read is about 200) or once a transaction has committed, as Premiere 27.0 did.
+    // 6 video and 6 audio tracks of 30 ten second clips each. A host object dies after 1200 further host calls
+    // (one whole-track read is about 250, the whole timeline about 3000) or once a transaction has committed, as Premiere 27.0 did.
     const big = () => {
       const track = (name: string) => Array.from({ length: 30 }, (_, i) => clip(`${name}-${i}`, i * 10, i * 10 + 10, i));
-      return timelineHost([0, 1, 2, 3, 4, 5].map((n) => track(`v${n}`)), [0, 1, 2, 3, 4, 5].map((n) => track(`a${n}`)), { strictHandles: true, staleAfterCalls: 400 });
+      return timelineHost([0, 1, 2, 3, 4, 5].map((n) => track(`v${n}`)), [0, 1, 2, 3, 4, 5].map((n) => track(`a${n}`)), { strictHandles: true, staleAfterCalls: 1200 });
     };
     it("cuts the range out of all 12 tracks and closes the gap", async () => {
       const value = big();

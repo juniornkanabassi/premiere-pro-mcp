@@ -71,7 +71,6 @@ type Item = ReturnType<typeof makeItem>;
 
 function makeSequence(guid: string, name: string, video: Item[][], audio: Item[][]) {
   const tracks = { video, audio };
-  const sorted = (items: Item[]) => [...items].sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)));
   return {
     guid,
     name,
@@ -80,8 +79,8 @@ function makeSequence(guid: string, name: string, video: Item[][], audio: Item[]
     getTimebase: vi.fn(async () => "254016000"),
     getVideoTrackCount: vi.fn(async () => video.length),
     getAudioTrackCount: vi.fn(async () => audio.length),
-    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => sorted(video[index]).map(guard)) } : null),
-    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => sorted(audio[index]).map(guard)) } : null),
+    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => [...video[index]].map(guard)) } : null),
+    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => [...audio[index]].map(guard)) } : null),
   };
 }
 type Seq = ReturnType<typeof makeSequence>;

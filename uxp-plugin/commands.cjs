@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   function createCommandRegistry(deps) {
     const ppro = deps.ppro, Protocol = deps.Protocol, workspace = deps.workspace;
     const FrameTime = deps.FrameTime || (typeof require === "function" ? require("./frame-time.cjs") : globalThis.PremiereMcpFrameTime);
@@ -1828,7 +1830,7 @@
       if (trackIndex >= trackCount) throw commandError("UXP_TARGET_NOT_FOUND", "videoTrackIndex " + trackIndex + " is out of range");
       const track = await sequence.getVideoTrack(trackIndex), types = ppro.Constants && ppro.Constants.TrackItemType;
       if (!track || !types || types.CLIP == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere video track APIs are unavailable");
-      const clips = await track.getTrackItems(types.CLIP, false);
+      const clips = await TrackItems.sortByStart(await track.getTrackItems(types.CLIP, false));
       if (!clips || !clips[clipIndex]) throw commandError("UXP_TARGET_NOT_FOUND", "clipIndex " + clipIndex + " is out of range on video track " + trackIndex);
       return videoClipView(clips[clipIndex]);
     }

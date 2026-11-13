@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // This is deliberately a source-project-item label action resolved from one
   // timeline coordinate. The sequence is the explicit sequenceId when one is
   // given (inspect) or the reviewed snapshot's sequenceId (update); only an
@@ -206,7 +208,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "Clip track-item APIs are unavailable");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (!items.length) throw commandError("UXP_TARGET_NOT_FOUND", "The target track has no clip items");
       if (items.length > 512) throw commandError("UXP_TARGET_TOO_LARGE", "The target track has more than 512 clip items");
       return items;

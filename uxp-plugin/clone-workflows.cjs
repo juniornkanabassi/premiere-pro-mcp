@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // By default this is an append-only clone: a coordinate-bound append lets the
   // bridge prove both the original and exactly one new item without scanning
   // or overwriting unrelated timeline content. With destinationSeconds and/or
@@ -187,7 +189,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw refuse("UXP_COMMAND_UNAVAILABLE", "Clip track-item APIs are unavailable");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (!items.length) throw refuse("UXP_TARGET_NOT_FOUND", "The target track has no clip items");
       if (items.length > 512) throw refuse("UXP_TARGET_TOO_LARGE", "The target track has more than 512 clip items");
       return { items };

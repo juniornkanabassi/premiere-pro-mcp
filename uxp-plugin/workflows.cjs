@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   const MAX_SELECTION_ITEMS = 64;
   const MAX_METADATA_CHARS = 350000;
   const MAX_METADATA_RESULT_BYTES = 900000;
@@ -203,7 +205,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere clip track-item APIs are unavailable");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (trackItemsByTrack) trackItemsByTrack.set(cacheKey, items);
       if (!items[clipIndex]) throw commandError("UXP_TARGET_NOT_FOUND", "clipIndex " + clipIndex + " is out of range on " + mediaType + " track " + trackIndex);
       return items[clipIndex];
@@ -236,7 +238,7 @@
         try {
           const track = typeof sequence[trackMethod] === "function" ? await sequence[trackMethod](trackIndex) : null;
           if (track && itemType && itemType.CLIP != null && typeof track.getTrackItems === "function") {
-            items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+            items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
           }
         } catch (_) {}
         values.set(trackIndex, items);

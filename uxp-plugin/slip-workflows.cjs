@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // A slip is deliberately a separate, narrow operation rather than a
   // convenience alias for trackItem.update: it preserves timeline timing,
   // requires the complete reviewed state, and serializes its whole guarded
@@ -202,7 +204,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "Clip track-item APIs are unavailable");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (items.length > 512) throw commandError("UXP_TARGET_TOO_LARGE", "The target track has more than 512 clip items");
       const item = items[target.clipIndex];
       if (!item) throw commandError("UXP_TARGET_NOT_FOUND", "clipIndex is out of range");

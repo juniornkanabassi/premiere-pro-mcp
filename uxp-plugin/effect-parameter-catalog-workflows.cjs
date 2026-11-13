@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+
   // A caller can already inspect a known parameter through the automation
   // workflow. This catalog fills the discovery gap without returning parameter
   // values, which may be arbitrary PointF/Color objects or user content.
@@ -104,7 +106,7 @@
       if (!track || !itemType || itemType.CLIP == null || typeof track.getTrackItems !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose documented clip-item access on the requested track");
       }
-      const items = Array.from(await track.getTrackItems(itemType.CLIP, false) || []);
+      const items = await TrackItems.sortByStart(await track.getTrackItems(itemType.CLIP, false));
       if (items.length > MAX_TRACK_ITEMS) {
         throw commandError("UXP_TARGET_TOO_LARGE", "The requested track has more than " + MAX_TRACK_ITEMS + " clip items");
       }
