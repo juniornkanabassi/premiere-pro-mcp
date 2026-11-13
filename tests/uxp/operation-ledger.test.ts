@@ -336,3 +336,67 @@ describe("sequence pin (item 13)", () => {
     await expect(value.registry.dispatch("test.mutate", {}, { pinnedSequenceId: "gone" })).rejects.toMatchObject({ code: "UXP_PINNED_SEQUENCE_MISSING", noHostWrite: true });
   });
 });
+
+describe("panel watchdog: a hung mutation handler cannot block recovery", () => {
+  function hung(options: { watchdogMs?: number } = {}) {
+    const sequence = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const project = { guid: "project-1", getActiveSequence: async () => sequence };
+    let finishLate: () => void = () => undefined;
+    const stuck = vi.fn(() => new Promise<Record<string, unknown>>((resolve) => { finishLate = () => resolve({ outcome: "verified" }); }));
+    const next = vi.fn(async () => ({ outcome: "verified" }));
+    const registry = Commands.createCommandRegistry({
+      ppro: { Project: { getActiveProject: async () => project } }, Protocol, mutationWatchdogMs: options.watchdogMs ?? 30, mutationWatchdogGraceMs: 0,
+      Workflows: { createWorkflowDefinitions: () => ({ "test.stuck": { handler: stuck }, "test.next": { handler: next } }) },
+    });
+    return { registry, stuck, next, finishLate: () => finishLate() };
+  }
+
+  it("abandons a handler that outlives its deadline, marks it unknown and keeps the fence", async () => {
+    const value = hung();
+    const error = await value.registry.dispatch("test.stuck", { operationId: "stuck-1" }).catch((caught: any) => caught);
+    expect(error).toMatchObject({ code: "UXP_HANDLER_TIMEOUT", hostMayHaveChanged: true });
+    expect(error.message).toContain("outcome is unknown");
+    const recovery = await value.registry.dispatch("operations.recovery.inspect", {});
+    expect(recovery).toMatchObject({ recoveryRequired: true, operations: [{ id: "stuck-1", outcome: "unknown" }] });
+    // The queue has moved on, but the fence refuses new mutations until the operation is acknowledged.
+    await expect(value.registry.dispatch("test.next", { operationId: "after" })).rejects.toMatchObject({ code: "UXP_RECOVERY_REQUIRED" });
+    expect(value.next).not.toHaveBeenCalled();
+    // A late finish of the abandoned handler records nothing: the operation stays unknown.
+    value.finishLate();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ operations: [{ id: "stuck-1", outcome: "unknown" }] });
+  });
+
+  it("lets inspect and acknowledge run at once once the watchdog has fired, then allows new edits", async () => {
+    const value = hung();
+    await value.registry.dispatch("test.stuck", { operationId: "stuck-2" }).catch(() => undefined);
+    const recovery = await value.registry.dispatch("operations.recovery.inspect", {});
+    await expect(value.registry.dispatch("operations.recovery.acknowledge", {
+      expectedRecoveryRevision: recovery.recoveryRevision, expectedIdentityRevision: recovery.identityRevision, operationIds: ["stuck-2"], reviewed: true,
+    })).resolves.toMatchObject({ acknowledged: true, replayAuthorized: false });
+    await expect(value.registry.dispatch("test.next", { operationId: "after-ack" })).resolves.toMatchObject({ outcome: "verified" });
+  });
+
+  it("acknowledges a stuck handler without waiting for the queue, even before a second command is sent", async () => {
+    // Longer watchdog: the handler is hung but not yet abandoned, so a reviewed acknowledge of it queues; of an
+    // unrelated unknown operation (already abandoned) it does not.
+    const value = hung({ watchdogMs: 40 });
+    const stuckRun = value.registry.dispatch("test.stuck", { operationId: "stuck-3" }).catch((caught: any) => caught);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // inspect never waits on the queue
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ operations: [{ id: "stuck-3", outcome: "pending" }] });
+    const early = await value.registry.dispatch("operations.recovery.inspect", {});
+    const ack = value.registry.dispatch("operations.recovery.acknowledge", { expectedRecoveryRevision: early.recoveryRevision, expectedIdentityRevision: early.identityRevision, operationIds: ["stuck-3"], reviewed: true });
+    // The acknowledge waits for the watchdog, not forever, and then fails as stale because the operation turned unknown meanwhile.
+    await expect(ack).rejects.toMatchObject({ code: "UXP_STALE_RECOVERY" });
+    expect(await stuckRun).toMatchObject({ code: "UXP_HANDLER_TIMEOUT" });
+  });
+
+  it("uses the caller's deadline plus the grace instead of the default", async () => {
+    const value = hung({ watchdogMs: 60000 });
+    const started = Date.now();
+    const error = await value.registry.dispatch("test.stuck", { operationId: "stuck-4" }, { deadlineMs: 40 }).catch((caught: any) => caught);
+    expect(error).toMatchObject({ code: "UXP_HANDLER_TIMEOUT" });
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});

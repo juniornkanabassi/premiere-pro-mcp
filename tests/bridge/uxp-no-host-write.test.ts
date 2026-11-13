@@ -11,7 +11,7 @@ import { cleanupTempDirs, makePrivateBridgeTempDir } from "../helpers/temp-dir.j
 const active: UxpWebSocketBridge[] = [];
 afterEach(async () => { await Promise.all(active.splice(0).map((bridge) => bridge.stop())); cleanupTempDirs(); });
 
-type Frame = { requestId: string; command: string; args: Record<string, unknown>; pinnedSequenceId?: string; type: string; payload?: unknown };
+type Frame = { requestId: string; command: string; args: Record<string, unknown>; pinnedSequenceId?: string; deadlineMs?: number; type: string; payload?: unknown };
 
 async function connected(options: { workspaceRoot?: string; commands?: Record<string, unknown> } = {}) {
   const token = "no-host-write-token-sixteen";
@@ -126,6 +126,19 @@ describe("sequence pin (item 13)", () => {
     expect(byCommand("test.mutate")[1].args).toEqual({ value: 1 });
     expect(byCommand("state.get")[0].pinnedSequenceId).toBeUndefined();
     expect(byCommand("sequences.activate")[1].pinnedSequenceId).toBeUndefined();
+  });
+
+  it("sends the request deadline with mutating requests so the panel can abandon a hung handler", async () => {
+    const { bridge, client, frames } = await connected();
+    client.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Frame;
+      if (frame.type === "command") reply(client, frame, { ok: true, result: { outcome: "verified" } });
+    });
+    await bridge.request("test.mutate", {});
+    await bridge.request("state.get");
+    const byCommand = (command: string) => frames.filter((frame) => frame.command === command);
+    expect(byCommand("test.mutate")[0].deadlineMs).toBeGreaterThan(0);
+    expect(byCommand("state.get")[0].deadlineMs).toBeUndefined();
   });
 
   it("pins from any accepted activate, and forgets a closed or deleted pinned sequence", async () => {

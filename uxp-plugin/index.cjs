@@ -303,6 +303,15 @@ function pinnedSequenceIdOf(raw) {
   } catch (_) { return null; }
 }
 
+// How long the caller will wait, so the panel can abandon a hung handler soon after (the watchdog in commands.cjs).
+function deadlineMsOf(raw) {
+  try {
+    const value = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const ms = value && value.deadlineMs;
+    return Number.isInteger(ms) && ms > 0 && ms <= 3600000 ? ms : null;
+  } catch (_) { return null; }
+}
+
 async function dispatch(raw) {
   let cmd;
   let operation;
@@ -318,7 +327,7 @@ async function dispatch(raw) {
     let result;
     if (cmd.command === "capabilities.get") result = await capabilities();
     else if (cmd.command === "state.get") result = await stateSnapshot();
-    else if (cmd.command === "frame.export") result = await exportFrame(cmd.args, operation, { pinnedSequenceId: pinnedSequenceIdOf(raw) });
+    else if (cmd.command === "frame.export") result = await exportFrame(cmd.args, operation, { pinnedSequenceId: pinnedSequenceIdOf(raw), deadlineMs: deadlineMsOf(raw) });
     else if (cmd.command === "transcript.export") result = await exportTranscript(cmd.args);
     else if (cmd.command === "transcript.search") result = await searchTranscript(cmd.args);
     else if (cmd.command === "transcript.has") result = await hasTranscript(cmd.args);
@@ -326,7 +335,7 @@ async function dispatch(raw) {
     else {
       assertNotCancelled(operation);
       operation.phase = "host_call";
-      result = await commandRegistry.dispatch(cmd.command, cmd.args, { pinnedSequenceId: pinnedSequenceIdOf(raw) });
+      result = await commandRegistry.dispatch(cmd.command, cmd.args, { pinnedSequenceId: pinnedSequenceIdOf(raw), deadlineMs: deadlineMsOf(raw) });
     }
     const response = Protocol.envelope("result", {
       ok: true,

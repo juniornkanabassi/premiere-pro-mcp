@@ -20,8 +20,8 @@
   const AUDIO_SAMPLE_TICKS = 5292000n; // one 48 kHz sample
   const MAX_TRACK_ITEMS = 512;
   const MAX_SCANNED_ITEMS = 4096;
-  // Live 27.0: transactions of up to 3 clips or 50 moves verified; a 9-clip, 3-track compound did not.
-  // So one razor round handles at most this many tracks, and one move transaction this many items.
+  // Live 27.0: transactions of up to 3 clips or 51 moves on one track verified; a 9-clip, 3-track compound did not.
+  // So one razor round handles at most this many tracks, and a move transaction groups whole tracks up to this many items.
   const RAZOR_BATCH = 4;
   const MOVE_BATCH = 50;
   const STALE_OBJECT = /no longer valid/i;
@@ -678,9 +678,24 @@
       const byStart = function (left, right) { return left.start < right.start ? -1 : left.start > right.start ? 1 : 0; };
       const ordered = moves.filter(function (move) { return move.delta < 0n; }).sort(byStart)
         .concat(moves.filter(function (move) { return move.delta > 0n; }).sort(function (left, right) { return byStart(right, left); }));
-      // Items keep their order on a track while moving, so a later batch finds its items at the same positions.
-      for (let at = 0; at < ordered.length; at += MOVE_BATCH) {
-        const batch = ordered.slice(at, at + MOVE_BATCH);
+      // A track's moves always go in one transaction (a 51-move track was verified live that way; one split
+      // across two transactions hung the panel on 27.0). Tracks are independent, so whole tracks are grouped
+      // into batches of about MOVE_BATCH moves, and a longer track is a batch of its own. Within a track the
+      // order above is kept.
+      const byTrack = new Map();
+      for (const move of ordered) {
+        const key = move.ref.mediaType + ":" + move.ref.trackIndex;
+        if (!byTrack.has(key)) byTrack.set(key, []);
+        byTrack.get(key).push(move);
+      }
+      const batches = [];
+      let current = [];
+      for (const list of byTrack.values()) {
+        if (current.length && current.length + list.length > MOVE_BATCH) { batches.push(current); current = []; }
+        current = current.concat(list);
+      }
+      if (current.length) batches.push(current);
+      for (const batch of batches) {
         await transact(context, progress, label, batch.map(function (move) { return move.ref; }), function (make, fail, items) {
           return batch.map(function (move, index) { return requiredMethod(items[index], "createMoveAction")(tickTime(move.delta)); });
         });

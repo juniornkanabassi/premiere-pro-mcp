@@ -253,6 +253,16 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
     expect(value.track("video", 0)).toEqual([[0, 10, 40], [15, 20, 0], [20, 21, 0]]);
   });
 
+  it("moves a 51-clip successor run in one transaction, never splitting a track (live: a split run hung the panel)", async () => {
+    const track = Array.from({ length: 58 }, (_, i) => clip(`v-${i}`, i * 5, i * 5 + 5, i));
+    const value = timelineHost([track], [], { strictHandles: true });
+    const snap = (i: number) => ({ projectItemId: `v-${i}`, startSeconds: i * 5, endSeconds: i * 5 + 5, inSeconds: i, outSeconds: i + 5, durationSeconds: 5, speed: 1, reversed: false });
+    const result = await value.registry.dispatch("trackItem.rippleDelete", { mediaType: "video", trackIndex: 0, clipIndex: 6, confirmRippleDelete: true, operationId: "big-ripple", expectedSnapshot: { projectGuid: "project-1", sequenceId: "sequence-1", mediaType: "video", trackIndex: 0, clipIndex: 6, trackItemCount: 58, target: snap(6), following: snap(7) } });
+    expect(result).toMatchObject({ outcome: "verified", rippleDeleted: true });
+    expect(value.project.executeTransaction.mock.calls.filter((call) => String(call[1]).endsWith("(close gap)"))).toHaveLength(1);
+    expect(value.track("video", 0)).toHaveLength(57);
+  });
+
   it("closes a clip that is not a whole number of frames by its exact length (no 17 ms gap)", async () => {
     // 9.46 s at 25 fps is 236.5 frames; Premiere's own ripple shifted by 236 frames and left half a frame open.
     const value = timelineHost([[clip("target-1", 0, 9.46, 20), clip("following-1", 9.46, 19.46, 40)]]);
@@ -630,6 +640,15 @@ describe("timeline.range.extract", () => {
         expect(rows[5]).toEqual([45, 50, 11]);
         expect(rows[28]).toEqual([270, 280, 29]);
       }
+    });
+
+    it("groups whole tracks into move transactions of about 50 and never splits one", async () => {
+      const track = (name: string) => Array.from({ length: 30 }, (_, i) => clip(`${name}-${i}`, i * 10, i * 10 + 10, i));
+      const value = timelineHost([track("a"), track("b"), track("c")], [], { strictHandles: true });
+      const result = await extract(value, { startSeconds: 5, endSeconds: 10 }, "ex-groups");
+      expect(result).toMatchObject({ outcome: "verified", tracks: 3 });
+      // 3 tracks of about 29 moves each: 29 + 29 > 50, so one track per transaction.
+      expect(value.project.executeTransaction.mock.calls.filter((call) => String(call[1]).endsWith("(close gap)"))).toHaveLength(3);
     });
 
     it("lists exactly the clones left parked when a later step fails", async () => {

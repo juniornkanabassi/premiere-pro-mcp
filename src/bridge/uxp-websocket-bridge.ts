@@ -330,6 +330,8 @@ export class UxpWebSocketBridge extends EventEmitter {
       command,
       args,
       ...(pin ? { pinnedSequenceId: pin } : {}),
+      // The panel abandons a handler that outlives this, so a hung one cannot block recovery.
+      ...(mutating ? { deadlineMs: requestTimeoutMs } : {}),
     });
     const priorDispatched = currentInvocation()?.dispatched === true;
     // The panel drops frames over 64 KiB before it can read the requestId, so an

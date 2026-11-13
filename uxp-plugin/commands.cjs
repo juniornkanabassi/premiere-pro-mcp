@@ -14,6 +14,11 @@
     const Transcript = deps.TranscriptSupport || (typeof require === "function" ? require("./transcript.cjs") : globalThis.PremiereMcpTranscript);
     const operationLedger = Ledger.createOperationLedger({ storage: deps.storage, sessionId: deps.sessionId, digest: Transcript.transcriptRevision, requireDurability: deps.requireOperationDurability === true });
     let mutationTail = Promise.resolve();
+    // Handlers still inside their deadline. A handler that outlives it is marked unknown and dropped from here
+    // (see runWithWatchdog), so recovery commands never wait on a hung host call.
+    const liveHandlers = new Set();
+    const WATCHDOG_DEFAULT_MS = typeof deps.mutationWatchdogMs === "number" && deps.mutationWatchdogMs > 0 ? deps.mutationWatchdogMs : 60000;
+    const WATCHDOG_GRACE_MS = typeof deps.mutationWatchdogGraceMs === "number" && deps.mutationWatchdogGraceMs >= 0 ? deps.mutationWatchdogGraceMs : 5000;
     let anonymousOperation = 0;
     let invocationSession = null;
     try { invocationSession = Ledger.createSecureSessionId("invocation"); } catch (_) {}
@@ -245,8 +250,10 @@
     async function acknowledgeOperationRecovery(args) {
       assertOnlyKeys(args, ["expectedRecoveryRevision", "expectedIdentityRevision", "operationIds", "reviewed"]);
       if (!Array.isArray(args.operationIds) || args.operationIds.length > 4096 || args.operationIds.some((id) => typeof id !== "string")) throw refuse("UXP_INVALID_ARGUMENT", "operationIds must be the bounded inspected ID list");
-      // Reconciliation shares the mutation queue, so it cannot clear a reservation
-      // while its host mutation is still running.
+      // Reconciliation must not clear a reservation whose host mutation is still inside its deadline, so it
+      // queues behind it. Anything else, including a handler the watchdog gave up on, is acknowledged at once:
+      // a hung handler must never block recovery.
+      if (!args.operationIds.some((id) => liveHandlers.has(id))) return operationLedger.acknowledge(await operationIdentity(true), args);
       const pending = mutationTail.then(async () => operationLedger.acknowledge(await operationIdentity(true), args));
       mutationTail = pending.catch(() => {});
       return pending;
@@ -290,6 +297,26 @@
         throw error;
       }
     }
+    // A handler that has not returned by the caller's deadline (plus a grace) is abandoned: its operation turns
+    // unknown, so the fence stays until acknowledged, and the queue moves on. The handler itself cannot be
+    // cancelled and may still finish, but nothing it returns later is recorded.
+    function runWithWatchdog(operationKey, command, running, deadlineMs, input) {
+      const asked = Number.isFinite(deadlineMs) && deadlineMs > 0 ? deadlineMs + WATCHDOG_GRACE_MS : null;
+      const longWait = input && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs + WATCHDOG_GRACE_MS : 0;
+      const limit = Math.max(asked || WATCHDOG_DEFAULT_MS, longWait);
+      liveHandlers.add(operationKey);
+      let timer;
+      const expired = new Promise((resolve, reject) => {
+        timer = setTimeout(() => {
+          liveHandlers.delete(operationKey);
+          const error = commandError("UXP_HANDLER_TIMEOUT", command + " did not return within " + Math.round(limit / 1000) + " s and was abandoned. It may still be running or may have changed the project; its outcome is unknown. Inspect the timeline, then acknowledge operation recovery.");
+          error.hostMayHaveChanged = true;
+          reject(error);
+        }, limit);
+      });
+      running.catch(() => {});
+      return Promise.race([running, expired]).finally(() => { clearTimeout(timer); liveHandlers.delete(operationKey); });
+    }
     async function dispatchInvocation(command, args, invocation, meta) {
       const definition = definitions[command];
       if (!definition) throw commandError("UXP_UNSUPPORTED_COMMAND", "Unsupported UXP command: " + command);
@@ -329,7 +356,7 @@
         }
         try {
           invocation.handlerEntered = true;
-          const result = await definition.handler(input);
+          const result = await runWithWatchdog(operationKey, command, definition.handler(input), meta.deadlineMs, input);
           // ranOnSequenceId is the sequence that was active when the handler started.
           const envelope = { operationId: operationId || null, outcome: result && result.outcome ? result.outcome : "verified", ranOnSequenceId: current.sequenceGuid || null, ...(sequencePin ? { sequencePin } : {}), ...result };
           operationLedger.finish(operationKey, envelope.outcome);
