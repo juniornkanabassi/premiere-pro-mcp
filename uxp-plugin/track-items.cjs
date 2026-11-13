@@ -5,6 +5,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
+  const HostActions = typeof require === "function" ? require("./host-actions.cjs") : globalThis.PremiereMcpHostActions;
+
   // Premiere 27.0 returns Track.getTrackItems() in creation order once a clone, razor or paste has
   // appended a piece (live: a new right half listed last). Every clipIndex in this panel therefore
   // means "position in start-time order", and every read of a track goes through here.
@@ -24,7 +26,8 @@
   // Items in start-time order (stable: equal starts keep the host's order). If any start cannot be read
   // the host's own order is kept, because a partial sort would be worse than none.
   async function sortByStart(items) {
-    const list = Array.from(items || []);
+    // Every track item the panel edits comes through here, so this is where its action factories learn to retry.
+    const list = Array.from(items || []).map(HostActions.withActionRetry);
     if (list.length < 2) return list;
     const keyed = [];
     for (const item of list) keyed.push({ item, start: await startTicks(item), at: keyed.length });

@@ -6,6 +6,7 @@
   "use strict";
 
   const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+  const HostActions = typeof require === "function" ? require("./host-actions.cjs") : globalThis.PremiereMcpHostActions;
 
   // Copy a time range of clips from one sequence to another (or to another
   // place in the same sequence) the way an editor's copy and paste does: each
@@ -151,7 +152,7 @@
             await retryStale(async function () { Object.assign(context, await projectContext(request, true)); });
             return;
           } catch (error) {
-            if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) { await pause(attempt); continue; }
+            if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) { await HostActions.settle(attempt); continue; }
             if (firstWrite && !reached && error && typeof error === "object") error.noHostWrite = true;
             throw error;
           }

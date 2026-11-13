@@ -6,6 +6,7 @@
   "use strict";
 
   const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+  const HostActions = typeof require === "function" ? require("./host-actions.cjs") : globalThis.PremiereMcpHostActions;
 
   // Premiere's own ripple flag is not trusted (live 27.0: shiftOverLapping behaves
   // oppositely to its name, and the shift is whole frames, which left a 17 ms gap).
@@ -525,7 +526,9 @@
         if (!tracks.has(key)) tracks.set(key, await clipItemsOf(context.sequence, ref.mediaType, ref.trackIndex));
         const item = tracks.get(key)[ref.index];
         if (!item || await ticksOf(item, "getStartTime") !== ref.start) {
-          throw stop(progress, "UXP_VERIFICATION_FAILED", ref.mediaType + " track " + ref.trackIndex + " clip " + ref.index + " is no longer where it was read");
+          const moved = stop(progress, "UXP_VERIFICATION_FAILED", ref.mediaType + " track " + ref.trackIndex + " clip " + ref.index + " is no longer where it was read");
+          moved.readMismatch = true;
+          throw moved;
         }
         items.push(item);
       }
@@ -565,8 +568,9 @@
             }, label);
           });
         } catch (error) {
-          if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) {
-            await new Promise(function (resolve) { setTimeout(resolve, 25 * attempt); });
+          // Right after a commit Premiere may still refuse actions or read back a clip mid-update (live 27.0).
+          if (attempt < STALE_ATTEMPTS && !reached && (error && error.readMismatch || STALE_OBJECT.test(error && error.message ? error.message : ""))) {
+            await HostActions.settle(attempt);
             continue;
           }
           throw error;

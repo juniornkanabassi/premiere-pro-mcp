@@ -6,6 +6,7 @@
   "use strict";
 
   const TrackItems = typeof require === "function" ? require("./track-items.cjs") : globalThis.PremiereMcpTrackItems;
+  const HostActions = typeof require === "function" ? require("./host-actions.cjs") : globalThis.PremiereMcpHostActions;
 
   const MAX_SELECTION_ITEMS = 64;
   const MAX_PROJECT_ITEMS = 4096;
@@ -2126,7 +2127,7 @@
         const before = await listSequences(project);
         assertAppendCapacity(before, MAX_SEQUENCES, "Sequence cloning");
         project.lockedAccess(() => {
-          commitActions(project, "Clone sequence", [sequence.createCloneAction()]);
+          commitActions(project, "Clone sequence", [HostActions.withActionRetry(sequence).createCloneAction()]);
         });
         // The clone has committed: nothing below may throw, or a retry would clone twice.
         let undoSteps = 1, after = null, added = [], renamed = {}, readbackError = null;
@@ -2140,7 +2141,7 @@
               const item = clone && typeof clone.getProjectItem === "function" ? await clone.getProjectItem() : null;
               if (!item || typeof item.createSetNameAction !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose a rename action for the cloned sequence");
               project.lockedAccess(() => {
-                commitActions(project, "Rename cloned sequence", [item.createSetNameAction(name)]);
+                commitActions(project, "Rename cloned sequence", [HostActions.withActionRetry(item).createSetNameAction(name)]);
               });
               undoSteps++;
             } catch (error) {

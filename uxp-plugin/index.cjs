@@ -2,6 +2,8 @@
 const uxp = require("uxp");
 const { entrypoints, host, storage } = uxp;
 const ppro = require("premierepro");
+// Editors retry Premiere 27.0's spurious "script object is no longer valid" on create...Action (host-actions.cjs).
+globalThis.PremiereMcpHostActions.installEditorRetry(ppro);
 const Protocol = globalThis.PremiereMcpProtocol;
 const TranscriptSupport = globalThis.PremiereMcpTranscript;
 const TranscriptImport = globalThis.PremiereMcpTranscriptImport || (typeof require === "function" ? require("./transcript-import.cjs") : null);

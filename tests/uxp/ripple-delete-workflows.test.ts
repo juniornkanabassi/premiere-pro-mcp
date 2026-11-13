@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 const require = createRequire(import.meta.url);
 const Commands = require("../../uxp-plugin/commands.cjs");
 const Protocol = require("../../uxp-plugin/protocol.cjs");
+const HostActions = require("../../uxp-plugin/host-actions.cjs");
 
 const T = 254016000000n;
 const FRAME = T / 25n;
@@ -35,6 +36,13 @@ type HostOptions = {
    * committed transaction hands out objects that are already dead ("The script object is no longer valid.").
    */
   deadReadAfterCommit?: boolean;
+  /**
+   * Premiere 27.0 refuses create...Action calls with "The script object is no longer valid." for a while after
+   * a commit, although every argument is live, and the same call succeeds once it has caught up. Here the next
+   * N action creations after every commit (and at the start) are refused. Action methods then sit on a
+   * read-only prototype, as on the live host, and the panel's start-up retry (index.cjs) is installed.
+   */
+  refusedActionsAfterCommit?: number;
 };
 
 /**
@@ -50,7 +58,18 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   const firstSnapshot = new Promise<void>((resolve) => { pauseStarted = resolve; });
   const selections: Array<{ dead: boolean; items: Item[] }> = [];
   const lists: Record<Kind, Item[][]> = { video: [], audio: [] };
-  let generation = 0, hostCalls = 0, nextReadDead = false;
+  let generation = 0, hostCalls = 0, nextReadDead = false, refusalsLeft = options.refusedActionsAfterCommit ?? 0, refusals = 0;
+  function stillBusy() { if (refusalsLeft > 0) { refusalsLeft--; refusals++; throw new Error("The script object is no longer valid."); } }
+  /** With refusedActionsAfterCommit, the create...Action methods move to a read-only prototype, as on the live host. */
+  function hostShaped<O extends object>(object: O): O {
+    if (options.refusedActionsAfterCommit == null) return object;
+    const proto = {};
+    for (const name of Object.keys(object).filter((key) => /^create\w*Action$/.test(key))) {
+      Object.defineProperty(proto, name, { value: (object as Record<string, unknown>)[name], writable: false, configurable: false });
+      delete (object as Record<string, unknown>)[name];
+    }
+    return Object.setPrototypeOf(object, proto);
+  }
   let usedInLock: Array<() => void> = [];
   const dieAfterLock = () => { for (const kill of usedInLock) kill(); usedInLock = []; };
 
@@ -74,10 +93,10 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
       getSpeed: vi.fn(async () => state.speed),
       isSpeedReversed: vi.fn(async () => false),
       // Edge trims move the timeline edge and the matching source point together (live 26.0.2 / 27.0).
-      createSetStartAction: vi.fn((to: { ticks: string }) => { inLock(); const d = BigInt(to.ticks) - BigInt(state.start); return { apply: () => { if (options.ignoreSetStart) return; shift(state, "start", d); shift(state, "inPoint", d); } }; }),
-      createSetEndAction: vi.fn((to: { ticks: string }) => { inLock(); const d = BigInt(to.ticks) - BigInt(state.end); return { apply: () => { shift(state, "end", d); shift(state, "outPoint", d); } }; }),
+      createSetStartAction: vi.fn((to: { ticks: string }) => { stillBusy(); inLock(); const d = BigInt(to.ticks) - BigInt(state.start); return { apply: () => { if (options.ignoreSetStart) return; shift(state, "start", d); shift(state, "inPoint", d); } }; }),
+      createSetEndAction: vi.fn((to: { ticks: string }) => { stillBusy(); inLock(); const d = BigInt(to.ticks) - BigInt(state.end); return { apply: () => { shift(state, "end", d); shift(state, "outPoint", d); } }; }),
       // A move is relative.
-      createMoveAction: vi.fn((by: { ticks: string }) => { inLock(); return { apply: () => {
+      createMoveAction: vi.fn((by: { ticks: string }) => { stillBusy(); inLock(); return { apply: () => {
         if (options.ignoreMoves) return;
         shift(state, "start", BigInt(by.ticks)); shift(state, "end", BigInt(by.ticks));
         if (options.overwriteOnMove) {
@@ -93,7 +112,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
         }
       } }; }),
     };
-    return item;
+    return hostShaped(item);
   }
   type Item = ReturnType<typeof makeItem>;
   video.forEach((track, index) => lists.video.push(track.map((state) => makeItem(state, "video", index))));
@@ -138,7 +157,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     getAudioTrack: vi.fn(async (index: number) => options.missingAudioTrack || !lists.audio[index] ? null : { getTrackItems: vi.fn(async () => served(lists.audio[index]!)) }),
   };
   const cloneAction = vi.fn((source: Item, offset: { ticks: string }, videoOffset: number, audioOffset: number, alignToVideo: boolean, isInsert: boolean) => {
-    inLock();
+    stillBusy(); inLock();
     (source as unknown as { __touch?: () => void }).__touch?.();
     expect([videoOffset, audioOffset, alignToVideo, isInsert]).toEqual([0, 0, false, false]);
     return { apply: () => {
@@ -147,7 +166,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     } };
   });
   const removeAction = vi.fn((selection: { dead: boolean; items: Item[] }, ripple: boolean, mediaType: number, shiftOverlapping: boolean) => {
-    inLock();
+    stillBusy(); inLock();
     expect([ripple, shiftOverlapping]).toEqual([false, false]);
     return { apply: () => {
       if (selection.dead) throw new Error("The script object is no longer valid");
@@ -165,7 +184,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
       locked = true;
       try { callback(); } finally { locked = false; for (const selection of selections) selection.dead = true; dieAfterLock(); }
     }),
-    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; if (options.deadReadAfterCommit) nextReadDead = true; return true; }),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; if (options.deadReadAfterCommit) nextReadDead = true; refusalsLeft = options.refusedActionsAfterCommit ?? 0; return true; }),
   };
   /**
    * With strictHandles the project, the sequence and the tracks die too: every handle taken before a committed
@@ -192,7 +211,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   const ppro = {
     Project: { getActiveProject: vi.fn(async () => mortal(project)) },
     TickTime: { createWithTicks: vi.fn((ticks: string) => ({ ticks, seconds: Number(BigInt(ticks)) / Number(T) })) },
-    SequenceEditor: { getEditor: vi.fn(() => ({ createRemoveItemsAction: removeAction, createCloneTrackItemAction: cloneAction })) },
+    SequenceEditor: { getEditor: vi.fn(() => hostShaped({ createRemoveItemsAction: removeAction, createCloneTrackItemAction: cloneAction })) },
     TrackItemSelection: {
       createEmptySelection: vi.fn((callback: (selection: unknown) => void) => {
         inLock();
@@ -204,10 +223,11 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     },
     Constants: { TrackItemType: { CLIP: 1 }, MediaType: { VIDEO: 1, AUDIO: 2, ANY: 3 } },
   };
+  if (options.refusedActionsAfterCommit != null) HostActions.installEditorRetry(ppro);
   /** The track as [start, end, inPoint] seconds, in time order. */
   const track = (kind: Kind, index: number) => sorted(lists[kind][index]!).map((item) => [sec(item.state.start), sec(item.state.end), sec(item.state.inPoint)]);
   return {
-    lists, project, removeAction, cloneAction, track, sequence,
+    lists, project, removeAction, cloneAction, track, sequence, refusals: () => refusals,
     firstSnapshot, releaseFirstSnapshot: () => releasePause(),
     registry: Commands.createCommandRegistry({ ppro, Protocol }),
   };
@@ -600,6 +620,20 @@ describe("timeline.range.extract", () => {
     const moves = value.project.executeTransaction.mock.calls.filter((call) => String(call[1]).endsWith("(close gap)"));
     expect(moves).toHaveLength(1);
     expect(order.indexOf("long")).toBeLessThan(order.indexOf("later"));
+  });
+
+  it("finishes when Premiere refuses every action for a while after each commit (live 27.0: the same call then succeeds)", async () => {
+    const value = timelineHost(
+      [[clip("long", 0, 30, 0), clip("later", 30, 40, 0)], [clip("v2", 15, 25, 100)]],
+      [[clip("mix", 0, 40, 0)]],
+      { refusedActionsAfterCommit: 4 },
+    );
+    const result = await extract(value, { startSeconds: 20, endSeconds: 22 }, "ex-busy");
+    expect(result).toMatchObject({ extracted: true, verified: true, outcome: "verified" });
+    expect(value.track("video", 0)).toEqual([[0, 20, 0], [20, 28, 22], [28, 38, 0]]);
+    expect(value.track("audio", 0)).toEqual([[0, 20, 0], [20, 38, 22]]);
+    // Every step after the first hit the refusal, and nothing was abandoned half built.
+    expect(value.refusals()).toBeGreaterThanOrEqual(4 * result.undoSteps);
   });
 
   it("limits the edit to chosen tracks and refuses when an unchosen track has an item over the range", async () => {
