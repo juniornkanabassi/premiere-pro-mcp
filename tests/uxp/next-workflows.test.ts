@@ -735,6 +735,20 @@ describe("next-wave UXP event workflows", () => {
     expect(getActiveProject).not.toHaveBeenCalled();
   });
 
+  it("refuses an out-of-range track, a bad mute value and a stale expectation before any mute is set, tagging each noHostWrite", async () => {
+    const track = { isMuted: vi.fn(async () => false), setMute: vi.fn(async () => true) };
+    const sequence = { guid: "sequence-1", getVideoTrackCount: vi.fn(async () => 0), getAudioTrackCount: vi.fn(async () => 4), getAudioTrack: vi.fn(async () => track) };
+    const project = { getActiveSequence: vi.fn(async () => sequence), getSequences: vi.fn(async () => [sequence]) };
+    const definitions = NextWorkflows.createNextWorkflowDefinitions({ ppro: { Project: { getActiveProject: vi.fn(async () => project) } } });
+    const set = (args: Record<string, unknown>) => definitions["track.state.set"].handler({ sequenceId: "sequence-1", mediaType: "audio", trackIndices: [0], muted: true, ...args });
+    await expect(set({ trackIndices: [5] })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true, message: "trackIndices[0] must be an integer between 0 and 3" });
+    await expect(set({ muted: "yes" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(set({ trackIndices: [0, 0] })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(set({ expectedMuted: true })).rejects.toMatchObject({ code: "UXP_STALE_TARGET", noHostWrite: true });
+    await expect(set({ expectedSequenceId: "other" })).rejects.toMatchObject({ code: "UXP_STALE_TARGET", noHostWrite: true });
+    expect(track.setMute).not.toHaveBeenCalled();
+  });
+
   it("sets caption-track mute state through direct host promises and reads it back", async () => {
     let muted = false;
     const captionTrack = {

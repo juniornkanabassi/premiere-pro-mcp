@@ -676,9 +676,12 @@ async function sendCommandUnchecked(
   const timeoutMs = options?.timeoutMs || DEFAULT_TIMEOUT_MS;
   ensurePrivateBridgeDirectory(tempDir);
 
-  if (options?.failFastOnUnreadyHeartbeat || options?.requireHeartbeat) {
-    const failure = heartbeatFailure(getBridgeLiveness(options), options.hostLabel, options.requireHeartbeat === true);
-    if (failure) return failure;
+  // A connector that reports itself stopped or stale cannot run an edit. Nothing is published, so the edit
+  // is provably not applied, and the caller gets a plain error instead of a 30 s wait and an "unknown outcome".
+  const editing = options?.mutating ?? (options?.mutationOnTimeout === true || undoTrackingEnabled());
+  if (options?.failFastOnUnreadyHeartbeat || options?.requireHeartbeat || editing) {
+    const failure = heartbeatFailure(getBridgeLiveness(options), options?.hostLabel, options?.requireHeartbeat === true);
+    if (failure) return editing ? { ...failure, data: { mutationOutcome: "not_applied", timelineChanged: false } } : failure;
   }
 
   const id = randomUUID() + (options?.hostEngine === "headless" ? ".headless" : "");
@@ -756,9 +759,12 @@ async function sendRawCommandUnchecked(
   const timeoutMs = options?.timeoutMs || DEFAULT_TIMEOUT_MS;
   ensurePrivateBridgeDirectory(tempDir);
 
-  if (options?.failFastOnUnreadyHeartbeat || options?.requireHeartbeat) {
-    const failure = heartbeatFailure(getBridgeLiveness(options), options.hostLabel, options.requireHeartbeat === true);
-    if (failure) return failure;
+  // A connector that reports itself stopped or stale cannot run an edit. Nothing is published, so the edit
+  // is provably not applied, and the caller gets a plain error instead of a 30 s wait and an "unknown outcome".
+  const editing = options?.mutating ?? (options?.mutationOnTimeout === true || undoTrackingEnabled());
+  if (options?.failFastOnUnreadyHeartbeat || options?.requireHeartbeat || editing) {
+    const failure = heartbeatFailure(getBridgeLiveness(options), options?.hostLabel, options?.requireHeartbeat === true);
+    if (failure) return editing ? { ...failure, data: { mutationOutcome: "not_applied", timelineChanged: false } } : failure;
   }
 
   const id = randomUUID();
@@ -953,6 +959,8 @@ async function pollForResponse(
               `A modal dialog or a long analysis inside ${hostLabel} is likely blocking the scripting engine — ` +
               `check the ${hostLabel} window and dismiss any open dialog.` +
               (mutating ? ` The mutation outcome is unknown; inspect the timeline before retrying.` : ` The result, if any, will be discarded.`)
+              : queuedState === "no_connector"
+              ? `The CEP connector is not running in ${hostLabel}: nothing picked this command up within ${timeoutMs}ms, so it was withdrawn and not run. Open Window > Extensions > MCP Bridge in ${hostLabel}, wait for it to report running, then retry.`
               : queuedState === "cancelled"
               ? `${panelHostName} is busy or blocked by an earlier command (for example an export or a dialog). This command was not run; retry when ${panelHostName} is responsive.`
               : queuedState === "claim_race"
@@ -960,7 +968,7 @@ async function pollForResponse(
                 : mutating
                   ? `The mutation did not return within ${timeoutMs}ms. Its outcome is unknown; inspect ${hostLabel} before retrying.`
               : `Command timed out after ${timeoutMs}ms. Is the MCP connector panel running in ${hostLabel}?`,
-          ...(mutating && queuedState === "cancelled"
+          ...(mutating && (queuedState === "cancelled" || queuedState === "no_connector")
             ? { data: { mutationOutcome: "not_applied", timelineChanged: false } }
             : mutating && (sawBusy || queuedState === "claim_race")
               ? { data: { mutationOutcome: "unknown", timelineChanged: null } }
@@ -986,7 +994,7 @@ function cancelQueuedBehindLivePanel(
   cmdFile: string,
   ownBusyFile: string,
   hardCapMs: number,
-): "cancelled" | "claim_race" | "none" {
+): "cancelled" | "no_connector" | "claim_race" | "none" {
   // The panel atomically renames a command to `.claimed` immediately before
   // execution. A mere existence check races that rename, so claim the opposite
   // rename ourselves: success proves the panel did not pick up this command.
@@ -1003,12 +1011,13 @@ function cancelQueuedBehindLivePanel(
     });
     const heartbeat = getBridgeLiveness({ tempDir: directory }, now);
     const panelHeartbeatIsRecent = heartbeat.state === "running" || heartbeat.state === "waiting";
-    if (!anotherCommandIsWithinHardCap && !panelHeartbeatIsRecent) return "none";
+    // With no live panel and nothing else running, withdraw the command all the same: the rename below proves
+    // nobody claimed it, so it was never run and the caller can say so instead of "unknown".
     const cancelledFile = `${cmdFile}.cancelled`;
     try {
       renameSync(cmdFile, cancelledFile);
       safeUnlink(cancelledFile);
-      return "cancelled";
+      return anotherCommandIsWithinHardCap || panelHeartbeatIsRecent ? "cancelled" : "no_connector";
     } catch {
       // CEP claimed the command first. It may still run, so timeout is unknown.
       return "claim_race";

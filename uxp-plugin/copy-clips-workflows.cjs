@@ -30,6 +30,9 @@
   // capped at this extent and a long cut is done in several rounds that
   // reuse the same slot (shortcut: 3 Undo steps per round, raise if rounds are common).
   const PARKING_BUDGET = 12n * 3600n * TICKS_PER_SECOND;
+  // Live 27.0: rounds of 3 or fewer parked clones verified; 9 parked clones in one round did not.
+  const MAX_PARKED_PER_ROUND = 4;
+  const STALE_OBJECT = /no longer valid/i;
   const SEGMENT_KEYS = ["sourceStartTicks", "sourceEndTicks", "sourceStartSeconds", "sourceEndSeconds", "videoTrack"];
   // segments mode copies camera ranges from one video track each onto one
   // "program" video track of the same sequence; nothing else may be given.
@@ -99,28 +102,75 @@
       const parked = plan.entries.filter(function (entry) { return entry.trimmed; });
       const roundCount = parked.length ? parked[parked.length - 1].round + 1 : 0;
 
+      // After a failure, lists exactly which clones are still parked past the end of their tracks.
+      // Originals end well before the first parking slot, so anything at or after it is a parked clone.
+      async function withParked(receipt) {
+        if (!parked.length) return receipt;
+        const floor = parked.reduce(function (min, entry) { return entry.parkedStart < min ? entry.parkedStart : min; }, parked[0].parkedStart);
+        const spots = new Map();
+        for (const entry of parked) spots.set(entry.placement.mediaType + ":" + entry.placement.targetTrackIndex, entry.placement);
+        const found = [];
+        try {
+          for (const spot of spots.values()) {
+            const items = await clipItems(context.destination, spot.mediaType, spot.targetTrackIndex);
+            for (let index = 0; index < items.length; index++) {
+              const start = BigInt(await ticksOf(items[index], "getStartTime"));
+              if (start >= floor) found.push({ mediaType: spot.mediaType, trackIndex: spot.targetTrackIndex, clipIndex: index, projectItemId: await projectItemId(items[index]), startTicks: String(start), endTicks: await ticksOf(items[index], "getEndTime") });
+            }
+          }
+        } catch (scanError) {
+          return Object.assign(receipt, { parkedClones: null, parkedScanError: scanError && scanError.message ? scanError.message : String(scanError) });
+        }
+        if (found.length) receipt.nextStep += " " + found.length + " cloned clip" + (found.length === 1 ? " is" : "s are") + " still parked past the end of the destination tracks (see parkedClones). Remove them with remove_track_items_uxp, or Undo the committed steps.";
+        return Object.assign(receipt, { parkedClones: found });
+      }
+
+      // Host objects die ("The script object is no longer valid", live 27.0), so no item is carried from
+      // one step to the next. Each transaction reads its items again just before it, and a step whose
+      // object died before the transaction ran wrote nothing, so it is tried once more on new objects.
+      async function lockedTransaction(prepare, build, name, firstWrite) {
+        for (let attempt = 0; ; attempt++) {
+          let reached = false;
+          try {
+            const items = await prepare();
+            context.project.lockedAccess(function () {
+              // The editor's action is made here, inside the lock.
+              const make = { clone: function (item, offset, videoOffset, audioOffset) { return editor.createCloneTrackItemAction(item, offset, videoOffset, audioOffset, false, false); } };
+              const actions = checked(build(items, make));
+              reached = true;
+              committed(context.project.executeTransaction(function (compoundAction) {
+                for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
+              }, name), name);
+            });
+            return;
+          } catch (error) {
+            if (attempt === 0 && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) continue;
+            if (firstWrite && !reached && error && typeof error === "object") error.noHostWrite = true;
+            throw error;
+          }
+        }
+      }
+
       // Transaction 1: every clone, direct ones at their destination and
       // trimmed ones at the parking spot. A clone into a track that does not
       // exist yet creates it (live 27.0, probe P4), so when the program track
       // is new its first clone goes in a transaction of its own and the rest
       // follow once the track is there.
-      function cloneTransaction(entries, name) {
-        context.project.lockedAccess(function () {
-          const actions = checked(entries.map(function (entry) {
-            const at = entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks);
-            return editor.createCloneTrackItemAction(entry.item, ppro.TickTime.createWithTicks(String(at - entry.sourceStart)),
-              entry.videoOffset, entry.audioOffset, false, false);
-          }));
-          committed(context.project.executeTransaction(function (compoundAction) {
-            for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
-          }, name), name);
-        });
+      async function cloneTransaction(entries, name, firstWrite) {
+        await lockedTransaction(
+          async function () { const items = []; for (const entry of entries) items.push(await freshSource(context, entry)); return items; },
+          function (items, make) {
+            return entries.map(function (entry, index) {
+              const at = entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks);
+              return make.clone(items[index], ppro.TickTime.createWithTicks(String(at - entry.sourceStart)), entry.videoOffset, entry.audioOffset);
+            });
+          }, name, firstWrite);
       }
       // Round 0 of parking goes in with the direct clones; later rounds reuse
       // the slot once the previous round has been moved into place.
       const first = plan.entries.filter(function (entry) { return !entry.trimmed || entry.round === 0; });
       const chunks = plan.newTrack && first.length > 1 ? [first.slice(0, 1), first.slice(1)] : [first];
-      cloneTransaction(chunks[0], label);
+      await cloneTransaction(chunks[0], label, true);
       let steps = 1;
       try {
         if (plan.newTrack) {
@@ -133,68 +183,66 @@
           }
           await findClone(context.destination, entry, entry.trimmed ? entry.parkedStart : BigInt(entry.placement.startTicks), plan);
         }
-        if (chunks.length > 1) { cloneTransaction(chunks[1], label + " (rest)"); steps++; }
+        if (chunks.length > 1) { await cloneTransaction(chunks[1], label + " (rest)"); steps++; }
         for (let round = 0; round < roundCount; round++) {
           const mine = parked.filter(function (entry) { return entry.round === round; });
-          if (round > 0) { cloneTransaction(mine, label + " (park " + (round + 1) + ")"); steps++; }
+          if (round > 0) { await cloneTransaction(mine, label + " (park " + (round + 1) + ")"); steps++; }
           // Transaction 2: trim each parked clone to the range. Transaction 3:
           // move it into place.
           const clones = [];
-          for (const entry of mine) clones.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart, plan) });
-          context.project.lockedAccess(function () {
-            const actions = [];
-            for (const clone of clones) {
-              const placement = clone.entry.placement, head = BigInt(placement.trimHeadTicks), tail = BigInt(placement.trimTailTicks);
-              // Each of these is a full edge trim: SetStart moves the start and
-              // the source in together, SetEnd the end and the source out
-              // (live 26.0.2; SetInPoint/SetOutPoint do the same again, so
-              // using both pairs trims twice).
-              if (head > 0n) actions.push(requiredMethod(clone.item, "createSetStartAction")(ppro.TickTime.createWithTicks(String(clone.entry.parkedStart + head))));
-              if (tail > 0n) actions.push(requiredMethod(clone.item, "createSetEndAction")(ppro.TickTime.createWithTicks(String(clone.entry.parkedEnd - tail))));
-            }
-            checked(actions);
-            committed(context.project.executeTransaction(function (compoundAction) {
-          for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
-        }, label + " (trim)"), label + " (trim)");
-          });
+          for (const entry of mine) clones.push({ entry, at: await findClone(context.destination, entry, entry.parkedStart, plan) });
+          await lockedTransaction(
+            function () { return fetchAt(context.destination, clones.map(function (clone) { return clone.at; })); },
+            function (items) {
+              const actions = [];
+              clones.forEach(function (clone, index) {
+                const placement = clone.entry.placement, head = BigInt(placement.trimHeadTicks), tail = BigInt(placement.trimTailTicks);
+                // Each of these is a full edge trim: SetStart moves the start and
+                // the source in together, SetEnd the end and the source out
+                // (live 26.0.2; SetInPoint/SetOutPoint do the same again, so
+                // using both pairs trims twice).
+                if (head > 0n) actions.push(requiredMethod(items[index], "createSetStartAction")(ppro.TickTime.createWithTicks(String(clone.entry.parkedStart + head))));
+                if (tail > 0n) actions.push(requiredMethod(items[index], "createSetEndAction")(ppro.TickTime.createWithTicks(String(clone.entry.parkedEnd - tail))));
+              });
+              return actions;
+            }, label + " (trim)");
           steps++;
           const trimmed = [];
-          for (const entry of mine) trimmed.push({ entry, item: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks), plan) });
-          context.project.lockedAccess(function () {
-            const actions = checked(trimmed.map(function (clone) {
-              const from = clone.entry.parkedStart + BigInt(clone.entry.placement.trimHeadTicks);
-              return requiredMethod(clone.item, "createMoveAction")(ppro.TickTime.createWithTicks(String(BigInt(clone.entry.placement.startTicks) - from)));
-            }));
-            committed(context.project.executeTransaction(function (compoundAction) {
-          for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
-        }, label + " (place)"), label + " (place)");
-          });
+          for (const entry of mine) trimmed.push({ entry, at: await findClone(context.destination, entry, entry.parkedStart + BigInt(entry.placement.trimHeadTicks), plan) });
+          await lockedTransaction(
+            function () { return fetchAt(context.destination, trimmed.map(function (clone) { return clone.at; })); },
+            function (items) {
+              return trimmed.map(function (clone, index) {
+                const from = clone.entry.parkedStart + BigInt(clone.entry.placement.trimHeadTicks);
+                return requiredMethod(items[index], "createMoveAction")(ppro.TickTime.createWithTicks(String(BigInt(clone.entry.placement.startTicks) - from)));
+              });
+            }, label + " (place)");
           steps++;
         }
       } catch (error) {
-        return { copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
+        return await withParked({ copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
           readbackError: error && error.message ? error.message : String(error), rollbackPerformed: false,
           verificationBoundary: "committed_transaction_with_failed_follow_up",
-          nextStep: "Some clips were cloned but not trimmed or placed. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove them, then inspect again." };
+          nextStep: "Some clips were cloned but not trimmed or placed. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove them, then inspect again." });
       }
 
       try {
         const { problems, maxDeviationTicks } = await readbackProblems(context.destination, plan);
         if (problems.length) {
-          return { copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
+          return await withParked({ copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
             problems: problems.slice(0, 20), maxDeviationTicks, rollbackPerformed: false,
             verificationBoundary: "committed_transaction_with_failed_readback",
-            nextStep: "The copy committed but did not read back as planned. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove it, then inspect again." };
+            nextStep: "The copy committed but did not read back as planned. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove it, then inspect again." });
         }
         return { copied: true, committed: true, verified: true, outcome: "verified",
           sourceSequenceName: plan.snapshot.sourceSequenceName, destinationSequenceName: plan.snapshot.destinationSequenceName,
           clipsCopied: direct.length + parked.length, clipsTrimmed: parked.length, undoSteps: steps, maxDeviationTicks,
           verificationBoundary: "placement_start_source_range_and_project_item_readback", undoLabel: label };
       } catch (error) {
-        return { copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
+        return await withParked({ copied: false, committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: steps,
           readbackError: error && error.message ? error.message : String(error), rollbackPerformed: false,
           verificationBoundary: "committed_transaction_with_failed_readback",
-          nextStep: "Inspect the destination before any retry. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove the copy." };
+          nextStep: "Inspect the destination before any retry. Use Premiere Undo " + steps + " time" + (steps === 1 ? "" : "s") + " to remove the copy." });
       }
     }
 
@@ -370,12 +418,13 @@
       }
       const gap = (PARKING_GAP + frame - 1n) / frame * frame;
       const parkingBase = (lastEnd + frame - 1n) / frame * frame + gap;
-      let parking = parkingBase, round = 0;
+      let parking = parkingBase, round = 0, inRound = 0;
       for (const entry of entries) {
         if (!entry.trimmed) continue;
         const length = BigInt(entry.placement.endTicks) - BigInt(entry.placement.startTicks) + BigInt(entry.placement.trimHeadTicks) + BigInt(entry.placement.trimTailTicks);
         if (length + gap > PARKING_BUDGET) throw refuse("UXP_TARGET_TOO_LARGE", entry.placement.name + " is too long to park while it is trimmed; split the range so it crosses fewer long clips");
-        if (parking - parkingBase + length > PARKING_BUDGET) { round++; parking = parkingBase; }
+        if (parking - parkingBase + length > PARKING_BUDGET || inRound >= MAX_PARKED_PER_ROUND) { round++; parking = parkingBase; inRound = 0; }
+        inRound++;
         entry.round = round;
         entry.parkedStart = parking;
         entry.parkedEnd = parking + length;
@@ -417,17 +466,42 @@
     }
     function distance(left, right) { const d = BigInt(left) - BigInt(right); return d < 0n ? -d : d; }
 
+    // Where the clone sits now: { mediaType, trackIndex, index, start } (start in ticks as a string).
     async function findClone(sequence, entry, startTicks, plan) {
       const placement = entry.placement, tol = tolerance(placement.mediaType, plan);
       let best = null, bestDistance = tol + 1n;
-      for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) {
-        const away = distance(await ticksOf(item, "getStartTime"), startTicks);
-        if (away <= tol && away < bestDistance && await projectItemId(item) === placement.projectItemId) { best = item; bestDistance = away; }
+      const items = await clipItems(sequence, placement.mediaType, placement.targetTrackIndex);
+      for (let index = 0; index < items.length; index++) {
+        const start = await ticksOf(items[index], "getStartTime"), away = distance(start, startTicks);
+        if (away <= tol && away < bestDistance && await projectItemId(items[index]) === placement.projectItemId) { best = { mediaType: placement.mediaType, trackIndex: placement.targetTrackIndex, index, start }; bestDistance = away; }
       }
       if (best) return best;
       const seen = [];
-      for (const item of await clipItems(sequence, placement.mediaType, placement.targetTrackIndex)) seen.push(await ticksOf(item, "getStartTime"));
+      for (const item of items) seen.push(await ticksOf(item, "getStartTime"));
       throw commandError("UXP_VERIFICATION_FAILED", placement.name + " is not at its parking position " + startTicks + " on " + placement.mediaType + " track " + placement.targetTrackIndex + " (clip starts there: " + seen.slice(0, 8).join(", ") + ")");
+    }
+
+    // The items at those positions, fetched again (one track call each) right before they are used.
+    async function fetchAt(sequence, positions) {
+      const tracks = new Map(), items = [];
+      for (const at of positions) {
+        const key = at.mediaType + ":" + at.trackIndex;
+        if (!tracks.has(key)) tracks.set(key, await clipItems(sequence, at.mediaType, at.trackIndex));
+        const item = tracks.get(key)[at.index];
+        if (!item || await ticksOf(item, "getStartTime") !== at.start) throw commandError("UXP_VERIFICATION_FAILED", at.mediaType + " track " + at.trackIndex + " clip " + at.index + " is no longer where it was found");
+        items.push(item);
+      }
+      return items;
+    }
+
+    // A source clip, read again from its track (it may be in the sequence the copy is writing to).
+    async function freshSource(context, entry) {
+      const placement = entry.placement, items = await clipItems(context.source, placement.mediaType, placement.sourceTrackIndex);
+      const wanted = String(entry.sourceStart), matches = async function (item) { return await ticksOf(item, "getStartTime") === wanted && await projectItemId(item) === placement.projectItemId; };
+      const direct = items[placement.sourceClipIndex];
+      if (direct && await matches(direct)) return direct;
+      for (const item of items) if (await matches(item)) return item;
+      throw refuse("UXP_STALE_TRACK_ITEM", placement.name + " is no longer in the source sequence where the copy was planned");
     }
 
     // Compares every start, end, source in and source out within the media

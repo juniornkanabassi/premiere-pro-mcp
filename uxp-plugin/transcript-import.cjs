@@ -14,6 +14,8 @@
     const ppro = deps.ppro, transcript = deps.TranscriptSupport, Protocol = deps.Protocol;
     const importTails = new Map();
 
+    // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+    function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
     function commandError(code, message) {
       const error = new Error(message);
       error.code = code;
@@ -21,31 +23,31 @@
     }
 
     function assertObject(value) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", "args must be an object");
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", "args must be an object");
     }
 
     function assertOnlyKeys(value, allowed) {
       const unknown = Object.keys(value).find(function (key) { return !allowed.includes(key); });
-      if (unknown) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown);
+      if (unknown) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown);
     }
 
     function requiredString(value, name, maximum) {
       if (typeof value !== "string" || !value.trim() || value.length > maximum) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty string of at most " + maximum + " characters");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty string of at most " + maximum + " characters");
       }
       return value;
     }
 
     function exactGuid(value, name) {
       const guid = requiredString(value, name, 512);
-      if (guid === "[object Object]") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a readable GUID string");
+      if (guid === "[object Object]") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a readable GUID string");
       return guid;
     }
 
     function expectedRevision(value) {
       if (value === null) return null;
       if (typeof value !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedTranscriptRevision must be a sha256 revision or null");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedTranscriptRevision must be a sha256 revision or null");
       }
       return value;
     }
@@ -73,19 +75,19 @@
       assertObject(args);
       assertOnlyKeys(args, ["projectItemId", "expectedProjectGuid", "expectedTranscriptRevision", "json", "confirmDestructive", "operationId"]);
       if (args.confirmDestructive !== true) {
-        throw commandError("UXP_CONFIRMATION_REQUIRED", "confirmDestructive: true is required to replace a source transcript");
+        throw refuse("UXP_CONFIRMATION_REQUIRED", "confirmDestructive: true is required to replace a source transcript");
       }
       if (typeof args.operationId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(args.operationId)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters");
       }
       const json = requiredString(args.json, "json", MAX_IMPORT_BYTES);
       if (transcript.utf8ByteLength(json) > MAX_IMPORT_BYTES) {
-        throw commandError("UXP_INVALID_ARGUMENT", "json exceeds the 24 KiB transcript-import bridge limit");
+        throw refuse("UXP_INVALID_ARGUMENT", "json exceeds the 24 KiB transcript-import bridge limit");
       }
       try {
         if (!hasSegmentText(transcript.parseTranscriptJSON(json))) throw new Error("Transcript import requires nonempty segment text");
       } catch (error) {
-        throw commandError("UXP_INVALID_ARGUMENT", error && error.message ? error.message : "json is not valid transcript JSON");
+        throw refuse("UXP_INVALID_ARGUMENT", error && error.message ? error.message : "json is not valid transcript JSON");
       }
       return {
         projectItemId: requiredString(args.projectItemId, "projectItemId", 512),

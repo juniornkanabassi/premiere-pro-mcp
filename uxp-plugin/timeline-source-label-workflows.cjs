@@ -75,7 +75,7 @@
       const colorIndex = labelColorIndex(args.colorIndex);
       const expected = requiredSnapshot(args.expectedSnapshot);
       if (args.sequenceId !== undefined && requestedSequenceId(args.sequenceId, "sequenceId") !== expected.sequenceId) {
-        throw commandError("UXP_INVALID_ARGUMENT", "sequenceId must exactly match expectedSnapshot.sequenceId");
+        throw refuse("UXP_INVALID_ARGUMENT", "sequenceId must exactly match expectedSnapshot.sequenceId");
       }
       // An update always targets the reviewed sequence by ID, never whichever
       // sequence happens to be active in the UI.
@@ -250,7 +250,7 @@
       assertOnlyKeys(value, allowed);
       for (let index = 0; index < allowed.length; index += 1) {
         if (!Object.prototype.hasOwnProperty.call(value, allowed[index])) {
-          throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot." + allowed[index] + " is required");
+          throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot." + allowed[index] + " is required");
         }
       }
       const snapshot = {
@@ -265,13 +265,13 @@
         startSeconds: boundedSeconds(value.startSeconds, "expectedSnapshot.startSeconds"),
         endSeconds: boundedSeconds(value.endSeconds, "expectedSnapshot.endSeconds")
       };
-      if (snapshot.endSeconds < snapshot.startSeconds) throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot.endSeconds must not precede startSeconds");
+      if (snapshot.endSeconds < snapshot.startSeconds) throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot.endSeconds must not precede startSeconds");
       return snapshot;
     }
 
     function assertExpectedTarget(expected, target) {
       if (expected.mediaType !== target.mediaType || expected.trackIndex !== target.trackIndex || expected.clipIndex !== target.clipIndex) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot coordinates must exactly match the requested timeline target");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot coordinates must exactly match the requested timeline target");
       }
     }
 
@@ -305,43 +305,43 @@
   }
 
   function assertObject(value, name) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", (name || "args") + " must be an object");
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", (name || "args") + " must be an object");
   }
   function assertOnlyKeys(value, allowed) {
     const unknown = Object.keys(value).filter(function (key) { return !allowed.includes(key); });
-    if (unknown.length) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]);
+    if (unknown.length) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]);
   }
   function requiredMethod(value, method) {
     if (!value || typeof value[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose " + method + " for this target");
     return value[method].bind(value);
   }
   function enumValue(value, name, allowed) {
-    if (!allowed.includes(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", "));
+    if (!allowed.includes(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", "));
     return value;
   }
   function boundedInt(value, name, minimum, maximum) {
-    if (!Number.isInteger(value) || value < minimum || value > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum);
+    if (!Number.isInteger(value) || value < minimum || value > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum);
     return value;
   }
   function labelColorIndex(value) { return boundedInt(value, "colorIndex", 0, 15); }
   function boundedSeconds(value, name) {
     const seconds = Number(value);
-    if (!validSeconds(seconds)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 86400");
+    if (!validSeconds(seconds)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 86400");
     return seconds;
   }
   function validSeconds(value) { return Number.isFinite(value) && value >= 0 && value <= 86400; }
   function sameNumber(left, right) { return Math.abs(Number(left) - Number(right)) <= 0.000001; }
   function requestedSequenceId(value, name) {
     if (typeof value !== "string" || !value || value.length > 128 || value.indexOf("\u0000") !== -1) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty sequence ID of at most 128 characters");
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty sequence ID of at most 128 characters");
     }
     return value;
   }
   function requireConfirmation(value) {
-    if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "timeline.sourceLabel.update requires confirmSetLabel: true after reviewing the complete snapshot");
+    if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "timeline.sourceLabel.update requires confirmSetLabel: true after reviewing the complete snapshot");
   }
   function requireOperationId(value) {
-    if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+    if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
   }
   function requiredGuid(value, name) {
     const guid = guidString(value);
@@ -358,6 +358,8 @@
     try { return typeof value.toString === "function" ? String(value.toString()) : String(value); } catch (_) { return ""; }
   }
   function tickSeconds(value) { const seconds = value && Number(value.seconds); return Number.isFinite(seconds) ? seconds : null; }
+  // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+  function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
 
   return { createTimelineSourceLabelWorkflowDefinitions };

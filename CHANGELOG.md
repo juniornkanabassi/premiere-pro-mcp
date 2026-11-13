@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `extract_timeline_range_uxp` on all tracks and `copy_clips_between_sequences_uxp` / `apply_camera_cut_uxp` with many clips no longer carry Premiere script objects across transactions or long reads ("The script object is no longer valid." on Premiere 27.0). Every transaction fetches its items again by position just before it uses them, razor rounds handle at most 4 tracks, move batches at most 50 items, and copy rounds park at most 4 clones. A failure after parking returns `parkedClones` naming each clone left past the end of its track.
+- Argument refusals in the UXP panel (a missing `audio_track_index`, an out-of-range mute track, bad types and unknown keys across the editing commands) carry `noHostWrite`, so they no longer set the recovery fence that blocked later writes.
+- A CEP edit sent while the connector heartbeat is stale or stopped now fails at once as `not_applied` ("The CEP connector ..."), and an unclaimed edit with no connector is withdrawn at the timeout as `not_applied` instead of "outcome is unknown". `create_caption_track` no longer waits 30 s and sets a shared recovery fence when the connector is not running.
+- `undo_last_edit_uxp` and `inspect_undo_stack_uxp` say a verified edit with no inverse (ripple delete, duplicate, extract, overwrite) "cannot be reversed automatically" instead of "did not report a verified result". Receipts that carry only `outcome: "verified"` now count as verified.
+
+### Added
+
+- `manage_sequences_uxp` action `clone` accepts an optional `name`; the clone is renamed through its Project item and the name is read back (`nameApplied`).
+- `edit_timeline_uxp` says `audio_track_index` is required by insert and overwrite.
+
 ## [1.30.0] - 2026-11-07
 
 ### Added

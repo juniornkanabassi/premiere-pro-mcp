@@ -252,6 +252,12 @@ describe("issue #459 — manage_sequences_uxp forwards only each action's own pa
     expect(request).toHaveBeenCalledWith("sequences.clone", { sequenceId: "sequence-guid-1" });
   });
 
+  it("sends an optional clone name through so the clone can be renamed", async () => {
+    await tools.manage_sequences_uxp.handler({ action: "clone", sequence_id: "sequence-guid-1", name: "Fine Cut v2", operation_id: "op-2" });
+
+    expect(request).toHaveBeenCalledWith("sequences.clone", { sequenceId: "sequence-guid-1", name: "Fine Cut v2", operationId: "op-2" });
+  });
+
   it("sends the create_from_media parameters without leaking clone-only fields", async () => {
     await tools.manage_sequences_uxp.handler({
       action: "create_from_media",
@@ -291,11 +297,11 @@ describe("issue #459 — manage_sequences_uxp forwards only each action's own pa
     const result = await tools.manage_sequences_uxp.handler({
       action: "clone",
       sequence_id: "sequence-guid-1",
-      name: "Cutdown",
+      expected_name: "Cutdown",
     });
 
-    expect(result).toMatchObject({ success: false, error: expect.stringContaining("does not accept name") });
-    expect(result.error).toContain("It accepts: sequence_id, operation_id");
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining("does not accept expected_name") });
+    expect(result.error).toContain("It accepts: sequence_id, name, operation_id");
     expect(request).not.toHaveBeenCalled();
   });
 });

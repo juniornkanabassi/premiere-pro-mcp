@@ -53,9 +53,9 @@
 
     async function applyUnnest(args) {
       assertOnlyKeys(args, ["mediaType", "trackIndex", "clipIndex", "expectedSnapshot", "confirmUnnest", "operationId"]);
-      if (args.confirmUnnest !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "sequence.unnest requires confirmUnnest: true");
+      if (args.confirmUnnest !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "sequence.unnest requires confirmUnnest: true");
       if (typeof args.operationId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(args.operationId)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
       }
       assertObject(args.expectedSnapshot, "expectedSnapshot");
       const target = targetCoordinates(args);
@@ -330,9 +330,9 @@
     }
 
     function targetCoordinates(args) {
-      if (["video", "audio"].indexOf(args.mediaType) === -1) throw commandError("UXP_INVALID_ARGUMENT", "mediaType must be one of video, audio");
+      if (["video", "audio"].indexOf(args.mediaType) === -1) throw refuse("UXP_INVALID_ARGUMENT", "mediaType must be one of video, audio");
       for (const key of ["trackIndex", "clipIndex"]) {
-        if (!Number.isSafeInteger(args[key]) || args[key] < 0 || args[key] > 511) throw commandError("UXP_INVALID_ARGUMENT", key + " must be an integer from 0 to 511");
+        if (!Number.isSafeInteger(args[key]) || args[key] < 0 || args[key] > 511) throw refuse("UXP_INVALID_ARGUMENT", key + " must be an integer from 0 to 511");
       }
       return { mediaType: args.mediaType, trackIndex: args.trackIndex, clipIndex: args.clipIndex };
     }
@@ -344,9 +344,11 @@
     }
 
     function requiredMethod(target, name) { if (!target || typeof target[name] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "The required item does not expose " + name); return target[name].bind(target); }
-    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an object"); }
-    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw commandError("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
+    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an object"); }
+    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw refuse("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
     function requiredIdentifier(value, name) { let id = ""; try { id = value == null ? "" : String(typeof value.toString === "function" ? value.toString() : value); } catch (_) { id = ""; } if (!id || id.length > 512 || id.indexOf("\u0000") !== -1) throw commandError("UXP_VERIFICATION_FAILED", name + " is unavailable or invalid"); return id; }
+    // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+    function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
     function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
 
     return definitions;

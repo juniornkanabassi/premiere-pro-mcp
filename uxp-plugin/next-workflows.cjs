@@ -432,7 +432,7 @@
     async function waitForOperation(args) {
       assertOnlyKeys(args, ["operationType", "afterRevision", "timeoutMs"]);
       if (args.afterRevision == null) {
-        throw commandError("UXP_INVALID_ARGUMENT", "afterRevision from a pre-dispatch readiness snapshot is required");
+        throw refuse("UXP_INVALID_ARGUMENT", "afterRevision from a pre-dispatch readiness snapshot is required");
       }
       const operationType = optionalToken(args.operationType, "operationType");
       const names = {
@@ -441,7 +441,7 @@
         effectDrop: "operation.effect.drop.complete",
         generativeExtend: "operation.generative.extend.complete"
       };
-      if (!names[operationType]) throw commandError("UXP_INVALID_ARGUMENT", "operationType is not supported");
+      if (!names[operationType]) throw refuse("UXP_INVALID_ARGUMENT", "operationType is not supported");
       const result = await events.wait({
         afterRevision: integer(args.afterRevision, "afterRevision", 0, Number.MAX_SAFE_INTEGER),
         categories: ["operation"],
@@ -532,7 +532,7 @@
       assertOnlyKeys(args, ["projectId", "expectedPath", "paths", "confirmExternalWrite", "confirmOverwrite", "operationId"]);
       requireConfirmation(args.confirmExternalWrite, "confirmExternalWrite", "Branch copies write, close, and reopen project files");
       if (!Array.isArray(args.paths) || !args.paths.length || args.paths.length > 16) {
-        throw commandError("UXP_INVALID_ARGUMENT", "paths must contain 1-16 project paths");
+        throw refuse("UXP_INVALID_ARGUMENT", "paths must contain 1-16 project paths");
       }
       let project = await targetProject(args.projectId);
       const sourcePath = await allowedWorkspacePath(args.expectedPath == null ? project.path : args.expectedPath, "expectedPath");
@@ -541,7 +541,7 @@
       for (let i = 0; i < args.paths.length; i += 1) {
         const path = await allowedWorkspacePath(args.paths[i], "paths[" + i + "]");
         if (samePath(path, sourcePath) || paths.some(function (item) { return samePath(item, path); })) {
-          throw commandError("UXP_INVALID_ARGUMENT", "Branch paths must be distinct from the source and each other");
+          throw refuse("UXP_INVALID_ARGUMENT", "Branch paths must be distinct from the source and each other");
         }
         await rejectExistingProject(path, args.confirmOverwrite);
         paths.push(path);
@@ -705,7 +705,7 @@
 
     async function checkpointContext(args) {
       const owner = args.owner == null ? "project" : args.owner;
-      if (owner !== "project" && owner !== "sequence") throw commandError("UXP_INVALID_ARGUMENT", "owner must be project or sequence");
+      if (owner !== "project" && owner !== "sequence") throw refuse("UXP_INVALID_ARGUMENT", "owner must be project or sequence");
       const project = await activeProject(true);
       const target = owner === "project" ? project : await resolveSequence(project, args.sequenceId, true);
       const ownerId = guidString(target.guid);
@@ -722,14 +722,14 @@
 
     function checkpointName(value) {
       if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) || value.indexOf("premiereMcp.") === 0) {
-        throw commandError("UXP_INVALID_ARGUMENT", "name must be a 1-96 character unprefixed checkpoint token");
+        throw refuse("UXP_INVALID_ARGUMENT", "name must be a 1-96 character unprefixed checkpoint token");
       }
       return value;
     }
 
     function checkpointValueType(value) {
       if (value !== "string" && value !== "int" && value !== "float" && value !== "bool") {
-        throw commandError("UXP_INVALID_ARGUMENT", "valueType must be string, int, float, or bool");
+        throw refuse("UXP_INVALID_ARGUMENT", "valueType must be string, int, float, or bool");
       }
       return value;
     }
@@ -737,24 +737,24 @@
     function checkpointValue(value, valueType) {
       if (valueType === "string") {
         if (typeof value !== "string" || value.length > 8192 || value.indexOf("\0") !== -1) {
-          throw commandError("UXP_INVALID_ARGUMENT", "string checkpoint values must be at most 8192 characters and contain no NUL");
+          throw refuse("UXP_INVALID_ARGUMENT", "string checkpoint values must be at most 8192 characters and contain no NUL");
         }
         return value;
       }
       if (valueType === "bool") {
-        if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "bool checkpoint values must be boolean");
+        if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "bool checkpoint values must be boolean");
         return value;
       }
-      if (typeof value !== "number" || !Number.isFinite(value)) throw commandError("UXP_INVALID_ARGUMENT", valueType + " checkpoint values must be finite numbers");
+      if (typeof value !== "number" || !Number.isFinite(value)) throw refuse("UXP_INVALID_ARGUMENT", valueType + " checkpoint values must be finite numbers");
       if (valueType === "int" && (!Number.isSafeInteger(value) || Math.abs(value) > 2147483647)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "int checkpoint values must be 32-bit safe integers");
+        throw refuse("UXP_INVALID_ARGUMENT", "int checkpoint values must be 32-bit safe integers");
       }
       return value;
     }
 
     function checkpointPersistence(value) {
       const name = value == null ? "session" : value;
-      if (name !== "session" && name !== "persistent") throw commandError("UXP_INVALID_ARGUMENT", "persistence must be session or persistent");
+      if (name !== "session" && name !== "persistent") throw refuse("UXP_INVALID_ARGUMENT", "persistence must be session or persistent");
       const constants = ppro.Constants && ppro.Constants.PropertyType || {};
       const persistent = ppro.Properties.PROPERTY_PERSISTENT != null ? ppro.Properties.PROPERTY_PERSISTENT : constants.PERSISTENT;
       const nonPersistent = ppro.Properties.PROPERTY_NON_PERSISTENT != null ? ppro.Properties.PROPERTY_NON_PERSISTENT : constants.NON_PERSISTENT;
@@ -883,7 +883,7 @@
       assertOnlyKeys(args, ["projectItemId", "matchPath", "ignoreSubclips", "includePaths"]);
       const project = await activeProject(true);
       const clips = await resolveMediaHealthClips(project, args.projectItemId == null ? null : [args.projectItemId]);
-      if (clips.length !== 1) throw commandError("UXP_INVALID_ARGUMENT", "find_by_media_path requires exactly one seed media item");
+      if (clips.length !== 1) throw refuse("UXP_INVALID_ARGUMENT", "find_by_media_path requires exactly one seed media item");
       const matchPath = await allowedWorkspacePath(args.matchPath, "matchPath");
       if (typeof clips[0].findItemsMatchingMediaPath !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "This media item cannot search project media paths");
@@ -1104,7 +1104,7 @@
 
     function requiredSourceMediaOverrides(value, name) {
       if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be an inspect snapshot object");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be an inspect snapshot object");
       }
       assertOnlyKeys(value, ["projectGuid", "frameRate", "pixelAspectRatio"]);
       return {
@@ -1120,7 +1120,7 @@
       if (args.pixelAspectRatio != null) {
         const value = args.pixelAspectRatio;
         if (!value || typeof value !== "object" || Array.isArray(value)) {
-          throw commandError("UXP_INVALID_ARGUMENT", "pixelAspectRatio must be a ratio object");
+          throw refuse("UXP_INVALID_ARGUMENT", "pixelAspectRatio must be a ratio object");
         }
         assertOnlyKeys(value, ["numerator", "denominator"]);
         pixelAspectRatio = {
@@ -1130,7 +1130,7 @@
         boundedPixelAspectRatio(pixelAspectRatio.numerator / pixelAspectRatio.denominator, "pixelAspectRatio");
       }
       if (frameRate == null && pixelAspectRatio == null) {
-        throw commandError("UXP_INVALID_ARGUMENT", "Provide frameRate and/or pixelAspectRatio to update");
+        throw refuse("UXP_INVALID_ARGUMENT", "Provide frameRate and/or pixelAspectRatio to update");
       }
       return { frameRate, pixelAspectRatio };
     }
@@ -1138,7 +1138,7 @@
     function boundedSourceFrameRate(value, name) {
       const number = Number(value);
       if (!Number.isFinite(number) || number < 1 || number > 240) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be between 1 and 240 frames per second");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be between 1 and 240 frames per second");
       }
       return number;
     }
@@ -1146,7 +1146,7 @@
     function boundedPixelAspectRatio(value, name) {
       const number = Number(value);
       if (!Number.isFinite(number) || number < 0.01 || number > 100) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be between 0.01 and 100");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be between 0.01 and 100");
       }
       return number;
     }
@@ -1214,7 +1214,7 @@
 
     function requiredSourceMediaTiming(value, name) {
       if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be an inspect snapshot object");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be an inspect snapshot object");
       }
       assertOnlyKeys(value, ["startSeconds", "durationSeconds"]);
       return {
@@ -1230,20 +1230,20 @@
     async function resolveMediaHealthClips(project, projectItemIds) {
       if (projectItemIds == null) {
         if (!ppro.ProjectUtils || typeof ppro.ProjectUtils.getSelection !== "function") {
-          throw commandError("UXP_INVALID_ARGUMENT", "projectItemIds are required because Project-panel selection is unavailable");
+          throw refuse("UXP_INVALID_ARGUMENT", "projectItemIds are required because Project-panel selection is unavailable");
         }
         const selection = await ppro.ProjectUtils.getSelection(project);
         const selected = selection && Array.from(await selection.getItems() || []);
         if (!selected || !selected.length || selected.length > 64) {
-          throw commandError("UXP_INVALID_ARGUMENT", "Select 1-64 media items or pass projectItemIds");
+          throw refuse("UXP_INVALID_ARGUMENT", "Select 1-64 media items or pass projectItemIds");
         }
         return selected.map(castMediaClip);
       }
       if (!Array.isArray(projectItemIds) || !projectItemIds.length || projectItemIds.length > 64) {
-        throw commandError("UXP_INVALID_ARGUMENT", "projectItemIds must contain 1-64 identifiers");
+        throw refuse("UXP_INVALID_ARGUMENT", "projectItemIds must contain 1-64 identifiers");
       }
       const wanted = projectItemIds.map(function (value, index) { return boundedIdentifier(value, "projectItemIds[" + index + "]"); });
-      if (new Set(wanted).size !== wanted.length) throw commandError("UXP_INVALID_ARGUMENT", "projectItemIds must be unique");
+      if (new Set(wanted).size !== wanted.length) throw refuse("UXP_INVALID_ARGUMENT", "projectItemIds must be unique");
       const found = new Map(), queue = [await project.getRootItem()];
       let visited = 0;
       while (queue.length && found.size < wanted.length) {
@@ -1371,7 +1371,7 @@
       }
       const mediaType = trackMediaType(args.mediaType, true);
       if (mediaType === "all" && args.trackIndices != null) {
-        throw commandError("UXP_INVALID_ARGUMENT", "trackIndices require one explicit mediaType");
+        throw refuse("UXP_INVALID_ARGUMENT", "trackIndices require one explicit mediaType");
       }
       const mediaTypes = mediaType === "all" ? ["video", "audio", "caption"] : [mediaType];
       const tracks = [];
@@ -1392,21 +1392,21 @@
       const project = await activeProject(true), sequence = await resolveSequence(project, args.sequenceId, true);
       const sequenceId = guidString(sequence.guid);
       if (args.expectedSequenceId != null && optionalToken(args.expectedSequenceId, "expectedSequenceId") !== sequenceId) {
-        throw commandError("UXP_STALE_TARGET", "The target sequence changed before track mutation");
+        throw refuse("UXP_STALE_TARGET", "The target sequence changed before track mutation");
       }
       const mediaType = trackMediaType(args.mediaType, false);
-      if (typeof args.muted !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "muted must be a boolean");
+      if (typeof args.muted !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "muted must be a boolean");
       const expectedMuted = optionalExpectedBoolean(args.expectedMuted, "expectedMuted");
       const indices = await requestedTrackIndices(sequence, mediaType, args.trackIndices, true);
       const targets = [];
       for (let i = 0; i < indices.length; i += 1) {
         const track = await trackAt(sequence, mediaType, indices[i]);
         if (typeof track.setMute !== "function" || typeof track.isMuted !== "function") {
-          throw commandError("UXP_COMMAND_UNAVAILABLE", "A target track cannot report and set mute state");
+          throw refuse("UXP_COMMAND_UNAVAILABLE", "A target track cannot report and set mute state");
         }
         const beforeMuted = !!(await track.isMuted());
         if (expectedMuted != null && beforeMuted !== expectedMuted) {
-          throw commandError("UXP_STALE_TARGET", "A target track changed mute state before dispatch");
+          throw refuse("UXP_STALE_TARGET", "A target track changed mute state before dispatch");
         }
         targets.push({ track, trackIndex: indices[i], beforeMuted });
       }
@@ -1446,31 +1446,31 @@
     function trackMediaType(value, allowAll) {
       const result = value == null ? (allowAll ? "all" : null) : value;
       if (result === "video" || result === "audio" || result === "caption" || (allowAll && result === "all")) return result;
-      throw commandError("UXP_INVALID_ARGUMENT", "mediaType must be " + (allowAll ? "all, " : "") + "video, audio, or caption");
+      throw refuse("UXP_INVALID_ARGUMENT", "mediaType must be " + (allowAll ? "all, " : "") + "video, audio, or caption");
     }
 
     async function requestedTrackIndices(sequence, mediaType, values, required) {
       const countMethod = { video: "getVideoTrackCount", audio: "getAudioTrackCount", caption: "getCaptionTrackCount" }[mediaType];
       const count = Number(await sequence[countMethod]());
-      if (!Number.isInteger(count) || count < 0 || count > 1024) throw commandError("UXP_PROJECT_TOO_LARGE", "Track count is invalid or exceeds 1024");
+      if (!Number.isInteger(count) || count < 0 || count > 1024) throw refuse("UXP_PROJECT_TOO_LARGE", "Track count is invalid or exceeds 1024");
       if (values == null) {
-        if (required) throw commandError("UXP_INVALID_ARGUMENT", "trackIndices are required for set");
-        if (count > 64) throw commandError("UXP_PROJECT_TOO_LARGE", "Inspecting all tracks exceeds the 64-track response cap");
+        if (required) throw refuse("UXP_INVALID_ARGUMENT", "trackIndices are required for set");
+        if (count > 64) throw refuse("UXP_PROJECT_TOO_LARGE", "Inspecting all tracks exceeds the 64-track response cap");
         return Array.from({ length: count }, function (_, index) { return index; });
       }
       if (!Array.isArray(values) || !values.length || values.length > 64) {
-        throw commandError("UXP_INVALID_ARGUMENT", "trackIndices must contain 1-64 indices");
+        throw refuse("UXP_INVALID_ARGUMENT", "trackIndices must contain 1-64 indices");
       }
       const indices = values.map(function (value, index) { return integer(value, "trackIndices[" + index + "]", 0, Math.max(0, count - 1)); });
-      if (new Set(indices).size !== indices.length) throw commandError("UXP_INVALID_ARGUMENT", "trackIndices must be unique");
+      if (new Set(indices).size !== indices.length) throw refuse("UXP_INVALID_ARGUMENT", "trackIndices must be unique");
       return indices;
     }
 
     async function trackAt(sequence, mediaType, index) {
       const method = { video: "getVideoTrack", audio: "getAudioTrack", caption: "getCaptionTrack" }[mediaType];
-      if (typeof sequence[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "This sequence cannot access " + mediaType + " tracks");
+      if (typeof sequence[method] !== "function") throw refuse("UXP_COMMAND_UNAVAILABLE", "This sequence cannot access " + mediaType + " tracks");
       const track = await sequence[method](index);
-      if (!track) throw commandError("UXP_TARGET_NOT_FOUND", "Track index was not found");
+      if (!track) throw refuse("UXP_TARGET_NOT_FOUND", "Track index was not found");
       return track;
     }
 
@@ -1571,20 +1571,20 @@
 
     function validateSourceClipItems(value, mutation) {
       if (!Array.isArray(value) || !value.length || value.length > 64) {
-        throw commandError("UXP_INVALID_ARGUMENT", "items must contain 1-64 source clips");
+        throw refuse("UXP_INVALID_ARGUMENT", "items must contain 1-64 source clips");
       }
       const ids = new Set();
       return value.map(function (item, index) {
-        if (!item || typeof item !== "object" || Array.isArray(item)) throw commandError("UXP_INVALID_ARGUMENT", "items[" + index + "] must be an object");
+        if (!item || typeof item !== "object" || Array.isArray(item)) throw refuse("UXP_INVALID_ARGUMENT", "items[" + index + "] must be an object");
         const allowed = mutation
           ? ["projectItemId", "mediaType", "expectedInSeconds", "expectedOutSeconds", "inSeconds", "outSeconds", "clearInOut", "scaleToFrame"]
           : ["projectItemId", "mediaType"];
         assertOnlyKeys(item, allowed);
         const projectItemId = boundedIdentifier(item.projectItemId, "items[" + index + "].projectItemId");
-        if (ids.has(projectItemId)) throw commandError("UXP_INVALID_ARGUMENT", "Each projectItemId may appear only once per transaction");
+        if (ids.has(projectItemId)) throw refuse("UXP_INVALID_ARGUMENT", "Each projectItemId may appear only once per transaction");
         ids.add(projectItemId);
         const mediaType = item.mediaType == null ? "video" : item.mediaType;
-        if (mediaType !== "video" && mediaType !== "audio") throw commandError("UXP_INVALID_ARGUMENT", "mediaType must be video or audio");
+        if (mediaType !== "video" && mediaType !== "audio") throw refuse("UXP_INVALID_ARGUMENT", "mediaType must be video or audio");
         const result = { projectItemId, mediaType };
         if (!mutation) return result;
         const numberKeys = ["expectedInSeconds", "expectedOutSeconds", "inSeconds", "outSeconds"];
@@ -1594,15 +1594,15 @@
         }
         result.clearInOut = optionalBoolean(item.clearInOut, false, "items[" + index + "].clearInOut");
         result.scaleToFrame = optionalBoolean(item.scaleToFrame, false, "items[" + index + "].scaleToFrame");
-        if (item.scaleToFrame === false) throw commandError("UXP_INVALID_ARGUMENT", "scaleToFrame supports only true because Adobe exposes only a set-true action");
+        if (item.scaleToFrame === false) throw refuse("UXP_INVALID_ARGUMENT", "scaleToFrame supports only true because Adobe exposes only a set-true action");
         if (result.clearInOut && (result.inSeconds != null || result.outSeconds != null)) {
-          throw commandError("UXP_INVALID_ARGUMENT", "clearInOut cannot be combined with new in/out points");
+          throw refuse("UXP_INVALID_ARGUMENT", "clearInOut cannot be combined with new in/out points");
         }
         if (result.inSeconds != null && result.outSeconds != null && result.outSeconds <= result.inSeconds) {
-          throw commandError("UXP_INVALID_ARGUMENT", "outSeconds must be greater than inSeconds");
+          throw refuse("UXP_INVALID_ARGUMENT", "outSeconds must be greater than inSeconds");
         }
         if (!result.clearInOut && !result.scaleToFrame && result.inSeconds == null && result.outSeconds == null) {
-          throw commandError("UXP_INVALID_ARGUMENT", "Each update item must request a trim, clear, or scale-to-frame action");
+          throw refuse("UXP_INVALID_ARGUMENT", "Each update item must request a trim, clear, or scale-to-frame action");
         }
         return result;
       });
@@ -1775,7 +1775,7 @@
       if (confirmation === true) return;
       const exists = await destinationFileExists(path);
       if (exists !== false) {
-        throw commandError("UXP_CONFIRMATION_REQUIRED", exists === true
+        throw refuse("UXP_CONFIRMATION_REQUIRED", exists === true
           ? "confirmOverwrite is required when the destination file already exists"
           : "Destination existence could not be verified; inspect the destination before confirming confirmOverwrite");
       }
@@ -1874,10 +1874,10 @@
 
   function tokenArray(value, name) {
     if (value == null) return [];
-    if (!Array.isArray(value) || value.length > 32) throw commandError("UXP_INVALID_ARGUMENT", name + " must contain at most 32 values");
+    if (!Array.isArray(value) || value.length > 32) throw refuse("UXP_INVALID_ARGUMENT", name + " must contain at most 32 values");
     return value.map(function (item) {
       if (typeof item !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(item)) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " contains an invalid token");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " contains an invalid token");
       }
       return item;
     });
@@ -1886,33 +1886,33 @@
   function integer(value, name, minimum, maximum) {
     const number = Number(value);
     if (!Number.isInteger(number) || number < minimum || number > maximum) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be an integer between " + minimum + " and " + maximum);
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer between " + minimum + " and " + maximum);
     }
     return number;
   }
 
   function optionalToken(value, name) {
     if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be a 1-128 character token");
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be a 1-128 character token");
     }
     return value;
   }
 
   function requireOperationId(value, name) {
-    if (value == null) throw commandError("UXP_INVALID_ARGUMENT", name + " is required for safe replay");
+    if (value == null) throw refuse("UXP_INVALID_ARGUMENT", name + " is required for safe replay");
     return optionalToken(value, name);
   }
 
   function requiredPath(value, name) {
     if (typeof value !== "string" || !value.trim() || value.length > 4096 || value.indexOf("\0") !== -1) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty absolute path of at most 4096 characters");
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty absolute path of at most 4096 characters");
     }
     return value;
   }
 
   function boundedIdentifier(value, name) {
     if (typeof value !== "string" || !value || value.length > 512 || value.indexOf("\0") !== -1) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty identifier of at most 512 characters");
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty identifier of at most 512 characters");
     }
     return value;
   }
@@ -1920,25 +1920,25 @@
   function boundedSeconds(value, name) {
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0 || number > 86400000) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be between 0 and 86400000 seconds");
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be between 0 and 86400000 seconds");
     }
     return number;
   }
 
   function optionalExpectedBoolean(value, name) {
     if (value == null) return null;
-    if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a boolean");
+    if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a boolean");
     return value;
   }
 
   function optionalBoolean(value, fallback, name) {
     if (value == null) return fallback;
-    if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a boolean");
+    if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a boolean");
     return value;
   }
 
   function requireConfirmation(value, name, reason) {
-    if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", name + " must be true. " + reason + ".");
+    if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", name + " must be true. " + reason + ".");
   }
 
   function guidString(value) {
@@ -1947,8 +1947,8 @@
   }
 
   function assertOnlyKeys(value, allowed) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", "arguments must be an object");
-    for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw commandError("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", "arguments must be an object");
+    for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw refuse("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key);
   }
 
   function commandError(code, message) {

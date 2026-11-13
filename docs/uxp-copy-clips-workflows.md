@@ -56,11 +56,19 @@ keeps what the original had.
    `createSetOutPointAction()` do the same thing again, so only one action per
    edge is used), and one moves each trimmed clone into place with
    `createMoveAction()`. The result's `undo_steps` says how many Premiere Undos
-   remove the copy: one for a copy with no trims, three otherwise.
+   remove the copy: one for a copy with no trims, three otherwise. At most 4
+   clones are parked per round (live 27.0: a round of 9 failed with "The script
+   object is no longer valid."), so a copy that trims more clips runs several
+   rounds of three transactions. Premiere's script objects die once a transaction
+   has committed or after a long run of reads, so every transaction reads its
+   clips again just before it uses them, and a step whose object died before the
+   transaction ran is tried once more on new objects.
 6. It reads back every copy (project item, exact start and end ticks, source
    in/out, enabled state) and checks that no clone was left at its parking
    position. A readback mismatch after a committed transaction is reported as
-   `committed_unverified` with the undo count, not success.
+   `committed_unverified` with the undo count, not success. When any clone may
+   still be parked, the receipt lists it in `parkedClones` (track, clip index,
+   project item and exact ticks) so it can be removed.
 
 Transitions and the link between a clip's picture and sound are not copied.
 

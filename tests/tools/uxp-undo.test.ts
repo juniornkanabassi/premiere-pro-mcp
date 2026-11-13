@@ -50,6 +50,29 @@ describe("MCP-side undo stack: recording", () => {
     expect(entries.every((entry) => entry.invertible === false)).toBe(true);
   });
 
+  it("says a verified edit that cannot be undone cannot be reversed automatically, not that it was unverified (live: ripple delete, duplicate)", async () => {
+    // These receipts carry outcome "verified" and no `verified` field.
+    const { observed, list, tools } = setup({
+      "trackItem.rippleDelete": { rippleDeleted: true, outcome: "verified" },
+      "trackItem.clone": { cloned: true, outcome: "verified" },
+      "timeline.range.extract": { extracted: true, verified: true, outcome: "verified" },
+      "some.newCommand": { ok: true, outcome: "verified" },
+      "markers.add": { outcome: "committed_unverified" },
+    });
+    for (const command of ["markers.add", "trackItem.rippleDelete", "trackItem.clone", "timeline.range.extract", "some.newCommand"]) await observed.request(command, {});
+    const reasons = Object.fromEntries((await list()).map((entry) => [entry.command, entry.reason]));
+    expect(reasons["trackItem.rippleDelete"]).toContain("cannot be reversed automatically");
+    expect(reasons["trackItem.clone"]).toContain("cannot be reversed automatically");
+    expect(reasons["timeline.range.extract"]).toContain("cannot be reversed automatically");
+    expect(reasons["some.newCommand"]).toBe("some.newCommand cannot be reversed automatically in this build.");
+    for (const command of ["trackItem.rippleDelete", "trackItem.clone", "timeline.range.extract", "some.newCommand"]) expect(reasons[command]).not.toContain("did not report a verified result");
+    // An edit that really did not verify keeps the old wording.
+    expect(reasons["markers.add"]).toContain("did not report a verified result");
+    const refused: any = await tools.undo_last_edit_uxp.handler({});
+    expect(refused.error).toContain("cannot be reversed automatically");
+    expect(refused.error).not.toContain("did not report a verified result");
+  });
+
   it("records a razor across all tracks as not undoable and a single-clip razor as undoable", async () => {
     const { observed, list } = setup({ "trackItem.razor": razorReceipt });
     await observed.request("trackItem.razor", { allTracks: true, timeSeconds: 4 });

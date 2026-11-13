@@ -23,6 +23,13 @@ type HostOptions = {
   reverseOrder?: boolean;
   /** A move onto occupied space trims or removes the neighbour it lands on, as an overwrite would. */
   overwriteOnMove?: boolean;
+  /**
+   * Item objects die like Premiere's ("The script object is no longer valid."): once any transaction has
+   * committed since they were fetched, once a lockedAccess that used them has ended, or (with staleAfterCalls)
+   * after that many further host calls.
+   */
+  strictHandles?: boolean;
+  staleAfterCalls?: number;
 };
 
 /**
@@ -38,6 +45,9 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   const firstSnapshot = new Promise<void>((resolve) => { pauseStarted = resolve; });
   const selections: Array<{ dead: boolean; items: Item[] }> = [];
   const lists: Record<Kind, Item[][]> = { video: [], audio: [] };
+  let generation = 0, hostCalls = 0;
+  let usedInLock: Array<() => void> = [];
+  const dieAfterLock = () => { for (const kill of usedInLock) kill(); usedInLock = []; };
 
   function inLock() { if (!locked) throw new Error("A nullptr was dereferenced: action created outside lockedAccess"); }
   function shift(state: State, field: "start" | "end" | "inPoint" | "outPoint", ticks: bigint) { state[field] = String(BigInt(state[field]) + ticks); }
@@ -84,7 +94,31 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   video.forEach((track, index) => lists.video.push(track.map((state) => makeItem(state, "video", index))));
   audio.forEach((track, index) => lists.audio.push(track.map((state) => makeItem(state, "audio", index))));
   const sorted = (list: Item[]) => [...list].sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)));
-  const served = (list: Item[]) => options.reverseOrder ? sorted(list).reverse() : sorted(list);
+  const unwrap = (value: Item): Item => (value as unknown as { __item?: Item }).__item ?? value;
+  /** A fetched handle: same item, but invalid once the host would have invalidated it. */
+  function view(item: Item): Item {
+    if (!options.strictHandles) return item;
+    const born = { generation, hostCalls };
+    let dead = false;
+    const check = () => {
+      if (dead || born.generation !== generation || (options.staleAfterCalls != null && hostCalls - born.hostCalls > options.staleAfterCalls)) throw new Error("The script object is no longer valid.");
+    };
+    const proxy: Item = new Proxy(item, {
+      get(target, property) {
+        if (property === "__item") return target;
+        if (property === "__touch") return () => { check(); if (locked) usedInLock.push(() => { dead = true; }); };
+        const value = (target as unknown as Record<string | symbol, unknown>)[property];
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          check(); hostCalls++;
+          if (locked && String(property).startsWith("create")) usedInLock.push(() => { dead = true; });
+          return (value as (...a: unknown[]) => unknown)(...args);
+        };
+      },
+    });
+    return proxy;
+  }
+  const served = (list: Item[]) => (options.reverseOrder ? sorted(list).reverse() : sorted(list)).map(view);
   const sequence = {
     guid: "sequence-1",
     getTimebase: vi.fn(async () => String(FRAME)),
@@ -95,6 +129,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   };
   const cloneAction = vi.fn((source: Item, offset: { ticks: string }, videoOffset: number, audioOffset: number, alignToVideo: boolean, isInsert: boolean) => {
     inLock();
+    (source as unknown as { __touch?: () => void }).__touch?.();
     expect([videoOffset, audioOffset, alignToVideo, isInsert]).toEqual([0, 0, false, false]);
     return { apply: () => {
       const copy = makeItem({ ...source.state, start: String(BigInt(source.state.start) + BigInt(offset.ticks)), end: String(BigInt(source.state.end) + BigInt(offset.ticks)) }, source.kind, source.trackIndex);
@@ -118,9 +153,9 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     getActiveSequence: vi.fn(async () => sequence),
     lockedAccess: vi.fn((callback: () => void) => {
       locked = true;
-      try { callback(); } finally { locked = false; for (const selection of selections) selection.dead = true; }
+      try { callback(); } finally { locked = false; for (const selection of selections) selection.dead = true; dieAfterLock(); }
     }),
-    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; return true; }),
   };
   const ppro = {
     Project: { getActiveProject: vi.fn(async () => project) },
@@ -129,7 +164,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     TrackItemSelection: {
       createEmptySelection: vi.fn((callback: (selection: unknown) => void) => {
         inLock();
-        const selection = { dead: false, items: [] as Item[], addItem: (item: Item) => { if (!locked) return false; selection.items.push(item); return true; } };
+        const selection = { dead: false, items: [] as Item[], addItem: (item: Item) => { if (!locked) return false; (item as unknown as { __touch?: () => void }).__touch?.(); selection.items.push(unwrap(item)); return true; } };
         selections.push(selection);
         callback(selection);
         return true;
@@ -431,6 +466,45 @@ describe("trackItem.razor", () => {
     const value = timelineHost([[clip("a", 0, 10, 0)]], [], { ignoreSetStart: true });
     const result = await razor(value, { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4 }, "rz-9");
     expect(result).toMatchObject({ razored: false, committed: true, verified: false, outcome: "committed_unverified", undoSteps: 2, readbackError: expect.stringContaining("parking position") });
+    // The clone left past the end is named, so it can be removed.
+    expect(result).toMatchObject({ parkedClones: [{ mediaType: "video", trackIndex: 0, clipIndex: 1, projectItemId: "a", startSeconds: 20, endSeconds: 30 }] });
+    expect((result as { nextStep: string }).nextStep).toContain("still parked past the end");
+  });
+
+  it("a razor whose move back is ignored lists the right half that stayed parked", async () => {
+    const value = timelineHost([[clip("a", 0, 10, 0)]], [], { ignoreMoves: true });
+    const result = await razor(value, { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4 }, "rz-11");
+    // The move is ignored, so the right half stays parked: the readback problem lists it.
+    expect(result).toMatchObject({ outcome: "committed_unverified", parkedClones: [expect.objectContaining({ projectItemId: "a" })] });
+  });
+
+  describe("host objects that die (live 27.0: \"The script object is no longer valid.\")", () => {
+    it("razors 9 tracks in rounds of 4 with every item read again just before it is used", async () => {
+      const video = [0, 1, 2, 3, 4].map((n) => [clip(`v${n}`, 0, 10, n)]);
+      const audio = [0, 1, 2, 3].map((n) => [clip(`a${n}`, 0, 10, n)]);
+      const value = timelineHost(video, audio, { strictHandles: true });
+      const result = await razor(value, { allTracks: true, timeSeconds: 4 }, "rz-12");
+      expect(result).toMatchObject({ razored: true, verified: true, outcome: "verified", undoSteps: 9 });
+      for (const [kind, count] of [["video", 5], ["audio", 4]] as Array<[Kind, number]>) {
+        for (let n = 0; n < count; n++) expect(value.track(kind, n)).toEqual([[0, 4, n], [4, 10, n + 4]]);
+      }
+    });
+
+    it("tries once more on new objects when one died before the transaction ran", async () => {
+      const value = timelineHost([[clip("a", 0, 10, 0)]], [], { strictHandles: true });
+      const first = value.lists.video[0]![0]!;
+      first.createSetEndAction.mockImplementationOnce((() => { throw new Error("The script object is no longer valid."); }) as never);
+      await expect(razor(value, { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4 }, "rz-13")).resolves.toMatchObject({ razored: true, outcome: "verified", undoSteps: 3 });
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(3);
+      expect(value.track("video", 0)).toEqual([[0, 4, 0], [4, 10, 4]]);
+    });
+
+    it("does not retry once the transaction itself has failed", async () => {
+      const value = timelineHost([[clip("a", 0, 10, 0)]]);
+      value.project.executeTransaction.mockImplementationOnce((() => { throw new Error("The script object is no longer valid."); }) as never);
+      await expect(razor(value, { mediaType: "video", trackIndex: 0, clipIndex: 0, timeSeconds: 4 }, "rz-14")).rejects.toThrow("no longer valid");
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("returns committed_unverified after the first transaction when a later step cannot find the clone", async () => {
@@ -532,6 +606,41 @@ describe("timeline.range.extract", () => {
       await expect(extract(value, args, id)).rejects.toMatchObject({ code, noHostWrite: true });
       expect(value.project.executeTransaction).not.toHaveBeenCalled();
     }
+  });
+
+  describe("on every track of a large timeline, with host objects that die", () => {
+    // 6 video and 6 audio tracks of 30 ten second clips each. A host object dies after 400 further host calls
+    // (one whole-track read is about 200) or once a transaction has committed, as Premiere 27.0 did.
+    const big = () => {
+      const track = (name: string) => Array.from({ length: 30 }, (_, i) => clip(`${name}-${i}`, i * 10, i * 10 + 10, i));
+      return timelineHost([0, 1, 2, 3, 4, 5].map((n) => track(`v${n}`)), [0, 1, 2, 3, 4, 5].map((n) => track(`a${n}`)), { strictHandles: true, staleAfterCalls: 400 });
+    };
+    it("cuts the range out of all 12 tracks and closes the gap", async () => {
+      const value = big();
+      const result = await extract(value, { startSeconds: 45, endSeconds: 65 }, "ex-big");
+      expect(result).toMatchObject({ extracted: true, verified: true, outcome: "verified", tracks: 12, removedSeconds: 20 });
+      for (const [kind, n] of [["video", 0], ["video", 5], ["audio", 0], ["audio", 5]] as Array<[Kind, number]>) {
+        const rows = value.track(kind, n);
+        // 30 clips, 2 cut in two, 3 pieces inside the range gone.
+        expect(rows).toHaveLength(29);
+        expect(rows.slice(0, 5)).toEqual([[0, 10, 0], [10, 20, 1], [20, 30, 2], [30, 40, 3], [40, 45, 4]]);
+        // The right piece of clip 6 (source 11 s onward) now starts at 45 s, and the last clip sits 20 s earlier.
+        expect(rows[5]).toEqual([45, 50, 11]);
+        expect(rows[28]).toEqual([270, 280, 29]);
+      }
+    });
+
+    it("lists exactly the clones left parked when a later step fails", async () => {
+      const value = big();
+      const real = value.project.executeTransaction.getMockImplementation()!;
+      // The trim step is not committed, so the first round's 4 clones stay parked past the end.
+      value.project.executeTransaction.mockImplementation(((callback: never, label: string) => String(label).includes("(trim)") ? false : real(callback, label)) as never);
+      const result = await extract(value, { startSeconds: 45, endSeconds: 65 }, "ex-dead");
+      expect(result).toMatchObject({ extracted: false, committed: true, outcome: "committed_unverified", undoSteps: 1 });
+      const parked = (result as unknown as { parkedClones: Array<{ trackIndex: number; startSeconds: number }> }).parkedClones;
+      expect(parked).toHaveLength(4);
+      for (const clone of parked) expect(clone.startSeconds).toBeGreaterThan(300);
+    });
   });
 
   it("reports committed_unverified with the Undo count when the closing moves do not land", async () => {

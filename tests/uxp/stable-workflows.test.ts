@@ -17,6 +17,12 @@ async function acknowledgeReviewedRefusal(value: { registry: { dispatch: (...arg
   await expect(value.registry.dispatch("operations.recovery.acknowledge", { expectedRecoveryRevision: recovery.recoveryRevision, expectedIdentityRevision: recovery.identityRevision, operationIds, reviewed: true })).resolves.toMatchObject({ acknowledged: true, replayAuthorized: false, reconciledOperationIds: operationIds, recoveryRequired: false });
 }
 
+// An argument refusal thrown before any host write (noHostWrite) releases its operation ID and leaves no fence.
+async function expectNoFence(value: { registry: { dispatch: (...args: any[]) => Promise<any> } }) {
+  const recovery = await value.registry.dispatch("operations.recovery.inspect", {});
+  expect(recovery.recoveryRequired).toBe(false);
+}
+
 const PREMIERE_METADATA_NS = "http://ns.adobe.com/premierePrivateProjectMetaData/1.0/";
 const DC_NS = "http://purl.org/dc/elements/1.1/";
 const EXIF_NS = "http://ns.adobe.com/exif/1.0/";
@@ -889,24 +895,24 @@ describe("stable Premiere UXP workflow expansion", () => {
     await expect(invalid.registry.dispatch("selection.update", {
       mode: "replace", items: [target],
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(invalid);
+    await expectNoFence(invalid);
     await expect(invalid.registry.dispatch("selection.update", {
       mode: "clear", expectedSequenceGuid: "sequence-1", items: [target],
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(invalid);
+    await expectNoFence(invalid);
     await expect(invalid.registry.dispatch("selection.update", {
       mode: "clear", expectedSequenceGuid: "sequence-1", items: null,
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(invalid);
+    await expectNoFence(invalid);
     await expect(invalid.registry.dispatch("selection.update", {
       mode: "replace", expectedSequenceGuid: "sequence-1",
       items: [{ ...target, expectedStartSeconds: 21 }],
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(invalid);
+    await expectNoFence(invalid);
     await expect(invalid.registry.dispatch("selection.update", {
       mode: "replace", expectedSequenceGuid: "sequence-1", items: [target, target],
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(invalid);
+    await expectNoFence(invalid);
     await expect(invalid.registry.dispatch("selection.targets.inspect", {
       items: [
         { mediaType: "video", trackIndex: 0, clipIndex: 0 },
@@ -980,7 +986,7 @@ describe("stable Premiere UXP workflow expansion", () => {
     await expect(value.registry.dispatch("proxy.attach", {
       projectItemId: "source-1", mediaPath: "D:/Approved/proxy.mov",
     })).rejects.toMatchObject({ code: "UXP_CONFIRMATION_REQUIRED" });
-    await acknowledgeReviewedRefusal(value);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("proxy.attach", {
       projectItemId: "source-1", mediaPath: "D:/Approved/proxy.mov", confirmNonUndoable: true,
     })).resolves.toMatchObject({ attached: true, outcome: "verified", after: { hasProxy: true } });
@@ -1082,7 +1088,7 @@ describe("stable Premiere UXP workflow expansion", () => {
       name: "description",
       value: "Updated clip",
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(value);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("metadata.fields.update", {
       projectItemId: "source-1",
       packet: "xmp",
@@ -1159,7 +1165,7 @@ describe("stable Premiere UXP workflow expansion", () => {
       ...args, expectedProjectPanelMetadata: "<panel><column id=\"review\"/></panel>", projectPanelMetadata: "<panel/>",
       confirmUpdate: false, operationId: "panel-confirmation-1",
     })).rejects.toMatchObject({ code: "UXP_CONFIRMATION_REQUIRED" });
-    await acknowledgeReviewedRefusal(value, ["panel-confirmation-1"]);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("metadata.projectPanel.update", {
       ...args, expectedProjectPanelMetadata: "<panel><column id=\"review\"/></panel>", projectPanelMetadata: "<panel/>", confirmUpdate: true, operationId: "*",
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
@@ -1233,15 +1239,15 @@ describe("stable Premiere UXP workflow expansion", () => {
       ...args, fieldName: "McpPriority", expectedProjectPanelMetadata: "panel-before|schema:McpReviewState:MCP Review State:3",
       confirmCreate: false, operationId: "schema-confirmation-1",
     })).rejects.toMatchObject({ code: "UXP_CONFIRMATION_REQUIRED" });
-    await acknowledgeReviewedRefusal(value, ["schema-confirmation-1"]);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("metadata.projectSchema.create", {
       ...args, fieldName: "9-invalid", expectedProjectPanelMetadata: "panel-before|schema:McpReviewState:MCP Review State:3", operationId: "schema-invalid-name-1",
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(value, ["schema-invalid-name-1"]);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("metadata.projectSchema.create", {
       ...args, fieldName: "McpPriority", fieldType: "date", expectedProjectPanelMetadata: "panel-before|schema:McpReviewState:MCP Review State:3", operationId: "schema-invalid-type-1",
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
-    await acknowledgeReviewedRefusal(value, ["schema-invalid-type-1"]);
+    await expectNoFence(value);
     await expect(value.registry.dispatch("metadata.projectSchema.create", {
       ...args, fieldName: "McpPriority", expectedProjectPanelMetadata: "panel-before|schema:McpReviewState:MCP Review State:3", operationId: "*",
     })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });

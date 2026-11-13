@@ -1354,6 +1354,15 @@ describe("advanced stable Premiere UXP workflows", () => {
     expect(concurrent.project.executeTransaction).toHaveBeenCalledTimes(1);
   });
 
+  it("refuses an overwrite with no audio track before any write and leaves no recovery fence (live 27.0 fenced the bridge)", async () => {
+    const value = advancedHost();
+    await expect(value.registry.dispatch("timeline.overwrite", {
+      projectItemId: "clip-1", timeSeconds: 5, videoTrackIndex: 0, operationId: "ow-no-audio",
+    })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true, message: "audioTrackIndex must be a non-negative integer" });
+    expect(value.project.executeTransaction).not.toHaveBeenCalled();
+    await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+  });
+
   it("verifies relative track moves while keeping SequenceEditor transaction limits explicit", async () => {
     const value = advancedHost();
     await expect(value.registry.dispatch("trackItem.update", {
@@ -1894,6 +1903,32 @@ describe("advanced stable Premiere UXP workflows", () => {
       .rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
     expect(value.sequence.createCloneAction).not.toHaveBeenCalled();
     expect(second.sequence.createSubsequence).not.toHaveBeenCalled();
+  });
+
+  it("renames a clone through its Project item and reads the name back", async () => {
+    const value = advancedHost();
+    const clone = { guid: "sequence-2", name: "Assembly Copy" } as { guid: string; name: string; getProjectItem?: () => Promise<unknown> };
+    clone.getProjectItem = async () => ({ createSetNameAction: (name: string) => ({ apply: () => { clone.name = name; } }) });
+    value.sequence.createCloneAction.mockImplementation(() => ({ apply: () => value.sequences.push(clone) }));
+    await expect(value.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", name: "Assembly v2", operationId: "clone-named" })).resolves.toMatchObject({
+      cloned: true, outcome: "verified", verified: true, requestedName: "Assembly v2", nameApplied: true,
+      sequence: { id: "sequence-2", name: "Assembly v2" }, verificationBoundary: "sequence_identity_and_name_readback",
+    });
+  });
+
+  it("reports an unapplied clone name as committed_unverified instead of claiming it", async () => {
+    const value = advancedHost();
+    // The clone has no Project item to rename.
+    await expect(value.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", name: "Assembly v2", operationId: "clone-unnamed" })).resolves.toMatchObject({
+      cloned: true, outcome: "committed_unverified", verified: false, requestedName: "Assembly v2", nameApplied: false,
+      renameError: expect.stringContaining("rename action"), sequence: { id: "sequence-2", name: "Assembly Copy" },
+    });
+    // A clone without a name keeps its default and verifies on identity alone.
+    const plain = advancedHost();
+    await expect(plain.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", operationId: "clone-plain" })).resolves.toMatchObject({ outcome: "verified", sequence: { id: "sequence-2" } });
+    // A bad name is refused before anything is cloned.
+    await expect(plain.registry.dispatch("sequences.clone", { sequenceId: "sequence-1", name: "", operationId: "clone-bad" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    expect(plain.sequence.createCloneAction).toHaveBeenCalledTimes(1);
   });
 
   it("keeps direct sequence actions unverified with stable result keys and probes host methods", async () => {

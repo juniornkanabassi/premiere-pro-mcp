@@ -173,7 +173,7 @@ const timelineTargetProperties = {
 const timelinePositionProperties = {
   time_seconds: { type: "number", minimum: 0, maximum: 86400 },
   video_track_index: { type: "integer", minimum: 0 },
-  audio_track_index: { type: "integer", minimum: 0 },
+  audio_track_index: { type: "integer", minimum: 0, description: "Audio track for the clip's audio. Required by insert, overwrite and the MOGRT inserts: the panel refuses the call without it (nothing is written). It is where the clip's audio goes when the clip has any." },
 };
 
 export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
@@ -890,7 +890,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     edit_timeline_uxp: {
-      description: "Use the documented SequenceEditor to insert, overwrite, clone, remove, or insert MOGRT content without undocumented QE calls. MOGRT inserts act on the active sequence and read the placement back: verified when a returned item starts at time_seconds (within one frame) on the requested video track, failed when nothing is there.",
+      description: "Use the documented SequenceEditor to insert, overwrite, clone, remove, or insert MOGRT content without undocumented QE calls. MOGRT inserts act on the active sequence and read the placement back: verified when a returned item starts at time_seconds (within one frame) on the requested video track, failed when nothing is there. insert and overwrite need both video_track_index and audio_track_index: audio_track_index is not optional (the panel refuses the call without it, before writing anything), and it is where the clip's audio goes when the clip has any.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -952,7 +952,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     manage_sequences_uxp: {
-      description: "Inspect, create-from-media, clone, derive, activate, open, close, or explicitly delete sequences through documented stable UXP APIs. Each action accepts only its own parameters: inspect takes none and lists every sequence; clone/subsequence/activate/open/close/delete take sequence_id; create_from_media takes name and project_item_ids.",
+      description: "Inspect, create-from-media, clone, derive, activate, open, close, or explicitly delete sequences through documented stable UXP APIs. Each action accepts only its own parameters: inspect takes none and lists every sequence; clone/subsequence/activate/open/close/delete take sequence_id; create_from_media takes name and project_item_ids. clone also takes an optional name: the clone is renamed through its Project item and the new name is read back (nameApplied), so two clones need not share a title; without name the clone keeps Premiere's default name.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -995,7 +995,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
         const accepted: Record<string, readonly string[]> = {
           inspect: [],
           create_from_media: ["name", "project_item_ids", "target_bin_id", "confirm_non_undoable", "operation_id"],
-          clone: ["sequence_id", "operation_id"],
+          clone: ["sequence_id", "name", "operation_id"],
           subsequence: ["sequence_id", "ignore_track_targeting", "confirm_non_undoable", "operation_id"],
           activate: ["sequence_id", "operation_id"],
           open: ["sequence_id", "operation_id"],

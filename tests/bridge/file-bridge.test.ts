@@ -929,6 +929,66 @@ describe("sendCommand", () => {
     });
   });
 
+  it("withdraws an unclaimed edit when no connector is running and says so, without an unknown outcome (live: create_caption_track)", async () => {
+    vi.setSystemTime(new Date(10_000));
+    mockedExistsSync.mockImplementation((path) => {
+      const value = String(path);
+      if (value.includes("res_") || value.includes("busy_") || value.includes("bridge-heartbeat")) return false;
+      return true; // the cmd file stays in the queue: nobody claims it
+    });
+    mockedReaddirSync.mockReturnValue([]);
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700 } as unknown as ReturnType<typeof statSync>);
+
+    const promise = sendCommand("mutate", { tempDir: "/tmp/test-bridge", timeoutMs: 500, mutating: true });
+    await vi.advanceTimersByTimeAsync(600);
+    const result = await promise;
+
+    expect(result).toMatchObject({ success: false, data: { mutationOutcome: "not_applied", timelineChanged: false } });
+    expect(result.error).toContain("The CEP connector is not running in Premiere Pro");
+    expect(result.error).toContain("not run");
+    expect(result.error).not.toContain("outcome is unknown");
+    expect(mockedRenameSync).toHaveBeenCalledWith(expect.stringMatching(/cmd_.*\.jsx$/), expect.stringMatching(/cmd_.*\.jsx\.cancelled$/));
+  });
+
+  it.each([
+    ["stale", '{"protocolVersion":1,"state":"running"}', 1_000, "heartbeat is stale"],
+    ["waiting", '{"protocolVersion":1,"state":"waiting"}', 9_500, "not running"],
+  ])("fails an edit before publishing it when the connector heartbeat is %s, as not applied", async (_name, heartbeat, mtimeMs, text) => {
+    vi.setSystemTime(new Date(10_000));
+    mockedExistsSync.mockImplementation((path) => String(path).includes("bridge-heartbeat"));
+    mockedReadFileSync.mockReturnValue(heartbeat);
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700, mtimeMs } as unknown as ReturnType<typeof statSync>);
+
+    const result = await sendCommand("mutate", { tempDir: "/tmp/test-bridge", mutating: true });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining(text), data: { mutationOutcome: "not_applied", timelineChanged: false } });
+    expect(result.error).toContain("CEP connector");
+    expect(mockedRenameSync).not.toHaveBeenCalled();
+  });
+
+  it("treats a write tool call as an edit for the heartbeat check even when the tool sets no mutating flag", async () => {
+    // create_caption_track passes no flag; the server marks every write call through undo tracking.
+    vi.setSystemTime(new Date(10_000));
+    mockedExistsSync.mockImplementation((path) => String(path).includes("bridge-heartbeat"));
+    mockedReadFileSync.mockReturnValue('{"protocolVersion":1,"state":"running"}');
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700, mtimeMs: 1_000 } as unknown as ReturnType<typeof statSync>);
+
+    const result = await runWithUndoTracking(true, () => sendCommand("create caption track", { tempDir: "/tmp/test-bridge" }));
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining("heartbeat is stale"), data: { mutationOutcome: "not_applied" } });
+    expect(mockedRenameSync).not.toHaveBeenCalled();
+  });
+
+  it("still sends a read-only command when the heartbeat is stale, as before", async () => {
+    vi.setSystemTime(new Date(10_000));
+    mockedExistsSync.mockImplementation((path) => String(path).includes("bridge-heartbeat") || String(path).includes("res_"));
+    mockedReadFileSync.mockImplementation(((path: unknown) => String(path).includes("res_") ? '{"success":true}' : '{"protocolVersion":1,"state":"running"}') as never);
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700, mtimeMs: 1_000, size: 40 } as unknown as ReturnType<typeof statSync>);
+
+    await expect(sendCommand("read", { tempDir: "/tmp/test-bridge", mutating: false })).resolves.toMatchObject({ success: true });
+    expect(mockedRenameSync).toHaveBeenCalled();
+  });
+
   it("reports unknown mutation state after Premiere accepted a command but its busy marker stopped", async () => {
     vi.setSystemTime(new Date(10_000));
     mockedExistsSync.mockImplementation((path) => {

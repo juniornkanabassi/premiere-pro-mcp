@@ -18,6 +18,11 @@
   const AUDIO_SAMPLE_TICKS = 5292000n; // one 48 kHz sample
   const MAX_TRACK_ITEMS = 512;
   const MAX_SCANNED_ITEMS = 4096;
+  // Live 27.0: transactions of up to 3 clips or 50 moves verified; a 9-clip, 3-track compound did not.
+  // So one razor round handles at most this many tracks, and one move transaction this many items.
+  const RAZOR_BATCH = 4;
+  const MOVE_BATCH = 50;
+  const STALE_OBJECT = /no longer valid/i;
 
   function createRippleDeleteWorkflowDefinitions(deps) {
     const ppro = deps.ppro;
@@ -478,48 +483,103 @@
       return selection;
     }
 
-    // One undoable transaction. `build(make, fail)` runs inside lockedAccess and returns the actions.
-    // `make` creates the two editor actions here, where the lock is held.
-    function transact(context, progress, label, build) {
-      let committed = false;
-      context.project.lockedAccess(function () {
-        if (guidString(context.project.guid) !== context.projectGuid || guidString(context.sequence.guid) !== context.sequenceId) {
-          throw stop(progress, "UXP_STALE_TRACK_ITEM", "The active project or sequence changed before the edit");
+    // Host objects die (live 27.0: "The script object is no longer valid") once a transaction or a
+    // long run of reads has passed, so no item is carried from one step to the next. Each step names
+    // its items by position (ref) and they are fetched again here, one track call each, right before
+    // the lockedAccess that uses them. ref: { mediaType, trackIndex, index, start } with start in ticks.
+    async function freshItems(context, progress, refs) {
+      const tracks = new Map(), items = [];
+      for (const ref of refs) {
+        const key = ref.mediaType + ":" + ref.trackIndex;
+        if (!tracks.has(key)) tracks.set(key, await clipItemsOf(context.sequence, ref.mediaType, ref.trackIndex));
+        const item = tracks.get(key)[ref.index];
+        if (!item || await ticksOf(item, "getStartTime") !== ref.start) {
+          throw stop(progress, "UXP_VERIFICATION_FAILED", ref.mediaType + " track " + ref.trackIndex + " clip " + ref.index + " is no longer where it was read");
         }
-        const editor = ppro.SequenceEditor.getEditor(context.sequence);
-        if (!editor) throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor actions");
-        const make = {
-          // Never Premiere's own ripple: it shifts by whole frames and its overlap flag is unreliable.
-          remove: function (selection, mediaType) {
-            if (typeof editor.createRemoveItemsAction !== "function") throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose documented remove actions");
-            return editor.createRemoveItemsAction(selection, false, mediaType, false);
-          },
-          clone: function (item, offset) {
-            if (typeof editor.createCloneTrackItemAction !== "function") throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor clone actions");
-            return editor.createCloneTrackItemAction(item, offset, 0, 0, false, false);
-          }
-        };
-        const actions = build(make, function (code, message) { return stop(progress, code, message); });
-        for (const action of actions) if (!action) throw stop(progress, "UXP_ACTION_REJECTED", "Premiere did not create every action for " + label);
-        committed = context.project.executeTransaction(function (compoundAction) {
-          for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected an action for " + label);
-        }, label);
-      });
-      if (!committed) throw commandError("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);
-      progress.undoSteps++;
+        items.push(item);
+      }
+      return items;
+    }
+
+    // One undoable transaction. `build(make, fail, items)` runs inside lockedAccess with the refs' fresh items
+    // and returns the actions. `make` creates the two editor actions here, where the lock is held.
+    // An object that died before the transaction ran wrote nothing, so that case is retried once on new objects.
+    async function transact(context, progress, label, refs, build) {
+      for (let attempt = 0; ; attempt++) {
+        let committed = false, reached = false;
+        try {
+          const items = await freshItems(context, progress, refs);
+          context.project.lockedAccess(function () {
+            if (guidString(context.project.guid) !== context.projectGuid || guidString(context.sequence.guid) !== context.sequenceId) {
+              throw stop(progress, "UXP_STALE_TRACK_ITEM", "The active project or sequence changed before the edit");
+            }
+            const editor = ppro.SequenceEditor.getEditor(context.sequence);
+            if (!editor) throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor actions");
+            const make = {
+              // Never Premiere's own ripple: it shifts by whole frames and its overlap flag is unreliable.
+              remove: function (selection, mediaType) {
+                if (typeof editor.createRemoveItemsAction !== "function") throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose documented remove actions");
+                return editor.createRemoveItemsAction(selection, false, mediaType, false);
+              },
+              clone: function (item, offset) {
+                if (typeof editor.createCloneTrackItemAction !== "function") throw stop(progress, "UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor clone actions");
+                return editor.createCloneTrackItemAction(item, offset, 0, 0, false, false);
+              }
+            };
+            const actions = build(make, function (code, message) { return stop(progress, code, message); }, items);
+            for (const action of actions) if (!action) throw stop(progress, "UXP_ACTION_REJECTED", "Premiere did not create every action for " + label);
+            reached = true;
+            committed = context.project.executeTransaction(function (compoundAction) {
+              for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected an action for " + label);
+            }, label);
+          });
+        } catch (error) {
+          if (attempt === 0 && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) continue;
+          throw error;
+        }
+        if (!committed) throw commandError("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);
+        progress.undoSteps++;
+        return;
+      }
     }
 
     // Runs an edit; once a transaction has committed, any later failure becomes a
-    // committed_unverified receipt that says how many Undo steps to take.
+    // committed_unverified receipt that says how many Undo steps to take. A razor parks clones past the
+    // end of a track; whenever one may be left there the receipt lists exactly where (parkedClones).
     async function guarded(progress, base, operation) {
-      try { return await operation(); } catch (error) {
+      let receipt;
+      try { receipt = await operation(); } catch (error) {
         if (!progress.undoSteps) throw error;
-        return Object.assign({}, base, {
+        receipt = Object.assign({}, base, {
           committed: true, verified: false, partial: true, outcome: "committed_unverified", undoSteps: progress.undoSteps, rollbackPerformed: false,
           verificationBoundary: "committed_transaction_with_failed_follow_up",
           readbackError: error && error.message ? error.message : String(error),
           nextStep: "Inspect the affected tracks before any retry. Use Premiere Undo " + progress.undoSteps + " time" + (progress.undoSteps === 1 ? "" : "s") + " to reverse the committed steps."
         });
+      }
+      if (receipt && receipt.partial === true && progress.parking) await reportParked(progress, receipt);
+      return receipt;
+    }
+
+    // progress.parking: { context, floors: [{ mediaType, trackIndex, floor }] }. Anything at or after a
+    // floor is a parked clone: originals end at least a full parking gap before it.
+    async function reportParked(progress, receipt) {
+      const found = [];
+      try {
+        for (const spot of progress.parking.floors) {
+          const read = await readTrack(progress.parking.context.sequence, spot.mediaType, spot.trackIndex, 0);
+          read.infos.forEach(function (info, clipIndex) {
+            if (info.start >= spot.floor) found.push({ mediaType: spot.mediaType, trackIndex: spot.trackIndex, clipIndex, projectItemId: info.pid, startSeconds: secondsOf(info.start), endSeconds: secondsOf(info.end) });
+          });
+        }
+      } catch (error) {
+        receipt.parkedClones = null;
+        receipt.parkedScanError = error && error.message ? error.message : String(error);
+        return;
+      }
+      receipt.parkedClones = found;
+      if (found.length) {
+        receipt.nextStep = (receipt.nextStep || "") + " " + found.length + " cloned clip" + (found.length === 1 ? " is" : "s are") + " still parked past the end of the timeline (see parkedClones). Remove them with remove_track_items_uxp, or Undo the committed steps.";
       }
     }
 
@@ -582,10 +642,13 @@
       });
     }
 
-    function removeTransaction(context, progress, groups, label) {
-      transact(context, progress, label, function (make, fail) {
-        const items = [], types = new Set();
-        for (const group of groups) group.removed.forEach(function (index) { items.push(group.items[index]); types.add(group.mediaType); });
+    async function removeTransaction(context, progress, groups, label) {
+      const refs = [], types = new Set();
+      for (const group of groups) group.removed.forEach(function (index) {
+        refs.push({ mediaType: group.mediaType, trackIndex: group.trackIndex, index: group.from + index, start: group.infos[index].start });
+        types.add(group.mediaType);
+      });
+      await transact(context, progress, label, refs, function (make, fail, items) {
         const constants = ppro.Constants.MediaType;
         const mediaType = types.size === 1 ? constants[types.values().next().value.toUpperCase()] : constants.ANY;
         if (mediaType == null) throw fail("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose this media type constant");
@@ -605,7 +668,7 @@
         read.infos.forEach(function (info, index) {
           if (info.pid !== plan.expected[index].pid) throw commandError("UXP_VERIFICATION_FAILED", plan.mediaType + " track " + plan.trackIndex + " has a different clip order after the removal than planned");
           const delta = plan.expected[index].start - info.start;
-          if (delta !== 0n) moves.push({ item: info.item, delta, start: info.start });
+          if (delta !== 0n) moves.push({ ref: { mediaType: plan.mediaType, trackIndex: plan.trackIndex, index: plan.from + index, start: info.start }, delta, start: info.start });
         });
       }
       if (!moves.length) return 0;
@@ -613,16 +676,20 @@
       const byStart = function (left, right) { return left.start < right.start ? -1 : left.start > right.start ? 1 : 0; };
       const ordered = moves.filter(function (move) { return move.delta < 0n; }).sort(byStart)
         .concat(moves.filter(function (move) { return move.delta > 0n; }).sort(function (left, right) { return byStart(right, left); }));
-      transact(context, progress, label, function () {
-        return ordered.map(function (move) { return requiredMethod(move.item, "createMoveAction")(tickTime(move.delta)); });
-      });
+      // Items keep their order on a track while moving, so a later batch finds its items at the same positions.
+      for (let at = 0; at < ordered.length; at += MOVE_BATCH) {
+        const batch = ordered.slice(at, at + MOVE_BATCH);
+        await transact(context, progress, label, batch.map(function (move) { return move.ref; }), function (make, fail, items) {
+          return batch.map(function (move, index) { return requiredMethod(items[index], "createMoveAction")(tickTime(move.delta)); });
+        });
+      }
       return moves.length;
     }
 
     async function removeAndClose(context, progress, requests, ripple, label) {
       const groups = await loadRemovalGroups(context, requests);
       for (const group of groups) group.expected = removalLayout(group, ripple);
-      removeTransaction(context, progress, groups, label + " (remove)");
+      await removeTransaction(context, progress, groups, label + " (remove)");
       const moved = ripple ? await moveToLayout(context, progress, groups, label + " (close gap)") : 0;
       const verified = await verifyLayouts(context, groups);
       return { problems: verified.problems, maxErrorTicks: verified.maxError, removed: requests.length, moved };
@@ -694,7 +761,7 @@
           if (!info) continue;
         }
         await assertPlain(info.item, await nameOf(info.item), progress);
-        targets.push({ mediaType: spec.mediaType, trackIndex: spec.trackIndex, infos: read.infos, info });
+        targets.push({ mediaType: spec.mediaType, trackIndex: spec.trackIndex, infos: read.infos, info, index: read.infos.indexOf(info) });
       }
       return targets;
     }
@@ -710,37 +777,50 @@
     async function findParked(context, target, approxStart) {
       const tol = tolerance(context, target.mediaType);
       const infos = (await readTrack(context.sequence, target.mediaType, target.trackIndex, 0)).infos;
-      const found = infos.find(function (it) { return it.pid === target.info.pid && (it.start > approxStart ? it.start - approxStart : approxStart - it.start) <= tol; });
-      if (!found) throw commandError("UXP_VERIFICATION_FAILED", "The cut clip is not at its parking position on " + target.mediaType + " track " + target.trackIndex);
-      return found;
+      const index = infos.findIndex(function (it) { return it.pid === target.info.pid && (it.start > approxStart ? it.start - approxStart : approxStart - it.start) <= tol; });
+      if (index === -1) throw commandError("UXP_VERIFICATION_FAILED", "The cut clip is not at its parking position on " + target.mediaType + " track " + target.trackIndex);
+      return { index, start: infos[index].start };
     }
 
+    function parkedRef(target, found) { return { mediaType: target.mediaType, trackIndex: target.trackIndex, index: found.index, start: found.start }; }
+
     // Clone parked past the end, trim the clone's start, move it back: three undo steps (live-proven, P5).
+    // Done in rounds of RAZOR_BATCH tracks; each step reads its items again right before it uses them.
     async function razorTargets(context, progress, targets, cut, label) {
-      transact(context, progress, label + " (cut)", function (make) {
-        const actions = [];
-        for (const target of targets) {
-          actions.push(make.clone(target.info.item, tickTime(target.park - target.info.start)));
-          actions.push(requiredMethod(target.info.item, "createSetEndAction")(tickTime(cut)));
+      progress.parking = progress.parking || { context, floors: [] };
+      for (let at = 0; at < targets.length; at += RAZOR_BATCH) {
+        const round = targets.slice(at, at + RAZOR_BATCH);
+        for (const target of round) progress.parking.floors.push({ mediaType: target.mediaType, trackIndex: target.trackIndex, floor: target.park - PARKING_GAP / 2n });
+        await razorRound(context, progress, round, cut, label);
+        const problems = [];
+        for (const target of round) {
+          const read = await readTrack(context.sequence, target.mediaType, target.trackIndex, 0);
+          problems.push.apply(problems, layoutProblems(read.infos, layoutAfter(target.infos, cut, cut), tolerance(context, target.mediaType), target.mediaType + " track " + target.trackIndex, 0).problems);
         }
+        if (problems.length) return problems;
+      }
+      return [];
+    }
+
+    async function razorRound(context, progress, targets, cut, label) {
+      await transact(context, progress, label + " (cut)", targets.map(function (target) { return { mediaType: target.mediaType, trackIndex: target.trackIndex, index: target.index, start: target.info.start }; }), function (make, fail, items) {
+        const actions = [];
+        targets.forEach(function (target, index) {
+          actions.push(make.clone(items[index], tickTime(target.park - target.info.start)));
+          actions.push(requiredMethod(items[index], "createSetEndAction")(tickTime(cut)));
+        });
         return actions;
       });
       const parked = [];
       for (const target of targets) parked.push(await findParked(context, target, target.park));
-      transact(context, progress, label + " (trim)", function () {
-        return parked.map(function (found, index) { return requiredMethod(found.item, "createSetStartAction")(tickTime(found.start + (cut - targets[index].info.start))); });
+      await transact(context, progress, label + " (trim)", targets.map(function (target, index) { return parkedRef(target, parked[index]); }), function (make, fail, items) {
+        return items.map(function (item, index) { return requiredMethod(item, "createSetStartAction")(tickTime(parked[index].start + (cut - targets[index].info.start))); });
       });
       const trimmed = [];
       for (let index = 0; index < targets.length; index++) trimmed.push(await findParked(context, targets[index], parked[index].start + (cut - targets[index].info.start)));
-      transact(context, progress, label + " (place)", function () {
-        return trimmed.map(function (found) { return requiredMethod(found.item, "createMoveAction")(tickTime(cut - found.start)); });
+      await transact(context, progress, label + " (place)", targets.map(function (target, index) { return parkedRef(target, trimmed[index]); }), function (make, fail, items) {
+        return items.map(function (item, index) { return requiredMethod(item, "createMoveAction")(tickTime(cut - trimmed[index].start)); });
       });
-      const problems = [];
-      for (const target of targets) {
-        const read = await readTrack(context.sequence, target.mediaType, target.trackIndex, 0);
-        problems.push.apply(problems, layoutProblems(read.infos, layoutAfter(target.infos, cut, cut), tolerance(context, target.mediaType), target.mediaType + " track " + target.trackIndex, 0).problems);
-      }
-      return problems;
     }
 
     async function razorTrackItem(args) {
@@ -837,7 +917,7 @@
             if (info.start >= a && info.end <= b) requests.push({ mediaType: spec.mediaType, trackIndex: spec.trackIndex, clipIndex });
           });
         }
-        if (requests.length) removeTransaction(context, progress, await loadRemovalGroups(context, requests), "Extract range (remove)");
+        if (requests.length) await removeTransaction(context, progress, await loadRemovalGroups(context, requests), "Extract range (remove)");
         const moved = await moveToLayout(context, progress, chosen, "Extract range (close gap)");
         const verified = await verifyLayouts(context, chosen);
         if (verified.problems.length) return unverified(base, progress, verified.problems);

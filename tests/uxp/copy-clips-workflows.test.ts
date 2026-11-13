@@ -13,6 +13,36 @@ type Kind = "video" | "audio";
 
 let counter = 0;
 
+/**
+ * Item objects that die like Premiere's ("The script object is no longer valid."): once a transaction has
+ * committed since they were fetched, once a lockedAccess that used them has ended, or after `staleAfterCalls`
+ * further host calls. Null (the default) keeps every object valid.
+ */
+let strict: null | { generation: number; hostCalls: number; staleAfterCalls: number | null; locked: boolean; used: Array<() => void> } = null;
+function guard(entry: Item): Item {
+  const mode = strict;
+  if (!mode) return entry;
+  const born = { generation: mode.generation, hostCalls: mode.hostCalls };
+  let dead = false;
+  const check = () => {
+    if (dead || born.generation !== mode.generation || (mode.staleAfterCalls != null && mode.hostCalls - born.hostCalls > mode.staleAfterCalls)) throw new Error("The script object is no longer valid.");
+  };
+  return new Proxy(entry, {
+    get(target, property) {
+      if (property === "__item") return target;
+      if (property === "__touch") return () => { check(); if (mode.locked) mode.used.push(() => { dead = true; }); };
+      const value = (target as unknown as Record<string | symbol, unknown>)[property];
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        check(); mode.hostCalls++;
+        if (mode.locked && String(property).startsWith("create")) mode.used.push(() => { dead = true; });
+        return (value as (...a: unknown[]) => unknown)(...args);
+      };
+    },
+  });
+}
+const unwrap = (entry: Item): Item => (entry as unknown as { __item?: Item }).__item ?? entry;
+
 function makeItem(state: ItemState, options: { brokenTrim?: boolean } = {}) {
   const shiftBy = (field: "start" | "end" | "inPoint" | "outPoint", ticks: bigint) => { state[field] = String(BigInt(state[field]) + ticks); };
   return {
@@ -50,8 +80,8 @@ function makeSequence(guid: string, name: string, video: Item[][], audio: Item[]
     getTimebase: vi.fn(async () => "254016000"),
     getVideoTrackCount: vi.fn(async () => video.length),
     getAudioTrackCount: vi.fn(async () => audio.length),
-    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => sorted(video[index])) } : null),
-    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => sorted(audio[index])) } : null),
+    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => sorted(video[index]).map(guard)) } : null),
+    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => sorted(audio[index]).map(guard)) } : null),
   };
 }
 type Seq = ReturnType<typeof makeSequence>;
@@ -68,18 +98,19 @@ function item(kind: Kind, projectItemId: string, start: number, end: number, inP
  * two on V1 (0-40, 40-100, the second disabled), b-roll on V2 at 30-35, mixdown
  * on A0 (0-100). Destination "Segment": a body clip on V0 at 20-30 s.
  */
-function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?: (state: ItemState, kind: Kind) => void } = {}) {
+function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?: (state: ItemState, kind: Kind) => void; strict?: { staleAfterCalls: number | null }; layout?: { video: Item[][]; audio: Item[][]; destinationVideo: Item[][]; destinationAudio: Item[][] } } = {}) {
   counter = 0;
-  const source = makeSequence("seq-backup", "Backup", [
+  strict = options.strict ? { generation: 0, hostCalls: 0, staleAfterCalls: options.strict.staleAfterCalls, locked: false, used: [] } : null;
+  const source = makeSequence("seq-backup", "Backup", options.layout?.video ?? [
     [item("video", "host", 0, 100, 1000, { name: "Host.MXF" })],
     [item("video", "guest", 0, 40, 2000, { name: "Guest A" }), item("video", "guest", 40, 100, 2040, { name: "Guest B", disabled: true })],
     [item("video", "broll", 30, 35, 5, { name: "Broll.mp4" })],
-  ], [
+  ], options.layout?.audio ?? [
     [item("audio", "mix", 0, 100, 3000, { name: "Mixdown.wav" })],
   ]);
-  const destination = makeSequence("seq-segment", "Segment", [
+  const destination = makeSequence("seq-segment", "Segment", options.layout?.destinationVideo ?? [
     [item("video", "body", 20, 30, 0, { name: "Body" })], [], [],
-  ], [[]]);
+  ], options.layout?.destinationAudio ?? [[]]);
   const sequences: Seq[] = [source, destination];
   const findTrack = (sequence: Seq, target: Item) => {
     for (const kind of ["video", "audio"] as Kind[]) {
@@ -88,7 +119,10 @@ function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?:
     }
     return null;
   };
-  const cloneAction = vi.fn((sourceItem: Item, offset: { ticks: string }, videoOffset: number, audioOffset: number, alignToVideo: boolean, isInsert: boolean) => ({
+  const cloneAction = vi.fn((sourceItem: Item, offset: { ticks: string }, videoOffset: number, audioOffset: number, alignToVideo: boolean, isInsert: boolean) => {
+    (sourceItem as unknown as { __touch?: () => void }).__touch?.();
+    sourceItem = unwrap(sourceItem);
+    return {
     apply: () => {
       const found = sequences.map((sequence) => findTrack(sequence, sourceItem)).find(Boolean);
       if (!found) throw new Error("clone source not found");
@@ -100,13 +134,16 @@ function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?:
       expect(alignToVideo).toBe(false);
       expect(isInsert).toBe(false);
     },
-  }));
+  }; });
   const addAction = vi.fn((action: { apply: () => void }) => { action.apply(); return true; });
   const project = {
     guid: "project-1",
     getSequences: vi.fn(async () => sequences),
-    lockedAccess: vi.fn((callback: () => void) => callback()),
-    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }),
+    lockedAccess: vi.fn((callback: () => void) => {
+      if (strict) strict.locked = true;
+      try { callback(); } finally { if (strict) { strict.locked = false; for (const kill of strict.used) kill(); strict.used = []; } }
+    }),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); if (strict) strict.generation++; return true; }),
   };
   const ppro = {
     Project: { getActiveProject: vi.fn(async () => project) },
@@ -253,6 +290,65 @@ describe("UXP copy clips between sequences", () => {
     expect(result.problems[0]).toContain("changed enabled state");
   });
 
+  describe("host objects that die (live 27.0: 13 clips left 9 parked, \"The script object is no longer valid.\")", () => {
+    const wide = () => host({
+      strict: { staleAfterCalls: 60 },
+      layout: {
+        video: [0, 1, 2, 3, 4].map((n) => [item("video", `v${n}`, 0, 100, 1000 + n, { name: `V${n}` })]),
+        audio: [0, 1, 2, 3].map((n) => [item("audio", `a${n}`, 0, 100, 3000 + n, { name: `A${n}` })]),
+        destinationVideo: [[], [], [], [], []],
+        destinationAudio: [[], [], [], []],
+      },
+    });
+    const args = () => request({ sourceStartTicks: tick(30), sourceEndTicks: tick(35), destinationStartTicks: tick(0) });
+
+    it("copies 9 trimmed clips across 9 tracks by reading every item again just before it is used", async () => {
+      const value = wide();
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args());
+      const result = await value.registry.dispatch("sequence.copyClips", { ...args(), expectedSnapshot: plan, confirmCopy: true, operationId: "wide-1" });
+      expect(result).toMatchObject({ copied: true, verified: true, outcome: "verified", clipsCopied: 9, clipsTrimmed: 9 });
+      // At most 4 parked clones per round: the first clone transaction, then 2 + 3 + 3 steps over 3 rounds.
+      expect(result.undoSteps).toBe(9);
+      for (const list of [...value.destination.tracks.video, ...value.destination.tracks.audio]) {
+        expect(list).toHaveLength(1);
+        expect(list[0].state).toMatchObject({ start: tick(0), end: tick(5) });
+      }
+    });
+
+    it("tries once more on new objects when one died before the transaction ran, and writes nothing twice", async () => {
+      const value = host({ strict: { staleAfterCalls: null } });
+      const real = value.cloneAction.getMockImplementation()!;
+      value.cloneAction.mockImplementationOnce((() => { throw new Error("The script object is no longer valid."); }) as never);
+      const wholeArgs = request({ videoTracks: [2], audioTracks: [], destinationStartTicks: tick(40) });
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", wholeArgs);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...wholeArgs, expectedSnapshot: plan, confirmCopy: true, operationId: "retry-1" });
+      expect(result).toMatchObject({ copied: true, verified: true, undoSteps: 1 });
+      expect(real).toBeDefined();
+      expect(value.project.executeTransaction).toHaveBeenCalledTimes(1);
+      expect(value.destination.tracks.video[2]).toHaveLength(1);
+    });
+
+    it("lists the clones still parked past the end when a later step fails", async () => {
+      const value = host({ brokenTrim: true });
+      const trimArgs = request({ videoTracks: [0], audioTracks: [] });
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", trimArgs);
+      const result = await value.registry.dispatch("sequence.copyClips", { ...trimArgs, expectedSnapshot: plan, confirmCopy: true, operationId: "parked-1" });
+      expect(result).toMatchObject({ copied: false, committed: true, outcome: "committed_unverified", undoSteps: 2 });
+      expect(result.parkedClones).toEqual([expect.objectContaining({ mediaType: "video", trackIndex: 0, projectItemId: "host" })]);
+      expect(BigInt(result.parkedClones[0].startTicks)).toBeGreaterThan(BigInt(tick(30)));
+      expect(result.nextStep).toContain("still parked past the end");
+    });
+
+    it("tags a stale source clip as a refusal before any write", async () => {
+      const value = host({ strict: { staleAfterCalls: null } });
+      const wholeArgs = request({ videoTracks: [2], audioTracks: [], destinationStartTicks: tick(40) });
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", wholeArgs);
+      value.source.tracks.video[2][0].state.start = tick(31); // moved after inspection, but the plan check ran first
+      await expect(value.registry.dispatch("sequence.copyClips", { ...wholeArgs, expectedSnapshot: plan, confirmCopy: true, operationId: "stale-src" })).rejects.toMatchObject({ noHostWrite: true });
+      expect(value.project.executeTransaction).not.toHaveBeenCalled();
+    });
+  });
+
   it("reports a trim that does not land as committed_unverified", async () => {
     const value = host({ brokenTrim: true });
     const args = request({ videoTracks: [0], audioTracks: [] });
@@ -303,6 +399,7 @@ describe("UXP copy clips between sequences", () => {
     /** One sequence: cam1 on V0 and cam2 on V1 as ready-cut pieces (or whole when long), plus a mic on A0. */
     function stack(long = false, options: { createsTrack?: boolean; video?: Item[][] } = {}) {
       counter = 0;
+      strict = null;
       const piece = (id: string, start: number, end: number) => item("video", id, long ? 0 : start, long ? 100 : end, 1000 + (long ? 0 : start), { name: id + "@" + start });
       const sequence = makeSequence("seq-stack", "Stack",
         options.video ?? [long ? [piece("cam1", 0, 10)] : [piece("cam1", 0, 10), piece("cam1", 20, 30)], [piece("cam2", 10, 20)]],
@@ -402,7 +499,8 @@ describe("UXP copy clips between sequences", () => {
       expect(value.sequence.tracks.video[2]).toHaveLength(40);
       // Nothing ever sat further out than the cut, one gap and the 12 hour budget.
       expect(value.latestEnd()).toBeLessThanOrEqual(BigInt(tick(400 + 10 + 3600 * 12 + 3600)));
-      expect(result.undoSteps).toBe(13); // 4 parking rounds (11, 11, 11, 7 clones)
+      // Rounds are capped at 4 parked clones (9 at once failed live), so 10 rounds: the program track, 10 trim and 10 place steps, 9 later parking steps and the rest of round 0.
+      expect(result.undoSteps).toBe(31);
     });
 
     it("refuses a trimmed clip too long to park", async () => {

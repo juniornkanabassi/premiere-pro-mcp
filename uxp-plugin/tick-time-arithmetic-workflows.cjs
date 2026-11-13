@@ -32,13 +32,13 @@
       const base = createTickTime(baseTicks, "baseTicks");
       let operand = null, result;
       if (operation === "add" || operation === "subtract") {
-        if (args.factor !== undefined) throw commandError("UXP_INVALID_ARGUMENT", "factor is only allowed for multiply or divide");
+        if (args.factor !== undefined) throw refuse("UXP_INVALID_ARGUMENT", "factor is only allowed for multiply or divide");
         operand = createTickTime(canonicalTicks(args.operandTicks, "operandTicks"), "operandTicks");
         const method = operation === "add" ? "add" : "subtract";
         if (typeof base.value[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose TickTime." + method);
         result = base.value[method](operand.value);
       } else {
-        if (args.operandTicks !== undefined) throw commandError("UXP_INVALID_ARGUMENT", "operandTicks is only allowed for add or subtract");
+        if (args.operandTicks !== undefined) throw refuse("UXP_INVALID_ARGUMENT", "operandTicks is only allowed for add or subtract");
         const factor = boundedFactor(args.factor, operation === "divide" ? "divisor" : "factor");
         const method = operation === "multiply" ? "multiply" : "divide";
         if (typeof base.value[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose TickTime." + method);
@@ -74,25 +74,27 @@
 
     function canonicalTicks(value, name) {
       if (typeof value !== "string" || !/^(?:0|-?[1-9][0-9]{0,17})$/.test(value)) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be a canonical signed tick integer with at most 18 digits");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be a canonical signed tick integer with at most 18 digits");
       }
       return value;
     }
     function boundedFactor(value, name) {
       if (!Number.isInteger(value) || value < -1000000 || value > 1000000 || value === 0) {
-        throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-zero integer from -1000000 through 1000000");
+        throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-zero integer from -1000000 through 1000000");
       }
       return value;
     }
     function enumValue(value, name, allowed) {
-      if (!allowed.includes(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", "));
+      if (!allowed.includes(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", "));
       return value;
     }
     function assertOnlyKeys(value, allowed) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", "arguments must be an object");
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", "arguments must be an object");
       const unknown = Object.keys(value).find(function (key) { return !allowed.includes(key); });
-      if (unknown) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown);
+      if (unknown) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown);
     }
+    // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+    function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
     function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
 
     return definitions;

@@ -16,18 +16,18 @@ const CHECKPOINT_HINT = "Clone the sequence first (manage_sequences_uxp action c
 
 // Specific reasons. Any other mutating command gets the generic one.
 const NOT_INVERTIBLE: Readonly<Record<string, string>> = {
-  "timeline.overwrite": "Overwrite destroys the content it covered.",
-  "timeline.removeSelection": "A removed clip cannot be cloned back with its effects.",
-  "trackItem.rippleDelete": "A ripple-deleted clip cannot be cloned back with its effects.",
-  "timeline.range.extract": "An extracted range cannot be cloned back with its effects.",
-  "trackItems.remove": "A removed clip cannot be cloned back with its effects.",
-  "timeline.insert": "Insert shifts later clips; no inverse is implemented in this build.",
-  "timeline.cloneSelection": "No inverse is implemented for clone in this build.",
-  "trackItem.clone": "No inverse is implemented for clone in this build.",
-  "sequence.copyClips": "No inverse is implemented for copy clips in this build.",
-  "trackItem.splitEdit": "No inverse is implemented for J/L cuts in this build.",
-  "markers.remove": "The receipt does not hold enough to re-create the marker.",
-  "markers.removeMany": "The receipt does not hold enough to re-create the markers.",
+  "timeline.overwrite": "Overwrite destroys the content it covered, so it cannot be reversed automatically.",
+  "timeline.removeSelection": "A removed clip cannot be cloned back with its effects, so this cannot be reversed automatically.",
+  "trackItem.rippleDelete": "A ripple-deleted clip cannot be cloned back with its effects, so this cannot be reversed automatically.",
+  "timeline.range.extract": "An extracted range cannot be cloned back with its effects, so this cannot be reversed automatically.",
+  "trackItems.remove": "A removed clip cannot be cloned back with its effects, so this cannot be reversed automatically.",
+  "timeline.insert": "Insert shifts later clips and cannot be reversed automatically in this build.",
+  "timeline.cloneSelection": "Clone cannot be reversed automatically in this build.",
+  "trackItem.clone": "Clone cannot be reversed automatically in this build.",
+  "sequence.copyClips": "Copy clips cannot be reversed automatically in this build.",
+  "trackItem.splitEdit": "J/L cuts cannot be reversed automatically in this build.",
+  "markers.remove": "The receipt does not hold enough to re-create the marker, so this cannot be reversed automatically.",
+  "markers.removeMany": "The receipt does not hold enough to re-create the markers, so this cannot be reversed automatically.",
 };
 
 // Errors the bridge raises before anything reaches Premiere.
@@ -127,7 +127,8 @@ async function record(bridge: UxpWebSocketBridge, request: RequestFn, command: s
   let reason: string | null = null;
   let label = command;
   if (outcome.failed) reason = `${command} failed with an uncertain outcome, so Premiere may have changed.`;
-  else if (!isObject(result) || result.verified !== true) reason = `${command} did not report a verified result, so the timeline may not be what an undo would assume.`;
+  // Receipts say it either way: `verified: true`, or `outcome: "verified"` (ripple delete, clone and others carry only the outcome).
+  else if (!isObject(result) || (result.verified !== true && result.outcome !== "verified")) reason = `${command} did not report a verified result, so the timeline may not be what an undo would assume.`;
   else if (command === "trackItem.update") {
     const { before, after } = result;
     if (!isObject(before) || !isObject(after)) reason = "The update receipt has no before and after clip.";
@@ -147,7 +148,7 @@ async function record(bridge: UxpWebSocketBridge, request: RequestFn, command: s
   } else if (command === "markers.add") {
     label = `Add marker ${String(result.marker?.name ?? "")}`.trim();
     if (typeof result.marker?.guid !== "string") reason = "The marker receipt has no GUID.";
-  } else reason = NOT_INVERTIBLE[command] ?? `No inverse is implemented for ${command}.`;
+  } else reason = NOT_INVERTIBLE[command] ?? `${command} cannot be reversed automatically in this build.`;
 
   const identity = reason === null ? await readIdentity(request) : { sequenceId: null, projectKey: null };
   pushEntry(stateFor(bridge), { command, label, args, result: isObject(result) ? result : {}, reason, identity });
@@ -260,7 +261,7 @@ async function planInverse(entry: Entry, request: RequestFn): Promise<Plan> {
     return { steps: [{ command: "markers.remove", args: { ...owner, markerGuid: marker.guid, expectedName: marker.name, operationId: operationId(1) } }], verify: async () => null };
   }
 
-  return stop(`No inverse is implemented for ${entry.command}.`);
+  return stop(`${entry.command} cannot be reversed automatically in this build.`);
 }
 
 export function getUxpUndoTools(bridge: UxpWebSocketBridge) {

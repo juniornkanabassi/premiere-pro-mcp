@@ -55,7 +55,7 @@
       requireConfirmation(args.confirmSetPreviewFrame);
       requireOperationId(args.operationId);
       if (expected.sequenceId !== sequenceId) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot.sequenceId must exactly match sequenceId");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot.sequenceId must exactly match sequenceId");
       }
       // The complete reviewed owner identity is enough to join the tail before
       // *any* live preflight getter. If the project has changed, the guarded
@@ -195,12 +195,12 @@
   }
 
   function assertObject(value, name) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", (name || "args") + " must be an object");
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", (name || "args") + " must be an object");
   }
   function assertOnlyKeys(value, allowed) {
     assertObject(value, "args");
     const unknown = Object.keys(value).filter(function (key) { return !allowed.includes(key); });
-    if (unknown.length) throw commandError("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]);
+    if (unknown.length) throw refuse("UXP_INVALID_ARGUMENT", "Unknown argument: " + unknown[0]);
   }
   function requiredMethod(value, method) {
     if (!value || typeof value[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose " + method + " for this target");
@@ -212,7 +212,7 @@
     assertOnlyKeys(value, keys);
     for (let index = 0; index < keys.length; index += 1) {
       if (!Object.prototype.hasOwnProperty.call(value, keys[index])) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot." + keys[index] + " is required");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot." + keys[index] + " is required");
       }
     }
     const dimensions = previewRect(value.previewWidth, value.previewHeight, "expectedSnapshot preview frame");
@@ -231,15 +231,15 @@
   }
   function boundedInt(value, name, minimum, maximum) {
     if (!Number.isInteger(value) || value < minimum || value > maximum) {
-      throw commandError("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum);
+      throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum);
     }
     return value;
   }
   function requireConfirmation(value) {
-    if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "sequence.previewFrame.update requires confirmSetPreviewFrame: true after reviewing the complete snapshot");
+    if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "sequence.previewFrame.update requires confirmSetPreviewFrame: true after reviewing the complete snapshot");
   }
   function requireOperationId(value) {
-    if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+    if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
   }
   function sameSnapshot(left, right) {
     return left.projectGuid === right.projectGuid && left.sequenceId === right.sequenceId &&
@@ -255,6 +255,8 @@
     try { return typeof value.toString === "function" ? String(value.toString()) : String(value); } catch (_) { return ""; }
   }
   function messageOf(error) { return error && error.message ? String(error.message) : String(error || "unknown error"); }
+  // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+  function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
 
   return { createSequencePreviewFrameWorkflowDefinitions };

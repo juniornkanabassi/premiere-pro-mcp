@@ -313,7 +313,7 @@
       assertObject(value, "expectedSnapshot");
       const allowed = ["projectGuid", "sequenceId", "mediaType", "trackIndex", "clipIndex", "previous", "target", "following"];
       assertOnlyKeys(value, allowed);
-      for (const key of allowed) if (!(key in value)) throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot." + key + " is required");
+      for (const key of allowed) if (!(key in value)) throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot." + key + " is required");
       return {
         projectGuid: requiredGuid(value.projectGuid, "expectedSnapshot.projectGuid"), sequenceId: requiredGuid(value.sequenceId, "expectedSnapshot.sequenceId"),
         mediaType: enumValue(value.mediaType, "expectedSnapshot.mediaType", ["video", "audio"]), trackIndex: nonNegativeInt(value.trackIndex, "expectedSnapshot.trackIndex"),
@@ -326,7 +326,7 @@
       assertObject(value, name);
       const allowed = ["startSeconds", "endSeconds", "inSeconds", "outSeconds", "durationSeconds", "speed", "reversed"];
       assertOnlyKeys(value, allowed);
-      for (const key of allowed) if (!(key in value)) throw commandError("UXP_INVALID_ARGUMENT", name + "." + key + " is required");
+      for (const key of allowed) if (!(key in value)) throw refuse("UXP_INVALID_ARGUMENT", name + "." + key + " is required");
       return {
         startSeconds: boundedSeconds(value.startSeconds, name + ".startSeconds"), endSeconds: boundedSeconds(value.endSeconds, name + ".endSeconds"),
         inSeconds: boundedSeconds(value.inSeconds, name + ".inSeconds"), outSeconds: boundedSeconds(value.outSeconds, name + ".outSeconds"),
@@ -336,14 +336,14 @@
 
     function assertExpectedTarget(expected, target) {
       if (expected.mediaType !== target.mediaType || expected.trackIndex !== target.trackIndex || expected.clipIndex !== target.clipIndex) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot target coordinates must match mediaType, trackIndex, and clipIndex");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot target coordinates must match mediaType, trackIndex, and clipIndex");
       }
     }
 
     function signedOffset(value) {
       const offset = Number(value);
       if (!Number.isFinite(offset) || offset < -60 || offset > 60 || numbersEqual(offset, 0)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "slideBySeconds must be a non-zero number from -60 to 60");
+        throw refuse("UXP_INVALID_ARGUMENT", "slideBySeconds must be a non-zero number from -60 to 60");
       }
       return offset;
     }
@@ -361,19 +361,21 @@
     }
 
     function requiredMethod(target, name) { if (!target || typeof target[name] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "The timeline item does not expose " + name); return target[name].bind(target); }
-    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an object"); }
-    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw commandError("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
-    function enumValue(value, name, allowed) { if (allowed.indexOf(value) === -1) throw commandError("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
-    function nonNegativeInt(value, name) { if (!Number.isSafeInteger(value) || value < 0 || value > 511) throw commandError("UXP_INVALID_ARGUMENT", name + " must be an integer from 0 to 511"); return value; }
-    function boundedSeconds(value, name) { const seconds = Number(value); if (!Number.isFinite(seconds) || seconds < 0 || seconds > 86400) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 86400"); return seconds; }
-    function boundedSpeed(value, name) { const speed = Number(value); if (!Number.isFinite(speed) || speed < 0 || speed > 100) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 100"); return speed; }
-    function requiredBoolean(value, name) { if (typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
-    function requireConfirmation(value) { if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "trackItem.slide requires confirmSlide: true"); }
-    function requireOperationId(value) { if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters"); }
+    function assertObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an object"); }
+    function assertOnlyKeys(value, allowed) { assertObject(value, "arguments"); for (const key of Object.keys(value)) if (allowed.indexOf(key) === -1) throw refuse("UXP_INVALID_ARGUMENT", "Unexpected argument: " + key); }
+    function enumValue(value, name, allowed) { if (allowed.indexOf(value) === -1) throw refuse("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
+    function nonNegativeInt(value, name) { if (!Number.isSafeInteger(value) || value < 0 || value > 511) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer from 0 to 511"); return value; }
+    function boundedSeconds(value, name) { const seconds = Number(value); if (!Number.isFinite(seconds) || seconds < 0 || seconds > 86400) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 86400"); return seconds; }
+    function boundedSpeed(value, name) { const speed = Number(value); if (!Number.isFinite(speed) || speed < 0 || speed > 100) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a number from 0 to 100"); return speed; }
+    function requiredBoolean(value, name) { if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
+    function requireConfirmation(value) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "trackItem.slide requires confirmSlide: true"); }
+    function requireOperationId(value) { if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters"); }
     function requiredGuid(value, name) { const guid = guidString(value); if (!guid || guid.length > 128 || guid.indexOf("\u0000") !== -1) throw commandError("UXP_VERIFICATION_FAILED", name + " is unavailable or invalid"); return guid; }
     function guidString(value) { if (value == null) return ""; try { return typeof value.toString === "function" ? String(value.toString()) : String(value); } catch (_) { return ""; } }
     function tickSeconds(value) { const seconds = value && Number(value.seconds); return Number.isFinite(seconds) ? seconds : null; }
     function numbersEqual(left, right) { return Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Math.abs(Number(left) - Number(right)) < 0.000001; }
+    // A refusal thrown before any host write; the dispatcher releases the operation ID for it.
+    function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
     function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
 
     return definitions;

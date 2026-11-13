@@ -137,7 +137,7 @@
       try { timebase = String(await sequence.getTimebase()); } catch (_) { timebase = ""; }
       if (!/^\d{1,18}$/.test(timebase) || BigInt(timebase) <= 0n) throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not return a valid sequence ticksPerFrame timebase");
       try { return { ...FrameTime.snapSeconds(finiteNumber(seconds, name || "seconds", -86400, 86400), timebase), ticksPerFrame: timebase }; }
-      catch (_) { throw commandError("UXP_INVALID_ARGUMENT", (name || "seconds") + " could not be snapped to the sequence frame grid"); }
+      catch (_) { throw refuse("UXP_INVALID_ARGUMENT", (name || "seconds") + " could not be snapped to the sequence frame grid"); }
     }
 
     function tickSeconds(value) {
@@ -153,7 +153,7 @@
     function guidFromString(value, name) {
       const text = boundedString(value, name, 128);
       if (!ppro.Guid || typeof ppro.Guid.fromString !== "function") return text;
-      try { return ppro.Guid.fromString(text); } catch (_) { throw commandError("UXP_INVALID_ARGUMENT", name + " is not a valid GUID"); }
+      try { return ppro.Guid.fromString(text); } catch (_) { throw refuse("UXP_INVALID_ARGUMENT", name + " is not a valid GUID"); }
     }
 
     async function projectItemId(item) {
@@ -316,7 +316,7 @@
     async function resolveProjectItem(project, id, requireOneSelection) {
       if (id) return findProjectItem(project, id);
       const items = await selectedProjectItems(project);
-      if (requireOneSelection !== false && items.length !== 1) throw commandError("UXP_INVALID_ARGUMENT", "Select exactly one Project item or pass projectItemId");
+      if (requireOneSelection !== false && items.length !== 1) throw refuse("UXP_INVALID_ARGUMENT", "Select exactly one Project item or pass projectItemId");
       return requireOneSelection === false ? items : items[0];
     }
 
@@ -390,12 +390,12 @@
     function timelineTrackIndices(value) {
       if (value == null) return null;
       if (!Array.isArray(value) || !value.length || value.length > MAX_TIMELINE_TRACKS) {
-        throw commandError("UXP_INVALID_ARGUMENT", "trackIndices must contain 1-" + MAX_TIMELINE_TRACKS + " indices");
+        throw refuse("UXP_INVALID_ARGUMENT", "trackIndices must contain 1-" + MAX_TIMELINE_TRACKS + " indices");
       }
       const seen = new Set(), indices = [];
       for (let index = 0; index < value.length; index += 1) {
         const trackIndex = nonNegativeInt(value[index], "trackIndices[" + index + "]");
-        if (seen.has(trackIndex)) throw commandError("UXP_INVALID_ARGUMENT", "trackIndices must not contain duplicate indices");
+        if (seen.has(trackIndex)) throw refuse("UXP_INVALID_ARGUMENT", "trackIndices must not contain duplicate indices");
         seen.add(trackIndex); indices.push(trackIndex);
       }
       return indices.sort((left, right) => left - right);
@@ -418,13 +418,13 @@
       const mediaType = enumValue(args.mediaType == null ? "all" : args.mediaType, "mediaType", ["all", "video", "audio"]);
       const trackIndices = timelineTrackIndices(args.trackIndices), includeEmptyTracks = optionalBoolean(args.includeEmptyTracks, false, "includeEmptyTracks"), includeSourceProjectItems = optionalBoolean(args.includeSourceProjectItems, false, "includeSourceProjectItems"), includeSourceProjectItemClassification = optionalBoolean(args.includeSourceProjectItemClassification, false, "includeSourceProjectItemClassification"), includeSourceProjectItemContentType = optionalBoolean(args.includeSourceProjectItemContentType, false, "includeSourceProjectItemContentType"), includeSourceNestedSequenceIdentity = optionalBoolean(args.includeSourceNestedSequenceIdentity, false, "includeSourceNestedSequenceIdentity");
       if (includeSourceProjectItemClassification && !includeSourceProjectItems) {
-        throw commandError("UXP_INVALID_ARGUMENT", "includeSourceProjectItemClassification requires includeSourceProjectItems");
+        throw refuse("UXP_INVALID_ARGUMENT", "includeSourceProjectItemClassification requires includeSourceProjectItems");
       }
       if (includeSourceProjectItemContentType && !includeSourceProjectItems) {
-        throw commandError("UXP_INVALID_ARGUMENT", "includeSourceProjectItemContentType requires includeSourceProjectItems");
+        throw refuse("UXP_INVALID_ARGUMENT", "includeSourceProjectItemContentType requires includeSourceProjectItems");
       }
       if (includeSourceNestedSequenceIdentity && (!includeSourceProjectItems || !includeSourceProjectItemClassification)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "includeSourceNestedSequenceIdentity requires source Project-item IDs and classification");
+        throw refuse("UXP_INVALID_ARGUMENT", "includeSourceNestedSequenceIdentity requires source Project-item IDs and classification");
       }
       const maxItems = args.maxItems == null ? MAX_TIMELINE_ITEMS : boundedInt(args.maxItems, "maxItems", 1, MAX_TIMELINE_ITEMS);
       const itemType = ppro.Constants && ppro.Constants.TrackItemType;
@@ -659,7 +659,7 @@
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "beatTimesSeconds", "offsetSeconds", "namePrefix", "comments", "markerType", "operationId"]);
       const context = await markerContext({ ownerType: "sequence", sequenceId: args.sequenceId }, true);
       if (!Array.isArray(args.beatTimesSeconds) || !args.beatTimesSeconds.length || args.beatTimesSeconds.length > 512) {
-        throw commandError("UXP_INVALID_ARGUMENT", "beatTimesSeconds must contain between 1 and 512 entries");
+        throw refuse("UXP_INVALID_ARGUMENT", "beatTimesSeconds must contain between 1 and 512 entries");
       }
       const offset = finiteNumber(args.offsetSeconds == null ? 0 : args.offsetSeconds, "offsetSeconds", -86400, 86400);
       const prefix = args.namePrefix == null ? "Beat" : boundedString(args.namePrefix, "namePrefix", 64);
@@ -669,17 +669,17 @@
       for (let index = 0; index < args.beatTimesSeconds.length; index++) {
         const value = finiteNumber(args.beatTimesSeconds[index], "beatTimesSeconds[" + index + "]", 0, 86400);
         const positioned = value + offset;
-        if (positioned < 0 || positioned > 86400) throw commandError("UXP_INVALID_ARGUMENT", "offset beat times must remain between 0 and 86400 seconds");
+        if (positioned < 0 || positioned > 86400) throw refuse("UXP_INVALID_ARGUMENT", "offset beat times must remain between 0 and 86400 seconds");
         const key = positioned.toFixed(9);
-        if (seen.has(key)) throw commandError("UXP_INVALID_ARGUMENT", "offset beat times must be unique");
+        if (seen.has(key)) throw refuse("UXP_INVALID_ARGUMENT", "offset beat times must be unique");
         seen.add(key); requestedTimes.push(positioned);
       }
       for (let index = 1; index < requestedTimes.length; index++) {
-        if (requestedTimes[index] <= requestedTimes[index - 1]) throw commandError("UXP_INVALID_ARGUMENT", "beatTimesSeconds must be strictly increasing");
+        if (requestedTimes[index] <= requestedTimes[index - 1]) throw refuse("UXP_INVALID_ARGUMENT", "beatTimesSeconds must be strictly increasing");
       }
       const snappedTimes = await Promise.all(requestedTimes.map((value) => sequenceFrameTime(context.sequence, value, "beat time")));
       const times = snappedTimes.map((value) => value.appliedSeconds);
-      if (times.some((value, index) => index > 0 && value <= times[index - 1])) throw commandError("UXP_INVALID_ARGUMENT", "beatTimesSeconds collapse to duplicate or unordered sequence frames after snapping");
+      if (times.some((value, index) => index > 0 && value <= times[index - 1])) throw refuse("UXP_INVALID_ARGUMENT", "beatTimesSeconds collapse to duplicate or unordered sequence frames after snapping");
       return withAppendLock(await markerLockKey(context), async () => {
         const before = boundedMarkers(context.collection);
         if (before.length + times.length > MAX_MARKERS) throw commandError("UXP_COLLECTION_LIMIT", "Beat marker creation would exceed the " + MAX_MARKERS + " marker limit");
@@ -714,7 +714,7 @@
       const appliedStart = startTime ? startTime.appliedSeconds : requestedStart;
       const appliedDuration = durationTime ? durationTime.appliedSeconds : requestedDuration;
       const requested = [args.name, args.comments, args.markerType, args.durationSeconds, args.startSeconds, args.colorIndex].filter((value) => value != null);
-      if (!requested.length) throw commandError("UXP_INVALID_ARGUMENT", "Provide at least one marker field to update");
+      if (!requested.length) throw refuse("UXP_INVALID_ARGUMENT", "Provide at least one marker field to update");
       return withAppendLock(await markerLockKey(context), async () => {
         const marker = await findMarker(context.collection, args.markerGuid, args.expectedName);
         context.project.lockedAccess(() => {
@@ -882,7 +882,7 @@
     async function removeProjectItem(args) {
       assertObject(args); assertOnlyKeys(args, ["projectItemId", "expectedName", "operationId"]);
       // Removal is destructive, so it never falls back to whatever is selected.
-      if (args.projectItemId == null) throw commandError("UXP_INVALID_ARGUMENT", "projectItemId is required to remove a project item");
+      if (args.projectItemId == null) throw refuse("UXP_INVALID_ARGUMENT", "projectItemId is required to remove a project item");
       const project = await activeProject(true), item = await findProjectItem(project, args.projectItemId), before = await projectItemSnapshot(item);
       assertExpected(before.name, args.expectedName, "UXP_STALE_PROJECT_ITEM", "Project item name");
       let parent = await project.getRootItem();
@@ -1186,7 +1186,7 @@
       const startSeconds = finiteNumber(args.startSeconds, "startSeconds", 0, 86400);
       const endSeconds = finiteNumber(args.endSeconds, "endSeconds", 0, 86400);
       if (endSeconds <= startSeconds) {
-        throw commandError("UXP_INVALID_ARGUMENT", "endSeconds must be greater than startSeconds for PointF displacement inspection");
+        throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be greater than startSeconds for PointF displacement inspection");
       }
       return {
         mediaType: args.mediaType, trackIndex: args.trackIndex, clipIndex: args.clipIndex,
@@ -1257,10 +1257,10 @@
     function validatePointParameterSet(args) {
       assertObject(args); assertOnlyKeys(args, ["mediaType", "trackIndex", "clipIndex", "componentIndex", "paramIndex", "expectedComponentId", "expectedParamName", "expectedSnapshot", "point", "confirmSetPoint", "operationId"]);
       if (args.confirmSetPoint !== true) {
-        throw commandError("UXP_CONFIRMATION_REQUIRED", "Setting a PointF parameter requires confirmSetPoint=true after review");
+        throw refuse("UXP_CONFIRMATION_REQUIRED", "Setting a PointF parameter requires confirmSetPoint=true after review");
       }
       if (typeof args.operationId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(args.operationId)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
       }
       return {
         ...args,
@@ -1367,10 +1367,10 @@
     function validateColorParameterSet(args) {
       assertObject(args); assertOnlyKeys(args, ["mediaType", "trackIndex", "clipIndex", "componentIndex", "paramIndex", "expectedComponentId", "expectedParamName", "expectedSnapshot", "color", "confirmSetColor", "operationId"]);
       if (args.confirmSetColor !== true) {
-        throw commandError("UXP_CONFIRMATION_REQUIRED", "Setting a Color parameter requires confirmSetColor=true after review");
+        throw refuse("UXP_CONFIRMATION_REQUIRED", "Setting a Color parameter requires confirmSetColor=true after review");
       }
       if (typeof args.operationId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(args.operationId)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters");
       }
       return {
         ...args,
@@ -1409,11 +1409,11 @@
       const timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400);
       const hasEndSeconds = Object.prototype.hasOwnProperty.call(args, "endSeconds");
       if (direction !== "nearest" && hasEndSeconds) {
-        throw commandError("UXP_INVALID_ARGUMENT", "endSeconds is only supported when direction is nearest");
+        throw refuse("UXP_INVALID_ARGUMENT", "endSeconds is only supported when direction is nearest");
       }
       const endSeconds = direction === "nearest" ? finiteNumber(args.endSeconds, "endSeconds", 0, 86400) : undefined;
       if (endSeconds != null && endSeconds < timeSeconds) {
-        throw commandError("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds for nearest keyframe lookup");
+        throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds for nearest keyframe lookup");
       }
       const context = await parameterContext({
         mediaType: args.mediaType, trackIndex: args.trackIndex, clipIndex: args.clipIndex,
@@ -1498,15 +1498,15 @@
       assertObject(args);
       assertOnlyKeys(args, ["mediaType", "trackIndex", "clipIndex", "componentIndex", "paramIndex", "expectedSequenceId", "expectedComponentId", "expectedParamName", "expectedTimeVarying", "expectedKeyframeTimesSeconds", "timeVarying", "confirmDisableTimeVarying", "operationId"]);
       const expectedSequenceId = boundedString(args.expectedSequenceId, "expectedSequenceId", 128);
-      if (typeof args.expectedTimeVarying !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "expectedTimeVarying must be boolean");
-      if (typeof args.timeVarying !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "timeVarying must be boolean");
+      if (typeof args.expectedTimeVarying !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "expectedTimeVarying must be boolean");
+      if (typeof args.timeVarying !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "timeVarying must be boolean");
       if (!Array.isArray(args.expectedKeyframeTimesSeconds) || args.expectedKeyframeTimesSeconds.length > MAX_KEYFRAMES) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedKeyframeTimesSeconds must contain at most " + MAX_KEYFRAMES + " entries");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedKeyframeTimesSeconds must contain at most " + MAX_KEYFRAMES + " entries");
       }
       let previous = -1;
       const expectedKeyframeTimesSeconds = args.expectedKeyframeTimesSeconds.map((value, index) => {
         const seconds = finiteNumber(value, "expectedKeyframeTimesSeconds[" + index + "]", 0, 86400);
-        if (seconds <= previous) throw commandError("UXP_INVALID_ARGUMENT", "expectedKeyframeTimesSeconds must be strictly increasing");
+        if (seconds <= previous) throw refuse("UXP_INVALID_ARGUMENT", "expectedKeyframeTimesSeconds must be strictly increasing");
         previous = seconds;
         return seconds;
       });
@@ -1616,7 +1616,7 @@
 
     async function removeParameterKeyframeRange(args) {
       const context = await parameterContext(args, true), start = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), end = finiteNumber(args.endSeconds, "endSeconds", 0, 86400);
-      if (end < start) throw commandError("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds");
+      if (end < start) throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds");
       const beforeTimes = completeKeyframeTimes(context.param);
       const existed = beforeTimes.some((seconds) => seconds != null && seconds >= start && seconds <= end);
       if (!existed) return verifiedNoopResult({ removed: false, unchanged: true, startSeconds: start, endSeconds: end, after: await parameterSnapshot(context) }, "parameter_keyframe_range_absence_preflight");
@@ -1736,9 +1736,9 @@
       const context = await trackItemContext(args, true), before = await trackItemSnapshot(context);
       assertExpectedNumber(before.startSeconds, args.expectedStartSeconds, "UXP_STALE_TRACK_ITEM", "Track item start");
       assertExpectedNumber(before.endSeconds, args.expectedEndSeconds, "UXP_STALE_TRACK_ITEM", "Track item end");
-      if (args.moveBySeconds != null && (args.startSeconds != null || args.endSeconds != null)) throw commandError("UXP_INVALID_ARGUMENT", "moveBySeconds cannot be combined with startSeconds or endSeconds");
+      if (args.moveBySeconds != null && (args.startSeconds != null || args.endSeconds != null)) throw refuse("UXP_INVALID_ARGUMENT", "moveBySeconds cannot be combined with startSeconds or endSeconds");
       const requested = [args.moveBySeconds, args.startSeconds, args.endSeconds, args.inSeconds, args.outSeconds, args.disabled, args.name].filter((value) => value != null);
-      if (!requested.length) throw commandError("UXP_INVALID_ARGUMENT", "Provide at least one track-item field to update");
+      if (!requested.length) throw refuse("UXP_INVALID_ARGUMENT", "Provide at least one track-item field to update");
       const moveTime = args.moveBySeconds == null ? null : await sequenceFrameTime(context.sequence, args.moveBySeconds, "moveBySeconds");
       const startTime = args.startSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.startSeconds, "startSeconds", 0, 86400), "startSeconds");
       const endTime = args.endSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.endSeconds, "endSeconds", 0, 86400), "endSeconds");
@@ -1763,7 +1763,7 @@
       const kind = enumValue(args.kind, "kind", ["j_cut", "l_cut"]), requestedExtension = finiteNumber(args.extensionSeconds, "extensionSeconds", 0.001, 60);
       const context = await activeContext(true);
       const extensionTime = await sequenceFrameTime(context.sequence, requestedExtension, "extensionSeconds"), extension = extensionTime.appliedSeconds;
-      if (extension <= 0) throw commandError("UXP_INVALID_ARGUMENT", "extensionSeconds is less than half a sequence frame and would snap to zero");
+      if (extension <= 0) throw refuse("UXP_INVALID_ARGUMENT", "extensionSeconds is less than half a sequence frame and would snap to zero");
       const audioContext = { ...context, item: await trackItemAt(context.sequence, "audio", nonNegativeInt(args.audioTrackIndex, "audioTrackIndex"), nonNegativeInt(args.audioClipIndex, "audioClipIndex")), mediaType: "audio", trackIndex: args.audioTrackIndex, clipIndex: args.audioClipIndex };
       const videoContext = { ...context, item: await trackItemAt(context.sequence, "video", nonNegativeInt(args.videoTrackIndex, "videoTrackIndex"), nonNegativeInt(args.videoClipIndex, "videoClipIndex")), mediaType: "video", trackIndex: args.videoTrackIndex, clipIndex: args.videoClipIndex };
       const before = { audio: await trackItemSnapshot(audioContext), video: await trackItemSnapshot(videoContext) };
@@ -1971,7 +1971,7 @@
       assertObject(args); assertOnlyKeys(args, ["name", "confirmNonUndoable", "operationId"]);
       requireConfirmation(args.confirmNonUndoable, "Creating an empty sequence is a direct Project call without an Action boundary");
       if (typeof args.operationId !== "string" || !args.operationId) {
-        throw commandError("UXP_INVALID_ARGUMENT", "operationId is required for non-undoable empty sequence creation");
+        throw refuse("UXP_INVALID_ARGUMENT", "operationId is required for non-undoable empty sequence creation");
       }
       const name = boundedString(args.name, "name", 255), project = await activeProject(false);
       if (typeof project.createSequence !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "This Premiere build does not expose documented empty sequence creation");
@@ -2018,15 +2018,15 @@
     async function deriveSilenceSequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sourceProjectItemId", "name", "keepRanges", "targetBinId", "confirmNonUndoable", "operationId"]);
       requireConfirmation(args.confirmNonUndoable, "Derived silence removal creates subclips and a new sequence; the original source is not changed");
-      if (!Array.isArray(args.keepRanges) || !args.keepRanges.length || args.keepRanges.length > 64) throw commandError("UXP_INVALID_ARGUMENT", "keepRanges must contain 1-64 ranges");
+      if (!Array.isArray(args.keepRanges) || !args.keepRanges.length || args.keepRanges.length > 64) throw refuse("UXP_INVALID_ARGUMENT", "keepRanges must contain 1-64 ranges");
       const ranges = args.keepRanges.map((range, index) => {
         assertObject(range); assertOnlyKeys(range, ["startSeconds", "endSeconds", "startFrame", "endFrame"]);
         const startSeconds = finiteNumber(range.startSeconds, "keepRanges[" + index + "].startSeconds", 0, 86400);
         const endSeconds = finiteNumber(range.endSeconds, "keepRanges[" + index + "].endSeconds", 0, 86400);
-        if (endSeconds <= startSeconds) throw commandError("UXP_INVALID_ARGUMENT", "keepRanges must have positive duration");
-        if (index && startSeconds < args.keepRanges[index - 1].endSeconds) throw commandError("UXP_INVALID_ARGUMENT", "keepRanges must be ordered and non-overlapping");
+        if (endSeconds <= startSeconds) throw refuse("UXP_INVALID_ARGUMENT", "keepRanges must have positive duration");
+        if (index && startSeconds < args.keepRanges[index - 1].endSeconds) throw refuse("UXP_INVALID_ARGUMENT", "keepRanges must be ordered and non-overlapping");
         const startFrame = boundedInt(range.startFrame, "startFrame", 0, 100000000), endFrame = boundedInt(range.endFrame, "endFrame", 1, 100000000);
-        if (endFrame <= startFrame) throw commandError("UXP_INVALID_ARGUMENT", "keepRanges frame bounds must have positive duration");
+        if (endFrame <= startFrame) throw refuse("UXP_INVALID_ARGUMENT", "keepRanges frame bounds must have positive duration");
         return { startSeconds, endSeconds, startFrame, endFrame };
       });
       const project = await activeProject(true), sourceItem = await findProjectItem(project, args.sourceProjectItemId), source = asClip(sourceItem, "sourceProjectItemId");
@@ -2099,8 +2099,9 @@
     }
 
     async function cloneSequence(args) {
-      assertObject(args); assertOnlyKeys(args, ["sequenceId", "operationId"]);
+      assertObject(args); assertOnlyKeys(args, ["sequenceId", "name", "operationId"]);
       if (args.sequenceId == null) throw refuse("UXP_INVALID_ARGUMENT", "sequenceId is required; the active sequence is never assumed");
+      const name = args.name == null ? null : boundedString(args.name, "name", 255);
       const project = await activeProject(true), sequence = await resolveSequence(project, args.sequenceId);
       return withAppendLock(appendLockKey(project, "sequences", "all"), async () => {
         const before = await listSequences(project);
@@ -2108,8 +2109,27 @@
         project.lockedAccess(() => {
           commitActions(project, "Clone sequence", [sequence.createCloneAction()]);
         });
-        const after = await listSequences(project), added = after.filter((value) => !before.some((old) => old.id === value.id));
-        return mutationResult(added.length === 1, { cloned: true, source: await sequenceSnapshot(sequence), sequence: added[0] || null }, "sequence_identity_readback", "Clone sequence");
+        let after = await listSequences(project);
+        const added = after.filter((value) => !before.some((old) => old.id === value.id));
+        let renamed = {};
+        if (name != null && added.length === 1) {
+          // The clone is renamed through its Project item (Sequence has no name setter); the readback decides.
+          try {
+            const clone = (await boundedSequences(project)).find((value) => guidString(value.guid) === added[0].id);
+            const item = clone && typeof clone.getProjectItem === "function" ? await clone.getProjectItem() : null;
+            if (!item || typeof item.createSetNameAction !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose a rename action for the cloned sequence");
+            project.lockedAccess(() => {
+              commitActions(project, "Rename cloned sequence", [item.createSetNameAction(name)]);
+            });
+          } catch (error) {
+            renamed = { renameError: error && error.message ? error.message : String(error) };
+          }
+          after = await listSequences(project);
+          const applied = after.find((value) => value.id === added[0].id);
+          renamed = { requestedName: name, nameApplied: !!applied && applied.name === name, ...renamed };
+        } else if (name != null) renamed = { requestedName: name, nameApplied: false };
+        const clonedSequence = added.length === 1 ? after.find((value) => value.id === added[0].id) || added[0] : null;
+        return mutationResult(added.length === 1 && (name == null || renamed.nameApplied === true), { cloned: true, source: await sequenceSnapshot(sequence), sequence: clonedSequence, ...renamed }, name == null ? "sequence_identity_readback" : "sequence_identity_and_name_readback", "Clone sequence");
       });
     }
 
@@ -2252,7 +2272,7 @@
       assertObject(args); assertOnlyKeys(args, ["filePath", "outputFile", "presetFile", "inSeconds", "outSeconds", "workArea", "removeUponCompletion", "startQueueImmediately", "confirmExternalWrite", "operationId"]);
       requireExternalWrite(args.confirmExternalWrite);
       const manager = encoderManager(), input = await allowedPath(args.filePath, "filePath", "file"), output = await allowedPath(args.outputFile, "outputFile", "file"), preset = await allowedPath(args.presetFile, "presetFile", "file"), start = finiteNumber(args.inSeconds, "inSeconds", 0, 86400), end = finiteNumber(args.outSeconds, "outSeconds", 0, 86400);
-      if (end <= start) throw commandError("UXP_INVALID_ARGUMENT", "outSeconds must be greater than inSeconds");
+      if (end <= start) throw refuse("UXP_INVALID_ARGUMENT", "outSeconds must be greater than inSeconds");
       const inTime = tick(start), outTime = tick(end), workArea = boundedInt(args.workArea == null ? 0 : args.workArea, "workArea", 0, 16), removeUponCompletion = optionalBoolean(args.removeUponCompletion, false, "removeUponCompletion"), startQueueImmediately = optionalBoolean(args.startQueueImmediately, true, "startQueueImmediately");
       const project = await ppro.Project.getActiveProject();
       const job = beginEncoderJob("file", args.operationId, {
@@ -2370,7 +2390,7 @@
     }
 
     async function boundedPathArray(value, name, maximum, kind) {
-      if (!Array.isArray(value) || !value.length || value.length > maximum) throw commandError("UXP_INVALID_ARGUMENT", name + " must contain 1-" + maximum + " paths");
+      if (!Array.isArray(value) || !value.length || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must contain 1-" + maximum + " paths");
       return Promise.all(value.map((path, index) => allowedPath(path, name + "[" + index + "]", kind)));
     }
 
@@ -2472,7 +2492,7 @@
     function validateExpectedDisplayFormats(value) {
       assertObject(value); assertOnlyKeys(value, ["audioDisplayFormat", "videoDisplayFormat"]);
       if (!Object.prototype.hasOwnProperty.call(value, "audioDisplayFormat") || !Object.prototype.hasOwnProperty.call(value, "videoDisplayFormat")) {
-        throw commandError("UXP_INVALID_ARGUMENT", "expectedDisplayFormats must include audioDisplayFormat and videoDisplayFormat");
+        throw refuse("UXP_INVALID_ARGUMENT", "expectedDisplayFormats must include audioDisplayFormat and videoDisplayFormat");
       }
       return {
         audioDisplayFormat: validateDisplayFormatCode(value.audioDisplayFormat, "expectedDisplayFormats.audioDisplayFormat"),
@@ -2485,7 +2505,7 @@
       const updates = {};
       if (Object.prototype.hasOwnProperty.call(value, "audioDisplayFormat")) updates.audioDisplayFormat = validateDisplayFormatCode(value.audioDisplayFormat, "updates.audioDisplayFormat");
       if (Object.prototype.hasOwnProperty.call(value, "videoDisplayFormat")) updates.videoDisplayFormat = validateDisplayFormatCode(value.videoDisplayFormat, "updates.videoDisplayFormat");
-      if (!Object.keys(updates).length) throw commandError("UXP_INVALID_ARGUMENT", "updates must include audioDisplayFormat or videoDisplayFormat");
+      if (!Object.keys(updates).length) throw refuse("UXP_INVALID_ARGUMENT", "updates must include audioDisplayFormat or videoDisplayFormat");
       return updates;
     }
 
@@ -2503,10 +2523,10 @@
     function assertRequestedDisplayFormatsSupported(updates, supported) {
       const audioCodes = new Set(supported.audio.map((value) => value.code)), videoCodes = new Set(supported.video.map((value) => value.code));
       if (updates.audioDisplayFormat !== undefined && !audioCodes.has(updates.audioDisplayFormat)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "updates.audioDisplayFormat is not advertised by this Premiere host");
+        throw refuse("UXP_INVALID_ARGUMENT", "updates.audioDisplayFormat is not advertised by this Premiere host");
       }
       if (updates.videoDisplayFormat !== undefined && !videoCodes.has(updates.videoDisplayFormat)) {
-        throw commandError("UXP_INVALID_ARGUMENT", "updates.videoDisplayFormat is not advertised by this Premiere host");
+        throw refuse("UXP_INVALID_ARGUMENT", "updates.videoDisplayFormat is not advertised by this Premiere host");
       }
     }
 
@@ -2514,7 +2534,7 @@
       assertObject(value);
       const allowed = ["maximumBitDepth", "maxRenderQuality", "compositeInLinearColor", "audioSampleRate", "videoFrameRate", "videoFieldType", "videoPixelAspectRatio", "editingMode", "previewFileFormat", "previewCodec", "videoWidth", "videoHeight"];
       assertOnlyKeys(value, allowed);
-      if (!Object.keys(value).length) throw commandError("UXP_INVALID_ARGUMENT", "updates must contain at least one sequence setting");
+      if (!Object.keys(value).length) throw refuse("UXP_INVALID_ARGUMENT", "updates must contain at least one sequence setting");
       const result = {};
       for (const key of ["maximumBitDepth", "maxRenderQuality", "compositeInLinearColor"]) if (value[key] !== undefined) result[key] = requiredBoolean(value[key], key);
       if (value.audioSampleRate !== undefined) result.audioSampleRate = finiteNumber(value.audioSampleRate, "audioSampleRate", 1, 384000);
@@ -2538,7 +2558,7 @@
     // Premiere 27.0 returns scalar parameter values as {value: n} (probe P9); older hosts return n. Point and colour objects have no "value" key and pass through.
     function unwrapValue(value) { return value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "value") ? value.value : value; }
     function keyframeValue(value) { return value && value.value && Object.prototype.hasOwnProperty.call(value.value, "value") ? value.value.value : value && value.value !== undefined ? value.value : null; }
-    function scalarValue(value) { if (typeof value !== "number" && typeof value !== "string" && typeof value !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "value must be a number, string, or boolean"); if (typeof value === "number" && !Number.isFinite(value)) throw commandError("UXP_INVALID_ARGUMENT", "value must be finite"); if (typeof value === "string" && value.length > 4000) throw commandError("UXP_INVALID_ARGUMENT", "value string exceeds 4000 characters"); return value; }
+    function scalarValue(value) { if (typeof value !== "number" && typeof value !== "string" && typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "value must be a number, string, or boolean"); if (typeof value === "number" && !Number.isFinite(value)) throw refuse("UXP_INVALID_ARGUMENT", "value must be finite"); if (typeof value === "string" && value.length > 4000) throw refuse("UXP_INVALID_ARGUMENT", "value string exceeds 4000 characters"); return value; }
     // Host reads may expose arrays or native objects. Keep client input validation separate.
     function hostParameterValue(value, kind) {
       if (value == null) throw commandError("UXP_VALUE_UNAVAILABLE", "Premiere did not expose a " + kind + " parameter start value");
@@ -2577,7 +2597,7 @@
     function expectedPointParameterSnapshot(value) {
       assertObject(value);
       assertOnlyKeys(value, ["projectId", "sequenceId", "mediaType", "trackIndex", "clipIndex", "componentIndex", "componentId", "paramIndex", "paramName", "timeVarying", "point"]);
-      if (typeof value.timeVarying !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot.timeVarying must be boolean");
+      if (typeof value.timeVarying !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot.timeVarying must be boolean");
       return {
         projectId: boundedString(value.projectId, "expectedSnapshot.projectId", 128),
         sequenceId: boundedString(value.sequenceId, "expectedSnapshot.sequenceId", 128),
@@ -2595,7 +2615,7 @@
     function expectedColorParameterSnapshot(value) {
       assertObject(value);
       assertOnlyKeys(value, ["projectId", "sequenceId", "mediaType", "trackIndex", "clipIndex", "componentIndex", "componentId", "paramIndex", "paramName", "timeVarying", "color"]);
-      if (typeof value.timeVarying !== "boolean") throw commandError("UXP_INVALID_ARGUMENT", "expectedSnapshot.timeVarying must be boolean");
+      if (typeof value.timeVarying !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", "expectedSnapshot.timeVarying must be boolean");
       return {
         projectId: boundedString(value.projectId, "expectedSnapshot.projectId", 128),
         sequenceId: boundedString(value.sequenceId, "expectedSnapshot.sequenceId", 128),
@@ -2678,7 +2698,7 @@
   function boundedString(value, name, maximum) { if (typeof value !== "string" || !value.trim() || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-empty string of at most " + maximum + " characters"); return value; }
   function boundedStringAllowEmpty(value, name, maximum) { if (typeof value !== "string" || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a string of at most " + maximum + " characters"); return value; }
   function boundedStringArray(value, name, maximum, itemMaximum) { if (!Array.isArray(value) || !value.length || value.length > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must contain 1-" + maximum + " values"); return value.map((item, index) => boundedString(item, name + "[" + index + "]", itemMaximum)); }
-  function nonNegativeInt(value, name) { if (!Number.isInteger(value) || value < 0) throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-negative integer"); return value; }
+  function nonNegativeInt(value, name) { if (!Number.isInteger(value) || value < 0) throw refuse("UXP_INVALID_ARGUMENT", name + " must be a non-negative integer"); return value; }
   function boundedInt(value, name, minimum, maximum) { if (!Number.isInteger(value) || value < minimum || value > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be an integer from " + minimum + " to " + maximum); return value; }
   function finiteNumber(value, name, minimum, maximum) { const number = Number(value); if (!Number.isFinite(number) || number < minimum || number > maximum) throw refuse("UXP_INVALID_ARGUMENT", name + " must be from " + minimum + " to " + maximum); return number; }
   function requiredBoolean(value, name) { if (typeof value !== "boolean") throw refuse("UXP_INVALID_ARGUMENT", name + " must be a boolean"); return value; }
@@ -2687,13 +2707,13 @@
   function requireConfirmation(value, message) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
   function requireDestructiveConfirmation(value) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "Removing reviewed marker snapshots is destructive; pass confirmDestructive=true after review"); }
   function reviewedMarkerSnapshots(value) {
-    if (!Array.isArray(value) || !value.length || value.length > 128) throw commandError("UXP_INVALID_ARGUMENT", "markerSnapshots must contain 1-128 reviewed marker snapshots");
+    if (!Array.isArray(value) || !value.length || value.length > 128) throw refuse("UXP_INVALID_ARGUMENT", "markerSnapshots must contain 1-128 reviewed marker snapshots");
     const seen = new Set(), snapshots = [];
     for (let index = 0; index < value.length; index += 1) {
       const snapshot = value[index];
       assertObject(snapshot); assertOnlyKeys(snapshot, ["markerGuid", "expectedName", "expectedStartSeconds", "expectedDurationSeconds"]);
       const markerGuid = boundedString(snapshot.markerGuid, "markerSnapshots[" + index + "].markerGuid", 128);
-      if (seen.has(markerGuid)) throw commandError("UXP_INVALID_ARGUMENT", "markerSnapshots must not contain duplicate markerGuid values");
+      if (seen.has(markerGuid)) throw refuse("UXP_INVALID_ARGUMENT", "markerSnapshots must not contain duplicate markerGuid values");
       seen.add(markerGuid);
       snapshots.push({
         markerGuid,
@@ -2706,7 +2726,7 @@
   }
   function assertExpected(actual, expected, code, label) { if (expected != null && actual !== expected) throw commandError(code, label + " no longer matches the expected value"); }
   function assertExpectedNumber(actual, expected, code, label) { if (expected != null && !numbersEqual(actual, expected)) throw commandError(code, label + " no longer matches the expected value"); }
-  function requireExternalWrite(value) { if (value !== true) throw commandError("UXP_CONFIRMATION_REQUIRED", "Encoding writes external files and may overwrite an existing output; pass confirmExternalWrite=true after review"); }
+  function requireExternalWrite(value) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", "Encoding writes external files and may overwrite an existing output; pass confirmExternalWrite=true after review"); }
   function sameNumberArrays(left, right) { return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => numbersEqual(value, right[index])); }
   function numbersEqual(left, right) { return Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Math.abs(Number(left) - Number(right)) < 0.000001; }
   function pointsEqual(left, right) { return !!left && !!right && numbersEqual(left.x, right.x) && numbersEqual(left.y, right.y); }
