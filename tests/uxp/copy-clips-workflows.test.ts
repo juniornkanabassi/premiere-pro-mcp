@@ -18,12 +18,14 @@ let counter = 0;
  * committed since they were fetched, once a lockedAccess that used them has ended, or after `staleAfterCalls`
  * further host calls. Null (the default) keeps every object valid.
  */
-let strict: null | { generation: number; hostCalls: number; staleAfterCalls: number | null; locked: boolean; used: Array<() => void> } = null;
-function guard(entry: Item): Item {
+let strict: null | { generation: number; hostCalls: number; staleAfterCalls: number | null; locked: boolean; used: Array<() => void>; deadReadAfterCommit?: boolean; nextReadDead?: boolean } = null;
+/** Whether the objects handed out by this track read are born dead (the first read after a commit, when deadReadAfterCommit is on). */
+function takeDead(): boolean { if (!strict || !strict.nextReadDead) return false; strict.nextReadDead = false; return true; }
+function guard(entry: Item, bornDead = false): Item {
   const mode = strict;
   if (!mode) return entry;
   const born = { generation: mode.generation, hostCalls: mode.hostCalls };
-  let dead = false;
+  let dead = bornDead;
   const check = () => {
     if (dead || born.generation !== mode.generation || (mode.staleAfterCalls != null && mode.hostCalls - born.hostCalls > mode.staleAfterCalls)) throw new Error("The script object is no longer valid.");
   };
@@ -79,8 +81,8 @@ function makeSequence(guid: string, name: string, video: Item[][], audio: Item[]
     getTimebase: vi.fn(async () => "254016000"),
     getVideoTrackCount: vi.fn(async () => video.length),
     getAudioTrackCount: vi.fn(async () => audio.length),
-    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => [...video[index]].map(guard)) } : null),
-    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => [...audio[index]].map(guard)) } : null),
+    getVideoTrack: vi.fn(async (index: number) => video[index] ? { getTrackItems: vi.fn(async () => { const dead = takeDead(); return [...video[index]].map((entry) => guard(entry, dead)); }) } : null),
+    getAudioTrack: vi.fn(async (index: number) => audio[index] ? { getTrackItems: vi.fn(async () => { const dead = takeDead(); return [...audio[index]].map((entry) => guard(entry, dead)); }) } : null),
   };
 }
 type Seq = ReturnType<typeof makeSequence>;
@@ -97,9 +99,9 @@ function item(kind: Kind, projectItemId: string, start: number, end: number, inP
  * two on V1 (0-40, 40-100, the second disabled), b-roll on V2 at 30-35, mixdown
  * on A0 (0-100). Destination "Segment": a body clip on V0 at 20-30 s.
  */
-function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?: (state: ItemState, kind: Kind) => void; strict?: { staleAfterCalls: number | null }; layout?: { video: Item[][]; audio: Item[][]; destinationVideo: Item[][]; destinationAudio: Item[][] } } = {}) {
+function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?: (state: ItemState, kind: Kind) => void; strict?: { staleAfterCalls: number | null; deadReadAfterCommit?: boolean }; layout?: { video: Item[][]; audio: Item[][]; destinationVideo: Item[][]; destinationAudio: Item[][] } } = {}) {
   counter = 0;
-  strict = options.strict ? { generation: 0, hostCalls: 0, staleAfterCalls: options.strict.staleAfterCalls, locked: false, used: [] } : null;
+  strict = options.strict ? { generation: 0, hostCalls: 0, staleAfterCalls: options.strict.staleAfterCalls, locked: false, used: [], deadReadAfterCommit: options.strict.deadReadAfterCommit } : null;
   const source = makeSequence("seq-backup", "Backup", options.layout?.video ?? [
     [item("video", "host", 0, 100, 1000, { name: "Host.MXF" })],
     [item("video", "guest", 0, 40, 2000, { name: "Guest A" }), item("video", "guest", 40, 100, 2040, { name: "Guest B", disabled: true })],
@@ -142,7 +144,7 @@ function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?:
       if (strict) strict.locked = true;
       try { callback(); } finally { if (strict) { strict.locked = false; for (const kill of strict.used) kill(); strict.used = []; } }
     }),
-    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); if (strict) strict.generation++; return true; }),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); if (strict) { strict.generation++; if (strict.deadReadAfterCommit) strict.nextReadDead = true; } return true; }),
   };
   const ppro = {
     Project: { getActiveProject: vi.fn(async () => project) },
@@ -312,6 +314,19 @@ describe("UXP copy clips between sequences", () => {
         expect(list).toHaveLength(1);
         expect(list[0].state).toMatchObject({ start: tick(0), end: tick(5) });
       }
+    });
+
+    it("copies 9 trimmed clips when every read right after a commit hands out dead handles", async () => {
+      const value = host({
+        strict: { staleAfterCalls: 60, deadReadAfterCommit: true },
+        layout: {
+          video: [0, 1, 2, 3, 4].map((n) => [item("video", `v${n}`, 0, 100, 1000 + n, { name: `V${n}` })]),
+          audio: [0, 1, 2, 3].map((n) => [item("audio", `a${n}`, 0, 100, 3000 + n, { name: `A${n}` })]),
+          destinationVideo: [[], [], [], [], []], destinationAudio: [[], [], [], []],
+        },
+      });
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args());
+      await expect(value.registry.dispatch("sequence.copyClips", { ...args(), expectedSnapshot: plan, confirmCopy: true, operationId: "wide-dead" })).resolves.toMatchObject({ copied: true, verified: true, clipsTrimmed: 9 });
     });
 
     it("tries once more on new objects when one died before the transaction ran, and writes nothing twice", async () => {

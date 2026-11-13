@@ -25,6 +25,7 @@
   const RAZOR_BATCH = 4;
   const MOVE_BATCH = 50;
   const STALE_OBJECT = /no longer valid/i;
+  const STALE_ATTEMPTS = 3;
 
   function createRippleDeleteWorkflowDefinitions(deps) {
     const ppro = deps.ppro;
@@ -133,11 +134,13 @@
           const closed = await removeAndClose(edit, progress, [{
             mediaType: target.mediaType, trackIndex: target.trackIndex, clipIndex: target.clipIndex, expectedProjectItemId: before.target.projectItemId
           }], true, "Ripple delete timeline item");
-          const afterContext = await activeTarget(target, true);
-          if (afterContext.projectGuid !== before.projectGuid || afterContext.sequenceId !== before.sequenceId) {
-            throw commandError("UXP_VERIFICATION_FAILED", "Premiere changed the active project or sequence during the committed ripple delete");
-          }
-          after = await rippleReadback(afterContext, before);
+          after = await retryStale(async function () {
+            const afterContext = await activeTarget(target, true);
+            if (afterContext.projectGuid !== before.projectGuid || afterContext.sequenceId !== before.sequenceId) {
+              throw commandError("UXP_VERIFICATION_FAILED", "Premiere changed the active project or sequence during the committed ripple delete");
+            }
+            return rippleReadback(afterContext, before);
+          });
           const notes = closed.problems.slice();
           if (!sameRippleResult(before, after)) notes.unshift(describeRippleDivergence(before, after));
           if (notes.length) throw commandError("UXP_VERIFICATION_FAILED", notes.join("; "));
@@ -419,11 +422,25 @@
       };
     }
 
+    // Premiere kills host objects around a commit (live 27.0: handles read just after one died with "The script
+    // object is no longer valid."). A read, or any step that has not yet written, is simply done again on fresh
+    // objects, a few times with a short pause.
+    async function retryStale(step) {
+      for (let attempt = 1; ; attempt++) {
+        try { return await step(); } catch (error) {
+          if (attempt >= STALE_ATTEMPTS || !STALE_OBJECT.test(error && error.message ? error.message : "")) throw error;
+          await new Promise(function (resolve) { setTimeout(resolve, 25 * attempt); });
+        }
+      }
+    }
+
     // Reads a track from clipIndex `from` on, so a caller never touches items before its first target.
-    async function readTrack(sequence, mediaType, trackIndex, from) {
-      const items = (await clipItemsOf(sequence, mediaType, trackIndex)).slice(from || 0), infos = [];
-      for (const item of items) infos.push(await infoOf(item));
-      return { items, infos };
+    function readTrack(sequence, mediaType, trackIndex, from) {
+      return retryStale(async function () {
+        const items = (await clipItemsOf(sequence, mediaType, trackIndex)).slice(from || 0), infos = [];
+        for (const item of items) infos.push(await infoOf(item));
+        return { items, infos };
+      });
     }
 
     async function nameOf(item) {
@@ -505,9 +522,9 @@
 
     // One undoable transaction. `build(make, fail, items)` runs inside lockedAccess with the refs' fresh items
     // and returns the actions. `make` creates the two editor actions here, where the lock is held.
-    // An object that died before the transaction ran wrote nothing, so that case is retried once on new objects.
+    // An object that died before the transaction ran wrote nothing, so that case is retried on new objects.
     async function transact(context, progress, label, refs, build) {
-      for (let attempt = 0; ; attempt++) {
+      for (let attempt = 1; ; attempt++) {
         let committed = false, reached = false;
         try {
           const items = await freshItems(context, progress, refs);
@@ -536,7 +553,10 @@
             }, label);
           });
         } catch (error) {
-          if (attempt === 0 && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) continue;
+          if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) {
+            await new Promise(function (resolve) { setTimeout(resolve, 25 * attempt); });
+            continue;
+          }
           throw error;
         }
         if (!committed) throw commandError("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);

@@ -35,6 +35,7 @@
   // Live 27.0: rounds of 3 or fewer parked clones verified; 9 parked clones in one round did not.
   const MAX_PARKED_PER_ROUND = 4;
   const STALE_OBJECT = /no longer valid/i;
+  const STALE_ATTEMPTS = 3;
   const SEGMENT_KEYS = ["sourceStartTicks", "sourceEndTicks", "sourceStartSeconds", "sourceEndSeconds", "videoTrack"];
   // segments mode copies camera ranges from one video track each onto one
   // "program" video track of the same sequence; nothing else may be given.
@@ -131,7 +132,7 @@
       // one step to the next. Each transaction reads its items again just before it, and a step whose
       // object died before the transaction ran wrote nothing, so it is tried once more on new objects.
       async function lockedTransaction(prepare, build, name, firstWrite) {
-        for (let attempt = 0; ; attempt++) {
+        for (let attempt = 1; ; attempt++) {
           let reached = false;
           try {
             const items = await prepare();
@@ -146,7 +147,7 @@
             });
             return;
           } catch (error) {
-            if (attempt === 0 && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) continue;
+            if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) { await pause(attempt); continue; }
             if (firstWrite && !reached && error && typeof error === "object") error.noHostWrite = true;
             throw error;
           }
@@ -468,8 +469,20 @@
     }
     function distance(left, right) { const d = BigInt(left) - BigInt(right); return d < 0n ? -d : d; }
 
+    // Premiere kills host objects around a commit; a read is simply done again on fresh objects.
+    function pause(attempt) { return new Promise(function (resolve) { setTimeout(resolve, 25 * attempt); }); }
+    async function retryStale(step) {
+      for (let attempt = 1; ; attempt++) {
+        try { return await step(); } catch (error) {
+          if (attempt >= STALE_ATTEMPTS || !STALE_OBJECT.test(error && error.message ? error.message : "")) throw error;
+          await pause(attempt);
+        }
+      }
+    }
+
     // Where the clone sits now: { mediaType, trackIndex, index, start } (start in ticks as a string).
-    async function findClone(sequence, entry, startTicks, plan) {
+    function findClone(sequence, entry, startTicks, plan) { return retryStale(function () { return findCloneOnce(sequence, entry, startTicks, plan); }); }
+    async function findCloneOnce(sequence, entry, startTicks, plan) {
       const placement = entry.placement, tol = tolerance(placement.mediaType, plan);
       let best = null, bestDistance = tol + 1n;
       const items = await clipItems(sequence, placement.mediaType, placement.targetTrackIndex);
@@ -484,7 +497,8 @@
     }
 
     // The items at those positions, fetched again (one track call each) right before they are used.
-    async function fetchAt(sequence, positions) {
+    function fetchAt(sequence, positions) { return retryStale(function () { return fetchAtOnce(sequence, positions); }); }
+    async function fetchAtOnce(sequence, positions) {
       const tracks = new Map(), items = [];
       for (const at of positions) {
         const key = at.mediaType + ":" + at.trackIndex;
@@ -509,7 +523,8 @@
     // Compares every start, end, source in and source out within the media
     // type's tolerance, and reports the largest deviation seen in ticks, so a
     // sample-grid or 1-tick landing verifies and a real miss does not.
-    async function readbackProblems(sequence, plan) {
+    function readbackProblems(sequence, plan) { return retryStale(function () { return readbackProblemsOnce(sequence, plan); }); }
+    async function readbackProblemsOnce(sequence, plan) {
       const problems = [];
       const claimed = new Set();
       const cache = {};

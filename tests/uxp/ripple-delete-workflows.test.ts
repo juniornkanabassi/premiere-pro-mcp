@@ -30,6 +30,11 @@ type HostOptions = {
    */
   strictHandles?: boolean;
   staleAfterCalls?: number;
+  /**
+   * Premiere also kills handles that are read just after a commit: the first track read after every
+   * committed transaction hands out objects that are already dead ("The script object is no longer valid.").
+   */
+  deadReadAfterCommit?: boolean;
 };
 
 /**
@@ -45,7 +50,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   const firstSnapshot = new Promise<void>((resolve) => { pauseStarted = resolve; });
   const selections: Array<{ dead: boolean; items: Item[] }> = [];
   const lists: Record<Kind, Item[][]> = { video: [], audio: [] };
-  let generation = 0, hostCalls = 0;
+  let generation = 0, hostCalls = 0, nextReadDead = false;
   let usedInLock: Array<() => void> = [];
   const dieAfterLock = () => { for (const kill of usedInLock) kill(); usedInLock = []; };
 
@@ -96,10 +101,10 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
   const sorted = (list: Item[]) => [...list].sort((a, b) => Number(BigInt(a.state.start) - BigInt(b.state.start)));
   const unwrap = (value: Item): Item => (value as unknown as { __item?: Item }).__item ?? value;
   /** A fetched handle: same item, but invalid once the host would have invalidated it. */
-  function view(item: Item): Item {
+  function view(item: Item, bornDead = false): Item {
     if (!options.strictHandles) return item;
     const born = { generation, hostCalls };
-    let dead = false;
+    let dead = bornDead;
     const check = () => {
       if (dead || born.generation !== generation || (options.staleAfterCalls != null && hostCalls - born.hostCalls > options.staleAfterCalls)) throw new Error("The script object is no longer valid.");
     };
@@ -119,7 +124,11 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     return proxy;
   }
   // The host lists a track in creation order, so a clone or a razor half appended later comes last (live 27.0).
-  const served = (list: Item[]) => (options.reverseOrder ? sorted(list).reverse() : [...list]).map(view);
+  const served = (list: Item[]) => {
+    const bornDead = nextReadDead;
+    nextReadDead = false;
+    return (options.reverseOrder ? sorted(list).reverse() : [...list]).map((item) => view(item, bornDead));
+  };
   const sequence = {
     guid: "sequence-1",
     getTimebase: vi.fn(async () => String(FRAME)),
@@ -156,7 +165,7 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
       locked = true;
       try { callback(); } finally { locked = false; for (const selection of selections) selection.dead = true; dieAfterLock(); }
     }),
-    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; return true; }),
+    executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; if (options.deadReadAfterCommit) nextReadDead = true; return true; }),
   };
   const ppro = {
     Project: { getActiveProject: vi.fn(async () => project) },
@@ -261,6 +270,21 @@ describe("guarded documented UXP contiguous track-item ripple delete workflow", 
     expect(result).toMatchObject({ outcome: "verified", rippleDeleted: true });
     expect(value.project.executeTransaction.mock.calls.filter((call) => String(call[1]).endsWith("(close gap)"))).toHaveLength(1);
     expect(value.track("video", 0)).toHaveLength(57);
+  });
+
+  it("ripples a second clip on a track that was already edited, when every read right after a commit hands out dead handles (live 27.0)", async () => {
+    const track = Array.from({ length: 58 }, (_, i) => clip(`v-${i}`, i * 5, i * 5 + 5, i));
+    const value = timelineHost([track], [], { strictHandles: true, deadReadAfterCommit: true });
+    const snap = (id: string, start: number) => ({ projectItemId: id, startSeconds: start, endSeconds: start + 5, inSeconds: Number(id.split("-")[1]), outSeconds: Number(id.split("-")[1]) + 5, durationSeconds: 5, speed: 1, reversed: false });
+    const ripple = (clipIndex: number, ids: [string, number, string, number], count: number, operationId: string) => value.registry.dispatch("trackItem.rippleDelete", {
+      mediaType: "video", trackIndex: 0, clipIndex, confirmRippleDelete: true, operationId,
+      expectedSnapshot: { projectGuid: "project-1", sequenceId: "sequence-1", mediaType: "video", trackIndex: 0, clipIndex, trackItemCount: count, target: snap(ids[0], ids[1]), following: snap(ids[2], ids[3]) },
+    });
+    await expect(ripple(6, ["v-6", 30, "v-7", 35], 58, "twice-1")).resolves.toMatchObject({ outcome: "verified", rippleDeleted: true });
+    // The track is now 57 clips with the successors 5 s earlier; the next target sits at index 10.
+    await expect(ripple(10, ["v-11", 50, "v-12", 55], 57, "twice-2")).resolves.toMatchObject({ outcome: "verified", rippleDeleted: true });
+    expect(value.track("video", 0)).toHaveLength(56);
+    expect(value.track("video", 0).every((row, i, rows) => i === 0 || row[0] === rows[i - 1]![1])).toBe(true);
   });
 
   it("closes a clip that is not a whole number of frames by its exact length (no 17 ms gap)", async () => {
