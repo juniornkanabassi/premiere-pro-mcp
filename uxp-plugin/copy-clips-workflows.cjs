@@ -137,7 +137,9 @@
           try {
             const items = await prepare();
             context.project.lockedAccess(function () {
-              // The editor's action is made here, inside the lock.
+              // The editor is taken here, inside the lock, from the destination as resolved for this step.
+              const editor = ppro.SequenceEditor.getEditor(context.destination);
+              if (!editor || typeof editor.createCloneTrackItemAction !== "function") throw refuse("UXP_COMMAND_UNAVAILABLE", "Premiere does not expose SequenceEditor clone actions");
               const make = { clone: function (item, offset, videoOffset, audioOffset) { return editor.createCloneTrackItemAction(item, offset, videoOffset, audioOffset, false, false); } };
               const actions = checked(build(items, make));
               reached = true;
@@ -145,6 +147,8 @@
                 for (const action of actions) if (compoundAction.addAction(action) === false) throw commandError("UXP_ACTION_REJECTED", "Premiere rejected a copy action");
               }, name), name);
             });
+            // Never reuse the project or the sequences across a commit: resolve them again by GUID.
+            await retryStale(async function () { Object.assign(context, await projectContext(request, true)); });
             return;
           } catch (error) {
             if (attempt < STALE_ATTEMPTS && !reached && STALE_OBJECT.test(error && error.message ? error.message : "")) { await pause(attempt); continue; }

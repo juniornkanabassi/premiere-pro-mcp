@@ -317,13 +317,23 @@
       running.catch(() => {});
       return Promise.race([running, expired]).finally(() => { clearTimeout(timer); liveHandlers.delete(operationKey); });
     }
+    async function retryRead(read) {
+      for (let attempt = 1; ; attempt++) {
+        try { return await read(); } catch (error) {
+          if (attempt >= 3 || !/no longer valid/i.test(String(error && error.message))) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+        }
+      }
+    }
     async function dispatchInvocation(command, args, invocation, meta) {
       const definition = definitions[command];
       if (!definition) throw commandError("UXP_UNSUPPORTED_COMMAND", "Unsupported UXP command: " + command);
       if (definition.probe && !await definition.probe()) throw commandError("UXP_COMMAND_UNAVAILABLE", command + " is not supported by this Premiere build");
       const input = args || {};
       const operationId = validateOperationId(input.operationId);
-      if (definition.readOnly) return definition.handler(input);
+      // A read writes nothing, so a host object that dies under it ("The script object is no longer valid.",
+      // live 27.0, right after a burst of commits) is handled by reading again on fresh objects.
+      if (definition.readOnly) return retryRead(function () { return definition.handler(input); });
       if (!invocationSession || !operationLedger.secureIdentityAvailable) throw commandError("UXP_SECURE_IDENTITY_UNAVAILABLE", "Documented UXP cryptographic entropy is unavailable; no host mutation was dispatched. Run the matching panel in a supported Premiere host");
       const pin = typeof meta.pinnedSequenceId === "string" && meta.pinnedSequenceId ? meta.pinnedSequenceId : null;
       const identity = await operationIdentity(false);
@@ -390,6 +400,11 @@
       inFlightBindings.set(operationKey, binding);
       try { return await pending; }
       finally { if (inFlightOperations.get(operationKey) === pending) { inFlightOperations.delete(operationKey); inFlightBindings.delete(operationKey); } }
+    }
+    // True for a command that can write, so the panel can stand its event subscriptions down around it.
+    function isMutating(command) {
+      const definition = definitions[command];
+      return !!definition && definition.readOnly !== true && definition.nonFencing !== true;
     }
     async function capabilities() {
       let project = null, sequence = null;
@@ -2040,7 +2055,7 @@
         ? nextWorkflowRuntime.dispose()
         : { disposed: true };
     }
-    return { definitions, dispatch, capabilities, stateSnapshot, initialize, dispose };
+    return { definitions, dispatch, capabilities, stateSnapshot, initialize, dispose, isMutating };
   }
 
   function validateAddArgs(args) {

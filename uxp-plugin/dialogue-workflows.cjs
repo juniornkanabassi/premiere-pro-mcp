@@ -47,11 +47,21 @@
       if (!sequence) return partial("dialogue_sequence_host_return", added, null, []);
       const inserted = [await id(videos[0])];
       try {
-        const editor = ppro.SequenceEditor.getEditor(sequence); if (!editor || !editor.createInsertProjectItemAction) throw new Error("SequenceEditor unavailable");
+        // The project, the sequence and its editor are resolved again before every insert: each commit may kill them.
+        const sequenceId = await id(sequence);
+        const live = async function () {
+          const current = await ppro.Project.getActiveProject() || project;
+          const found = Array.from(await current.getSequences() || []);
+          let match = null; for (const item of found) if (await id(item) === sequenceId) { match = item; break; }
+          const editor = ppro.SequenceEditor.getEditor(match || sequence);
+          if (!editor || !editor.createInsertProjectItemAction) throw new Error("SequenceEditor unavailable");
+          return { project: current, editor: editor };
+        };
+        await live();
         let offset = 0;
         for (let i = 0; i < plan.segments.length; i++) {
-          if (i) { project.lockedAccess(function () { commit(project, "Insert reviewed dialogue video", [editor.createInsertProjectItemAction(videos[i], tick(offset), 0, 0, false)]); }); inserted.push(await id(videos[i])); }
-          if (plan.mode === "podcast") { project.lockedAccess(function () { commit(project, "Insert reviewed dialogue audio", [editor.createInsertProjectItemAction(audios[i], tick(offset), 0, 0, false)]); }); inserted.push(await id(audios[i])); }
+          if (i) { const now = await live(); now.project.lockedAccess(function () { commit(now.project, "Insert reviewed dialogue video", [now.editor.createInsertProjectItemAction(videos[i], tick(offset), 0, 0, false)]); }); inserted.push(await id(videos[i])); }
+          if (plan.mode === "podcast") { const now = await live(); now.project.lockedAccess(function () { commit(now.project, "Insert reviewed dialogue audio", [now.editor.createInsertProjectItemAction(audios[i], tick(offset), 0, 0, false)]); }); inserted.push(await id(audios[i])); }
           offset += plan.segments[i].source_end_seconds - plan.segments[i].source_start_seconds;
         }
       } catch (_) { return partial("dialogue_sequence_partial_insert_receipt", added, sequence, inserted); }

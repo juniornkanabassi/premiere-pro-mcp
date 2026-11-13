@@ -400,3 +400,41 @@ describe("panel watchdog: a hung mutation handler cannot block recovery", () => 
     expect(Date.now() - started).toBeLessThan(2000);
   });
 });
+
+describe("host objects are never kept between steps or commands", () => {
+  function registryWith(handlers: Record<string, unknown>) {
+    const sequence = { guid: "sequence-1", getVideoTrackCount: async () => 0, getAudioTrackCount: async () => 0 };
+    const project = { guid: "project-1", getActiveSequence: async () => sequence };
+    return Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project } }, Protocol, Workflows: { createWorkflowDefinitions: () => handlers } });
+  }
+
+  it("a read that hits a dead host object is read again on fresh objects", async () => {
+    let calls = 0;
+    const registry = registryWith({ "test.read": { readOnly: true, handler: async () => { calls++; if (calls < 3) throw new Error("The script object is no longer valid."); return { ok: true, calls }; } } });
+    await expect(registry.dispatch("test.read", {})).resolves.toMatchObject({ ok: true, calls: 3 });
+    // Only that error is retried, and only a few times.
+    let other = 0;
+    const failing = registryWith({ "test.read": { readOnly: true, handler: async () => { other++; throw new Error("something else"); } } });
+    await expect(failing.dispatch("test.read", {})).rejects.toThrow("something else");
+    expect(other).toBe(1);
+    let always = 0;
+    const dead = registryWith({ "test.read": { readOnly: true, handler: async () => { always++; throw new Error("The script object is no longer valid."); } } });
+    await expect(dead.dispatch("test.read", {})).rejects.toThrow("no longer valid");
+    expect(always).toBe(3);
+  });
+
+  it("a mutating handler is never retried, so a write cannot run twice", async () => {
+    let writes = 0;
+    const registry = registryWith({ "test.mutate": { handler: async () => { writes++; throw new Error("The script object is no longer valid."); } } });
+    await expect(registry.dispatch("test.mutate", { operationId: "no-retry" })).rejects.toThrow("no longer valid");
+    expect(writes).toBe(1);
+  });
+
+  it("tells the panel which commands can write, so event subscriptions stand down around them", () => {
+    const registry = registryWith({ "test.read": { readOnly: true, handler: async () => ({}) }, "test.select": { nonFencing: true, handler: async () => ({}) }, "test.mutate": { handler: async () => ({}) } });
+    expect(registry.isMutating("test.mutate")).toBe(true);
+    expect(registry.isMutating("test.read")).toBe(false);
+    expect(registry.isMutating("test.select")).toBe(false);
+    expect(registry.isMutating("no.such")).toBe(false);
+  });
+});

@@ -1799,6 +1799,10 @@
         const edgeAction = kind === "j_cut" ? audioContext.item.createSetStartAction(edgeTick) : audioContext.item.createSetEndAction(edgeTick);
         commitActions(context.project, kind === "j_cut" ? "Create J-cut" : "Create L-cut", [edgeAction]);
       });
+      // The commit may have killed the project and sequence handles: resolve them again before reading or writing on.
+      // A failure here is after a commit, so it must not claim "nothing was written".
+      const reresolve = async () => { try { Object.assign(context, await editorContext(true)); } catch (error) { if (error && typeof error === "object") error.noHostWrite = false; throw error; } };
+      await reresolve();
       let afterItem = await trackItemAt(context.sequence, "audio", audioTrackIndex, audioClipIndex);
       let after = await trackItemSnapshot({ ...audioContext, item: afterItem });
       let undoSteps = 1;
@@ -1808,6 +1812,7 @@
           commitActions(context.project, kind === "j_cut" ? "Set J-cut source in" : "Set L-cut source out", [sourceAction]);
         });
         undoSteps = 2;
+        await reresolve();
         afterItem = await trackItemAt(context.sequence, "audio", audioTrackIndex, audioClipIndex);
         after = await trackItemSnapshot({ ...audioContext, item: afterItem });
       }
@@ -2083,11 +2088,20 @@
           if (!sequence) return partialReceipt("derived_sequence_host_return", await reconciledSequence());
           const inserted = await safeProjectItemIds([createdItems[0]]);
           try {
-            const editor = ppro.SequenceEditor.getEditor(sequence);
-            if (!editor || typeof editor.createInsertProjectItemAction !== "function") throw new Error("editor unavailable");
+            // The project, the sequence and its editor are resolved again before every insert: each commit may kill them.
+            const sequenceId = guidString(sequence.guid);
+            const liveEditor = async () => {
+              const current = await ppro.Project.getActiveProject() || project;
+              const match = (await boundedSequences(current)).find((value) => guidString(value.guid) === sequenceId);
+              const editor = ppro.SequenceEditor.getEditor(match || sequence);
+              if (!editor || typeof editor.createInsertProjectItemAction !== "function") throw new Error("editor unavailable");
+              return { project: current, editor };
+            };
+            await liveEditor();
             let offset = ranges[0].endSeconds - ranges[0].startSeconds;
             for (let index = 1; index < createdItems.length; index++) {
-              project.lockedAccess(() => commitActions(project, "Insert silence-removal segment", [editor.createInsertProjectItemAction(createdItems[index], tick(offset, "timeline offset"), 0, 0, false)]));
+              const now = await liveEditor();
+              now.project.lockedAccess(() => commitActions(now.project, "Insert silence-removal segment", [now.editor.createInsertProjectItemAction(createdItems[index], tick(offset, "timeline offset"), 0, 0, false)]));
               inserted.push(...await safeProjectItemIds([createdItems[index]])); offset += ranges[index].endSeconds - ranges[index].startSeconds;
             }
           } catch (_) {

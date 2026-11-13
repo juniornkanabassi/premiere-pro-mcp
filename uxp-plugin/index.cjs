@@ -335,7 +335,15 @@ async function dispatch(raw) {
     else {
       assertNotCancelled(operation);
       operation.phase = "host_call";
-      result = await commandRegistry.dispatch(cmd.command, cmd.args, { pinnedSequenceId: pinnedSequenceIdOf(raw), deadlineMs: deadlineMsOf(raw) });
+      // The panel keeps Track objects only as event targets. While a command that can write runs they are let go,
+      // and they are looked up again afterwards, so no host object outlives the commits of an edit.
+      const mutating = typeof commandRegistry.isMutating === "function" && commandRegistry.isMutating(cmd.command);
+      if (mutating) { targetSubscriptionGeneration += 1; unsubscribeTrackEvents(false); }
+      try {
+        result = await commandRegistry.dispatch(cmd.command, cmd.args, { pinnedSequenceId: pinnedSequenceIdOf(raw), deadlineMs: deadlineMsOf(raw) });
+      } finally {
+        if (mutating) setTimeout(function () { void rebindTrackEvents(); }, 750);
+      }
     }
     const response = Protocol.envelope("result", {
       ok: true,

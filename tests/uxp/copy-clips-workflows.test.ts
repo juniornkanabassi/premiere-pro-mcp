@@ -43,6 +43,27 @@ function guard(entry: Item, bornDead = false): Item {
     },
   });
 }
+/** Project, sequence and track handles die with every commit too (strict mode): the step must resolve them again. */
+const CHILDREN = new Set(["getVideoTrack", "getAudioTrack", "getSequences"]);
+function mortal<T extends object>(target: T): T {
+  const mode = strict;
+  if (!mode) return target;
+  const born = mode.generation;
+  return new Proxy(target, {
+    get(inner, property) {
+      if (property === "__raw") return inner;
+      const value = (inner as Record<string | symbol, unknown>)[property];
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (born !== mode.generation) throw new Error("The script object is no longer valid.");
+        const out = (value as (...a: unknown[]) => unknown).apply(inner, args);
+        if (!CHILDREN.has(String(property))) return out;
+        const wrap = (child: unknown) => Array.isArray(child) ? child.map((entry) => mortal(entry as object)) : child && typeof child === "object" ? mortal(child as object) : child;
+        return out instanceof Promise ? out.then(wrap) : wrap(out);
+      };
+    },
+  });
+}
 const unwrap = (entry: Item): Item => (entry as unknown as { __item?: Item }).__item ?? entry;
 
 function makeItem(state: ItemState, options: { brokenTrim?: boolean } = {}) {
@@ -147,10 +168,10 @@ function host(options: { brokenTrim?: boolean; readbackBreaks?: boolean; drift?:
     executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); if (strict) { strict.generation++; if (strict.deadReadAfterCommit) strict.nextReadDead = true; } return true; }),
   };
   const ppro = {
-    Project: { getActiveProject: vi.fn(async () => project) },
+    Project: { getActiveProject: vi.fn(async () => mortal(project)) },
     TickTime: { createWithTicks: vi.fn((ticks: string) => ({ ticks })), createWithSeconds: vi.fn((seconds: number) => ({ seconds })) },
     SequenceEditor: { getEditor: vi.fn((sequence: Seq) => {
-      expect(sequence).toBe(destination);
+      expect((sequence as unknown as { __raw?: Seq }).__raw ?? sequence).toBe(destination);
       return { createCloneTrackItemAction: cloneAction };
     }) },
     Constants: { TrackItemType: { CLIP: 1 }, MediaType: { VIDEO: "video", AUDIO: "audio" } },
@@ -327,6 +348,14 @@ describe("UXP copy clips between sequences", () => {
       });
       const plan = await value.registry.dispatch("sequence.copyClips.inspect", args());
       await expect(value.registry.dispatch("sequence.copyClips", { ...args(), expectedSnapshot: plan, confirmCopy: true, operationId: "wide-dead" })).resolves.toMatchObject({ copied: true, verified: true, clipsTrimmed: 9 });
+    });
+
+    it("a later separate inspect resolves project and sequences again after the copy's commits", async () => {
+      const value = wide();
+      const plan = await value.registry.dispatch("sequence.copyClips.inspect", args());
+      await value.registry.dispatch("sequence.copyClips", { ...args(), expectedSnapshot: plan, confirmCopy: true, operationId: "wide-then-inspect" });
+      // Nothing from the apply is kept: a fresh inspect of the same ranges still works on the dead-handle host.
+      await expect(value.registry.dispatch("sequence.copyClips.inspect", request({ destinationStartTicks: tick(100), sourceStartTicks: tick(30), sourceEndTicks: tick(35) }))).resolves.toMatchObject({ projectGuid: "project-1" });
     });
 
     it("tries once more on new objects when one died before the transaction ran, and writes nothing twice", async () => {

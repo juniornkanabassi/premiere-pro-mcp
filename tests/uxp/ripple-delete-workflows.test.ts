@@ -167,8 +167,30 @@ function timelineHost(video: State[][], audio: State[][] = [], options: HostOpti
     }),
     executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); generation++; if (options.deadReadAfterCommit) nextReadDead = true; return true; }),
   };
+  /**
+   * With strictHandles the project, the sequence and the tracks die too: every handle taken before a committed
+   * transaction throws "The script object is no longer valid." afterwards, so each step must resolve them again.
+   */
+  const CHILDREN = new Set(["getActiveSequence", "getVideoTrack", "getAudioTrack"]);
+  function mortal<T extends object>(target: T): T {
+    if (!options.strictHandles) return target;
+    const born = generation;
+    return new Proxy(target, {
+      get(inner, property) {
+        const value = (inner as Record<string | symbol, unknown>)[property];
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (born !== generation) throw new Error("The script object is no longer valid.");
+          const out = (value as (...a: unknown[]) => unknown).apply(inner, args);
+          if (!CHILDREN.has(String(property))) return out;
+          const wrap = (child: unknown) => child && typeof child === "object" ? mortal(child as object) : child;
+          return out instanceof Promise ? out.then(wrap) : wrap(out);
+        };
+      },
+    });
+  }
   const ppro = {
-    Project: { getActiveProject: vi.fn(async () => project) },
+    Project: { getActiveProject: vi.fn(async () => mortal(project)) },
     TickTime: { createWithTicks: vi.fn((ticks: string) => ({ ticks, seconds: Number(BigInt(ticks)) / Number(T) })) },
     SequenceEditor: { getEditor: vi.fn(() => ({ createRemoveItemsAction: removeAction, createCloneTrackItemAction: cloneAction })) },
     TrackItemSelection: {

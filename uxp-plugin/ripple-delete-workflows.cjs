@@ -383,6 +383,18 @@
       return { project, sequence, projectGuid: requiredGuid(project.guid, "active project GUID"), sequenceId: requiredGuid(sequence.guid, "active sequence GUID"), frame: BigInt(timebase) };
     }
 
+    // Never reuse a project or sequence across a committed transaction: Premiere may have killed both.
+    // After every commit they are resolved again (the active project, then its active sequence) and checked
+    // to be the same ones.
+    async function refreshContext(context) {
+      const fresh = await retryStale(editContext);
+      if (fresh.projectGuid !== context.projectGuid || fresh.sequenceId !== context.sequenceId) {
+        throw commandError("UXP_STALE_TRACK_ITEM", "The active project or sequence changed during the edit");
+      }
+      context.project = fresh.project;
+      context.sequence = fresh.sequence;
+    }
+
     function snapTicks(seconds, frame) {
       const perFrame = frame * 1000000n;
       return (BigInt(Math.round(seconds * 1000000)) * TICKS_PER_SECOND + perFrame / 2n) / perFrame * frame;
@@ -561,6 +573,7 @@
         }
         if (!committed) throw commandError("UXP_TRANSACTION_FAILED", "Premiere did not commit " + label);
         progress.undoSteps++;
+        await refreshContext(context);
         return;
       }
     }
