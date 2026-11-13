@@ -332,7 +332,7 @@
   function validSeconds(value) { return Number.isFinite(value) && value >= 0 && value <= 86400; }
   function sameNumber(left, right) { return Math.abs(Number(left) - Number(right)) <= 0.000001; }
   function requestedSequenceId(value, name) {
-    if (typeof value !== "string" || !value || value.length > 128 || value.indexOf(" ") !== -1) {
+    if (typeof value !== "string" || !value || value.length > 128 || value.indexOf("\u0000") !== -1) {
       throw commandError("UXP_INVALID_ARGUMENT", name + " must be a non-empty sequence ID of at most 128 characters");
     }
     return value;

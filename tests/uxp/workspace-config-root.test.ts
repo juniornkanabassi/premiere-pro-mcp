@@ -203,3 +203,14 @@ describe("panel source (items 3, 4, 13)", () => {
     expect(panel).toContain('{ noHostWrite: true, dispatchEvidence: "handler_pre_write" }');
   });
 });
+
+describe("configured root with spaces in the path (live Premiere 27)", () => {
+  it("falls back to the plain file: path when the %20 form is rejected", async () => {
+    const root = folder("/Users/j/05 Other/Codex Workspace");
+    const fs = { ...fsFor(root), getEntryWithUrl: vi.fn(async (url: string) => { if (url === "file:" + root.nativePath) return root; throw new Error("not found"); }) };
+    const broker = Workspace.createWorkspaceBroker({ fs });
+    await broker.configureRoot(root.nativePath);
+    expect(broker.status()).toMatchObject({ configured: true, configError: null });
+    expect(fs.getEntryWithUrl).toHaveBeenCalledWith("file:/Users/j/05%20Other/Codex%20Workspace");
+  });
+});

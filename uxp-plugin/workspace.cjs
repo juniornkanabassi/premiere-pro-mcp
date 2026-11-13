@@ -105,7 +105,8 @@
       const kind = options && options.kind || "file";
       let entry;
       try {
-        entry = await fs.getEntryWithUrl(toFileUrl(value));
+        // Same %20 fallback as configureRoot: Premiere 27 wants the plain path.
+        try { entry = await fs.getEntryWithUrl(toFileUrl(value)); } catch (first) { entry = await fs.getEntryWithUrl("file:" + parseAbsolutePath(value, label).normalized).catch(() => { throw first; }); }
       } catch (error) {
         if (error && /^UXP_[A-Z0-9_]+$/.test(error.code || "")) throw error;
         throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve " + label + " to a canonical filesystem path");
@@ -243,7 +244,9 @@
         }
         await initialize();
         let entry;
-        try { entry = await fs.getEntryWithUrl(toFileUrl(parsed.normalized)); } catch (_) {
+        // Premiere 27 does not decode %20 in file: URLs, so fall back to the plain path (most project folders contain spaces).
+        try { entry = await fs.getEntryWithUrl(toFileUrl(parsed.normalized)); } catch (_) { try { entry = await fs.getEntryWithUrl("file:" + parsed.normalized); } catch (_) { entry = null; } }
+        if (!entry) {
           throw workspaceError("UXP_WORKSPACE_UNAVAILABLE", "Premiere could not open the configured workspace folder. Check that it exists and that the panel manifest uses localFileSystem fullAccess");
         }
         if (!entry || !entry.isFolder || !nativePathFor(entry)) {
