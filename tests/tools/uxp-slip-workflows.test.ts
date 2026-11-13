@@ -15,7 +15,6 @@ describe("public guarded track-item slip MCP tool", () => {
         slip_by_seconds: { minimum: -60, maximum: 60 },
         expected_snapshot: {
           additionalProperties: false,
-          required: ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "start_seconds", "end_seconds", "in_seconds", "out_seconds", "duration_seconds", "speed", "reversed"],
         },
       },
     });

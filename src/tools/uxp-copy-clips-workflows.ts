@@ -1,14 +1,7 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, camelKey, toPanelShape, withApplySnapshot, type SnapshotSchema } from "./uxp-apply-snapshot.js";
 
-export type Schema = {
-  type?: string;
-  properties?: Record<string, Schema>;
-  required?: string[];
-  items?: Schema;
-  additionalProperties?: boolean;
-  [key: string]: unknown;
-};
+export type Schema = SnapshotSchema;
 
 type CopyClipsArgs = {
   action: "inspect" | "apply";
@@ -68,60 +61,7 @@ const expectedSnapshotSchema: Schema = {
   },
 };
 
-function camelKey(snakeKey: string): string {
-  return snakeKey.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
-}
-
-/**
- * The schema the server validates against: every snapshot field also under its camelCase
- * twin and none required, so the raw inspect result gets past the server's schema check.
- * toPanelShape, driven by the strict schema above, still enforces required and unknown fields.
- */
-function acceptingCamelTwins(schema: Schema): Schema {
-  if (schema.type === "array") return { ...schema, items: acceptingCamelTwins(schema.items as Schema) };
-  if (schema.type !== "object" || !schema.properties) return schema;
-  const properties: Record<string, Schema> = {};
-  for (const [key, child] of Object.entries(schema.properties)) {
-    properties[key] = properties[camelKey(key)] = acceptingCamelTwins(child);
-  }
-  const { required: _required, ...rest } = schema;
-  return { ...rest, properties };
-}
 const toolSnapshotSchema = acceptingCamelTwins(expectedSnapshotSchema);
-
-/**
- * Convert a snapshot to the panel's camelCase shape, rejecting unknown or missing fields.
- * Each field may arrive as its snake_case key (expected_snapshot) or its camelCase twin
- * (the raw inspect result); giving both with different values is refused.
- */
-function toPanelShape(value: unknown, schema: Schema, name: string): unknown {
-  if (schema.type === "array") {
-    if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
-    return value.map((item, position) => toPanelShape(item, schema.items as Schema, `${name}[${position}]`));
-  }
-  if (schema.type === "object") {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
-    const record = value as Record<string, unknown>;
-    const properties = schema.properties ?? {};
-    const known = new Set(Object.keys(properties).flatMap((key) => [key, camelKey(key)]));
-    for (const key of Object.keys(record)) if (!known.has(key)) throw new Error(`${name} has an unknown field: ${key}`);
-    const out: Record<string, unknown> = {};
-    for (const key of schema.required ?? []) {
-      if (!(key in record) && !(camelKey(key) in record)) throw new Error(`${name}.${key} is required`);
-    }
-    for (const [key, child] of Object.entries(properties)) {
-      const camel = camelKey(key);
-      const both = camel !== key && key in record && camel in record;
-      if (both && JSON.stringify(record[key]) !== JSON.stringify(record[camel])) {
-        throw new Error(`${name}.${key} was given as both ${key} and ${camel} with different values`);
-      }
-      const given = key in record ? key : camel;
-      if (given in record) out[camel] = toPanelShape(record[given], child, `${name}.${key}`);
-    }
-    return out;
-  }
-  return value;
-}
 
 function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string, unknown>) {
   return bridge.request(command, args)

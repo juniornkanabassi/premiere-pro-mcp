@@ -42,7 +42,7 @@ describe("public guarded sequence preview-frame MCP tool", () => {
     const tool = getUxpSequencePreviewFrameWorkflowTools({ request } as unknown as UxpWebSocketBridge).manage_sequence_preview_frame_uxp;
     expect(tool.parameters).toMatchObject({
       additionalProperties: false, required: ["action", "sequence_id"],
-      properties: { action: { enum: ["inspect", "update"] }, expected_snapshot: { additionalProperties: false, required: Object.keys(snapshot) } },
+      properties: { action: { enum: ["inspect", "update"] }, expected_snapshot: { additionalProperties: false } },
     });
     await tool.handler({
       action: "update", sequence_id: "sequence-1", preview_width: 1920, preview_height: 1080,

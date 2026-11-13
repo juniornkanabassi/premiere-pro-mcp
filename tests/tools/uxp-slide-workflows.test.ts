@@ -10,7 +10,7 @@ describe("public guarded track-item slide MCP tool", () => {
     const tool = getUxpSlideWorkflowTools({ request } as unknown as UxpWebSocketBridge).slide_track_item_uxp;
     expect(tool.parameters).toMatchObject({
       additionalProperties: false, required: ["action", "media_type", "track_index", "clip_index"],
-      properties: { action: { enum: ["inspect", "apply"] }, slide_by_seconds: { minimum: -60, maximum: 60 }, expected_snapshot: { additionalProperties: false, required: ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "previous", "target", "following"] } },
+      properties: { action: { enum: ["inspect", "apply"] }, slide_by_seconds: { minimum: -60, maximum: 60 }, expected_snapshot: { additionalProperties: false } },
     });
     await tool.handler({
       action: "apply", media_type: "video", track_index: 0, clip_index: 1, slide_by_seconds: 2, confirm_slide: true, operation_id: "slide-tool-1",

@@ -139,7 +139,7 @@ describe("Adobe Premiere 26.3 UXP public MCP catalog", () => {
         sequence_id: { type: "string", minLength: 1, maxLength: 128 },
         preview_width: { type: "integer", minimum: 16, maximum: 10240 },
         preview_height: { type: "integer", minimum: 16, maximum: 8192 },
-        expected_snapshot: { type: "object", additionalProperties: false, required: ["project_guid", "sequence_id", "preview_width", "preview_height"] },
+        expected_snapshot: { type: "object", additionalProperties: false },
         confirm_set_preview_frame: { type: "boolean" }, operation_id: { type: "string" },
       },
     });

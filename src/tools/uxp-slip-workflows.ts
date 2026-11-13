@@ -1,5 +1,5 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, panelSnapshot, withApplySnapshot } from "./uxp-apply-snapshot.js";
 
 type SlipArgs = Record<string, unknown> & {
   action?: string;
@@ -49,35 +49,6 @@ function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string
     .catch((error: unknown) => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
 }
 
-function expectedSlipSnapshot(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("expected_snapshot must be the complete object returned by inspect");
-  }
-  const snapshot = value as Record<string, unknown>;
-  const allowed = [
-    "project_guid", "sequence_id", "media_type", "track_index", "clip_index",
-    "start_seconds", "end_seconds", "in_seconds", "out_seconds", "duration_seconds", "speed", "reversed",
-  ];
-  const unknown = Object.keys(snapshot).find((key) => !allowed.includes(key));
-  if (unknown) throw new Error(`expected_snapshot has an unknown field: ${unknown}`);
-  const missing = allowed.find((key) => !(key in snapshot));
-  if (missing) throw new Error(`expected_snapshot.${missing} is required`);
-  return {
-    projectGuid: snapshot.project_guid,
-    sequenceId: snapshot.sequence_id,
-    mediaType: snapshot.media_type,
-    trackIndex: snapshot.track_index,
-    clipIndex: snapshot.clip_index,
-    startSeconds: snapshot.start_seconds,
-    endSeconds: snapshot.end_seconds,
-    inSeconds: snapshot.in_seconds,
-    outSeconds: snapshot.out_seconds,
-    durationSeconds: snapshot.duration_seconds,
-    speed: snapshot.speed,
-    reversed: snapshot.reversed,
-  };
-}
-
 export function getUxpSlipWorkflowTools(bridge: UxpWebSocketBridge) {
   return {
     slip_track_item_uxp: {
@@ -88,7 +59,7 @@ export function getUxpSlipWorkflowTools(bridge: UxpWebSocketBridge) {
         properties: {
           action: { type: "string" as const, enum: ["inspect", "apply"] },
           ...targetProperties,
-          expected_snapshot: expectedSnapshot,
+          expected_snapshot: acceptingCamelTwins(expectedSnapshot),
           slip_by_seconds: { type: "number" as const, minimum: -60, maximum: 60, description: "Non-zero source-time offset. Timeline start/end remain unchanged." },
           confirm_slip: { type: "boolean" as const, description: "Required true after reviewing the complete inspect snapshot." },
           operation_id: operationId,
@@ -116,7 +87,7 @@ export function getUxpSlipWorkflowTools(bridge: UxpWebSocketBridge) {
         if (args.action === "apply") {
           return invoke(bridge, "trackItem.slip", {
             ...target,
-            expectedSnapshot: expectedSlipSnapshot(args.expected_snapshot),
+            expectedSnapshot: panelSnapshot(args.expected_snapshot, expectedSnapshot, "apply"),
             slipBySeconds: args.slip_by_seconds,
             confirmSlip: args.confirm_slip,
             operationId: args.operation_id,

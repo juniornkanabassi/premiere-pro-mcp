@@ -48,7 +48,7 @@ describe("public guarded timeline source-label MCP tool", () => {
     const tool = getUxpTimelineSourceLabelWorkflowTools({ request } as unknown as UxpWebSocketBridge).manage_timeline_source_label_uxp;
     expect(tool.parameters).toMatchObject({
       additionalProperties: false, required: ["action", "media_type", "track_index", "clip_index"],
-      properties: { action: { enum: ["inspect", "update"] }, expected_snapshot: { additionalProperties: false, required: Object.keys(snapshot) } },
+      properties: { action: { enum: ["inspect", "update"] }, expected_snapshot: { additionalProperties: false } },
     });
     await tool.handler({
       action: "update", media_type: "video", track_index: 0, clip_index: 0, color_index: 9,

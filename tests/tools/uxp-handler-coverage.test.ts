@@ -76,7 +76,7 @@ describe("UXP tool handler coverage", () => {
         }
       }
       // The snapshot schema lists every field in both spellings; one spelling per field is enough.
-      if (args.expected_snapshot && ["copy_clips_between_sequences_uxp", "apply_camera_cut_uxp"].includes(name)) args.expected_snapshot = snakeOnly(args.expected_snapshot);
+      if (args.expected_snapshot) args.expected_snapshot = snakeOnly(args.expected_snapshot);
       // set_lock and set_target are always refused before any bridge call.
       if (name === "manage_track_state_uxp" && all) args.action = "set_mute";
       // edit_timeline_uxp refuses arguments its action does not take; keep one action's set.

@@ -11,7 +11,7 @@ describe("public guarded contiguous track-item ripple-delete MCP tool", () => {
     const tool = getUxpRippleDeleteWorkflowTools({ request } as unknown as UxpWebSocketBridge).ripple_delete_track_item_uxp;
     expect(tool.parameters).toMatchObject({
       additionalProperties: false, required: ["action", "media_type", "track_index", "clip_index"],
-      properties: { action: { enum: ["inspect", "apply"] }, expected_snapshot: { additionalProperties: false, required: ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "track_item_count", "target", "following"] } },
+      properties: { action: { enum: ["inspect", "apply"] }, expected_snapshot: { additionalProperties: false } },
     });
     await tool.handler({
       action: "apply", media_type: "video", track_index: 0, clip_index: 0, confirm_ripple_delete: true, operation_id: "ripple-tool-1",

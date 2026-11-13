@@ -474,6 +474,12 @@ export function ensurePrivateBridgeDirectory(
   }
 }
 
+/** Bridge directories where this server process has seen the connector alive (a fresh heartbeat or any reply). */
+const connectorSeen = new Set<string>();
+/** Test hooks: forget, or record, which connectors this process has seen. */
+export function resetConnectorSeen(): void { connectorSeen.clear(); }
+export function markConnectorSeen(tempDir: string): void { connectorSeen.add(tempDir); }
+
 export function getTempDir(options?: BridgeOptions): string {
   return options?.tempDir || process.env.PREMIERE_TEMP_DIR || DEFAULT_TEMP_DIR;
 }
@@ -500,12 +506,36 @@ export function getBridgeLiveness(
       return { state: "unknown", ageMs: null };
     }
     const ageMs = Math.max(0, nowMs - statSync(heartbeatPath).mtimeMs);
+    if (ageMs <= BRIDGE_HEARTBEAT_STALE_MS) connectorSeen.add(getTempDir(options));
     return ageMs > BRIDGE_HEARTBEAT_STALE_MS
       ? { state: "stale", ageMs }
       : { state: heartbeat.state, ageMs };
   } catch {
     return { state: "unknown", ageMs: null };
   }
+}
+
+/**
+ * An edit has no connector to run on when the bridge directory holds no heartbeat at all and this server has
+ * never seen the connector alive or heard from it (telemetry: connector_not_running / no_heartbeat). An older
+ * connector that publishes no heartbeat becomes "seen" with its first reply, so a read command unlocks edits.
+ * A heartbeat file that exists but reports no usable state is a genuinely unknown state and keeps the old wait.
+ */
+function connectorNeverSeen(options?: BridgeOptions): boolean {
+  const tempDir = getTempDir(options);
+  if (connectorSeen.has(tempDir)) return false;
+  try { return !existsSync(join(tempDir, BRIDGE_HEARTBEAT_FILE)); } catch { return false; }
+}
+
+function noConnectorFailure(hostLabel = "Premiere Pro"): CommandResult {
+  return {
+    success: false,
+    data: { mutationOutcome: "not_applied", timelineChanged: false },
+    error:
+      `The CEP connector is not running in ${hostLabel}: the bridge directory has no heartbeat and nothing has answered in this session. ` +
+      `The edit was not sent. Open Window > Extensions > MCP Bridge in ${hostLabel}, wait for it to report running, then retry. ` +
+      `(An older connector that publishes no heartbeat starts working for edits after any read command gets a reply.)`,
+  };
 }
 
 /** Transport compatibility is independent from host API support and liveness. */
@@ -683,6 +713,7 @@ async function sendCommandUnchecked(
     const failure = heartbeatFailure(getBridgeLiveness(options), options?.hostLabel, options?.requireHeartbeat === true);
     if (failure) return editing ? { ...failure, data: { mutationOutcome: "not_applied", timelineChanged: false } } : failure;
   }
+  if (editing && connectorNeverSeen(options)) return noConnectorFailure(options?.hostLabel);
 
   const id = randomUUID() + (options?.hostEngine === "headless" ? ".headless" : "");
   const cmdFile = join(tempDir, `cmd_${id}.jsx`);
@@ -766,6 +797,7 @@ async function sendRawCommandUnchecked(
     const failure = heartbeatFailure(getBridgeLiveness(options), options?.hostLabel, options?.requireHeartbeat === true);
     if (failure) return editing ? { ...failure, data: { mutationOutcome: "not_applied", timelineChanged: false } } : failure;
   }
+  if (editing && connectorNeverSeen(options)) return noConnectorFailure(options?.hostLabel);
 
   const id = randomUUID();
   const cmdFile = join(tempDir, `cmd_${id}.jsx`);
@@ -906,6 +938,7 @@ async function pollForResponse(
             });
             return;
           } else {
+            connectorSeen.add(dirname(resFile));
             finish(result);
             return;
           }

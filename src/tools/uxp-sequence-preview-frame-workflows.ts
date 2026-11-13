@@ -1,5 +1,5 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, panelSnapshot, withApplySnapshot } from "./uxp-apply-snapshot.js";
 
 type PreviewFrameSnapshot = {
   project_guid: string;
@@ -25,25 +25,13 @@ const snapshotProperties = {
   preview_height: { type: "integer", minimum: 16, maximum: 8192 },
 } as const;
 const snapshotRequired = ["project_guid", "sequence_id", "preview_width", "preview_height"];
+const strictSnapshotSchema = { type: "object", additionalProperties: false, required: snapshotRequired, properties: snapshotProperties };
 const expectedSnapshotSchema = { properties: snapshotProperties };
 
 function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string, unknown>) {
   return bridge.request(command, args)
     .then((result) => ({ success: true, data: { backend: "uxp", result } }))
     .catch((error: unknown) => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
-}
-
-function strictSnapshot(value: PreviewFrameArgs["expected_snapshot"]) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected_snapshot is required for action: update");
-  const record = value as Record<string, unknown>;
-  for (const key of Object.keys(record)) if (!(key in snapshotProperties)) throw new Error(`expected_snapshot has an unknown field: ${key}`);
-  for (const key of snapshotRequired) if (!(key in record)) throw new Error(`expected_snapshot.${key} is required`);
-  return {
-    projectGuid: record.project_guid,
-    sequenceId: record.sequence_id,
-    previewWidth: record.preview_width,
-    previewHeight: record.preview_height,
-  };
 }
 
 /** A bounded documented-UXP preview-frame workflow for one explicit sequence GUID. */
@@ -59,7 +47,7 @@ export function getUxpSequencePreviewFrameWorkflowTools(bridge: UxpWebSocketBrid
           sequence_id: { type: "string", minLength: 1, maxLength: 128, description: "Exact sequence GUID returned by an existing sequence inspector." },
           preview_width: { type: "integer", minimum: 16, maximum: 10240, description: "Requested native preview-frame width. Required for action: update." },
           preview_height: { type: "integer", minimum: 16, maximum: 8192, description: "Requested native preview-frame height. Required for action: update." },
-          expected_snapshot: { type: "object", additionalProperties: false, required: snapshotRequired, properties: snapshotProperties },
+          expected_snapshot: acceptingCamelTwins(strictSnapshotSchema),
           confirm_set_preview_frame: { type: "boolean", description: "Must be true for action: update after reviewing expected_snapshot." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: update." },
         },
@@ -79,7 +67,7 @@ export function getUxpSequencePreviewFrameWorkflowTools(bridge: UxpWebSocketBrid
           sequenceId: args.sequence_id,
           previewWidth: args.preview_width,
           previewHeight: args.preview_height,
-          expectedSnapshot: strictSnapshot(args.expected_snapshot),
+          expectedSnapshot: panelSnapshot(args.expected_snapshot, strictSnapshotSchema, "update"),
           confirmSetPreviewFrame: args.confirm_set_preview_frame,
           operationId: args.operation_id,
         });

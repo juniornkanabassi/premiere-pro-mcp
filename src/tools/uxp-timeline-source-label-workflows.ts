@@ -1,5 +1,5 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, panelSnapshot, withApplySnapshot } from "./uxp-apply-snapshot.js";
 
 type SourceLabelSnapshot = {
   project_guid: string; sequence_id: string; media_type: "video" | "audio";
@@ -33,25 +33,13 @@ const snapshotProperties = {
   end_seconds: { type: "number", minimum: 0, maximum: 86400 },
 } as const;
 const snapshotRequired = ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "track_item_count", "source_project_item_id", "source_color_label_index", "start_seconds", "end_seconds"];
+const strictSnapshotSchema = { type: "object", additionalProperties: false, required: snapshotRequired, properties: snapshotProperties };
 const expectedSnapshotSchema = { properties: snapshotProperties };
 
 function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string, unknown>) {
   return bridge.request(command, args)
     .then((result) => ({ success: true, data: { backend: "uxp", result } }))
     .catch((error: unknown) => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
-}
-
-function strictSnapshot(value: SourceLabelArgs["expected_snapshot"]) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected_snapshot is required for action: update");
-  const record = value as Record<string, unknown>;
-  for (const key of Object.keys(record)) if (!(key in snapshotProperties)) throw new Error(`expected_snapshot has an unknown field: ${key}`);
-  for (const key of snapshotRequired) if (!(key in record)) throw new Error(`expected_snapshot.${key} is required`);
-  return {
-    projectGuid: record.project_guid, sequenceId: record.sequence_id, mediaType: record.media_type,
-    trackIndex: record.track_index, clipIndex: record.clip_index, trackItemCount: record.track_item_count,
-    sourceProjectItemId: record.source_project_item_id, sourceColorLabelIndex: record.source_color_label_index,
-    startSeconds: record.start_seconds, endSeconds: record.end_seconds,
-  };
 }
 
 /** A bounded documented-UXP source-label workflow resolved from one timeline coordinate in an explicit or active sequence. */
@@ -69,7 +57,7 @@ export function getUxpTimelineSourceLabelWorkflowTools(bridge: UxpWebSocketBridg
           clip_index: { type: "integer", minimum: 0, maximum: 511 },
           sequence_id: { type: "string", minLength: 1, maxLength: 128, description: "Optional exact sequence ID to resolve the coordinate in. When given it is resolved by ID and never falls back to the active sequence; an unknown ID fails. Update always targets expected_snapshot.sequence_id, and a given sequence_id must match it." },
           color_index: { type: "integer", minimum: 0, maximum: 15, description: "Requested native source color-label index." },
-          expected_snapshot: { type: "object", additionalProperties: false, required: snapshotRequired, properties: snapshotProperties },
+          expected_snapshot: acceptingCamelTwins(strictSnapshotSchema),
           confirm_set_label: { type: "boolean", description: "Must be true for action: update after reviewing expected_snapshot." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: update." },
         },
@@ -87,7 +75,7 @@ export function getUxpTimelineSourceLabelWorkflowTools(bridge: UxpWebSocketBridg
         };
         if (args.action === "inspect") return withApplySnapshot(invoke(bridge, "timeline.sourceLabel.inspect", target), expectedSnapshotSchema);
         if (args.action === "update") {
-          const expectedSnapshot = strictSnapshot(args.expected_snapshot);
+          const expectedSnapshot = panelSnapshot(args.expected_snapshot, strictSnapshotSchema, "update");
           if (args.sequence_id !== undefined && args.sequence_id !== expectedSnapshot.sequenceId) {
             return { success: false, error: "sequence_id must exactly match expected_snapshot.sequence_id; nothing was changed" };
           }

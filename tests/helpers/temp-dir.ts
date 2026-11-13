@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensurePrivateBridgeDirectory } from "../../src/bridge/file-bridge.js";
+import { ensurePrivateBridgeDirectory, markConnectorSeen } from "../../src/bridge/file-bridge.js";
 
 const created: string[] = [];
 
@@ -16,6 +16,13 @@ export function makeTempDir(prefix: string): string {
 export function makePrivateBridgeTempDir(prefix: string): string {
   const directory = join(makeTempDir(prefix), "bridge");
   ensurePrivateBridgeDirectory(directory);
+  return directory;
+}
+
+/** A bridge directory whose simulated connector has answered before, so edits are sent (not refused as "connector not running"). */
+export function makeAnsweringBridgeTempDir(prefix: string): string {
+  const directory = makePrivateBridgeTempDir(prefix);
+  markConnectorSeen(directory);
   return directory;
 }
 

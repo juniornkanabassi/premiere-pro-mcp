@@ -1,5 +1,5 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, panelSnapshot, withApplySnapshot } from "./uxp-apply-snapshot.js";
 
 type ItemSnapshot = {
   project_item_id: string;
@@ -40,31 +40,6 @@ function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string
     .catch((error: unknown) => ({ success: false, error: error instanceof Error ? error.message : String(error) }));
 }
 
-function strictItemSnapshot(value: unknown, name: string) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
-  const record = value as Record<string, unknown>;
-  for (const key of Object.keys(record)) if (!(key in itemSnapshotProperties)) throw new Error(`${name} has an unknown field: ${key}`);
-  for (const key of itemSnapshotRequired) if (!(key in record)) throw new Error(`${name}.${key} is required`);
-  return {
-    projectItemId: record.project_item_id,
-    startSeconds: record.start_seconds, endSeconds: record.end_seconds, inSeconds: record.in_seconds,
-    outSeconds: record.out_seconds, durationSeconds: record.duration_seconds, speed: record.speed, reversed: record.reversed,
-  };
-}
-
-function expectedCloneSnapshot(value: CloneArgs["expected_snapshot"]) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected_snapshot is required for action: apply");
-  const record = value as Record<string, unknown>;
-  const allowed = ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "track_item_count", "source"];
-  for (const key of Object.keys(record)) if (!allowed.includes(key)) throw new Error(`expected_snapshot has an unknown field: ${key}`);
-  for (const key of allowed) if (!(key in record)) throw new Error(`expected_snapshot.${key} is required`);
-  return {
-    projectGuid: record.project_guid, sequenceId: record.sequence_id, mediaType: record.media_type,
-    trackIndex: record.track_index, clipIndex: record.clip_index, trackItemCount: record.track_item_count,
-    source: strictItemSnapshot(record.source, "expected_snapshot.source"),
-  };
-}
-
 /** A bounded documented-UXP append-only counterpart to a timeline duplicate. */
 const expectedSnapshotSchema = {
   type: "object",
@@ -90,7 +65,7 @@ export function getUxpCloneWorkflowTools(bridge: UxpWebSocketBridge) {
           media_type: { type: "string", enum: ["video", "audio"] },
           track_index: { type: "integer", minimum: 0, maximum: 511 },
           clip_index: { type: "integer", minimum: 0, maximum: 511, description: "The clip to duplicate. Without a destination it must be the final clip on the track." },
-          expected_snapshot: expectedSnapshotSchema,
+          expected_snapshot: acceptingCamelTwins(expectedSnapshotSchema),
           confirm_duplicate: { type: "boolean", description: "Must be true for action: apply." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: apply." },
           destination_seconds: { type: "number", minimum: 0, maximum: 86400, description: "Timeline start of the copy. Omit to keep the source start (use with destination_track_index)." },
@@ -111,7 +86,7 @@ export function getUxpCloneWorkflowTools(bridge: UxpWebSocketBridge) {
         };
         if (args.action === "inspect") return withApplySnapshot(invoke(bridge, "trackItem.clone.inspect", target), expectedSnapshotSchema);
         if (args.action === "apply") return invoke(bridge, "trackItem.clone", {
-          ...target, expectedSnapshot: expectedCloneSnapshot(args.expected_snapshot),
+          ...target, expectedSnapshot: panelSnapshot(args.expected_snapshot, expectedSnapshotSchema, "apply"),
           confirmDuplicate: args.confirm_duplicate, operationId: args.operation_id,
         });
         return { success: false, error: `Unsupported workflow action: ${String(args.action)}` };

@@ -2,8 +2,68 @@ type JsonSchemaObject = { type?: string | string[]; properties?: Record<string, 
 type ToolResult = { success: boolean; data?: unknown; error?: string };
 type ApplyGuard = { schema: JsonSchemaObject; sourceKey?: string; sourceValue?: (record: Record<string, unknown>) => unknown };
 
-function camelKey(snakeKey: string): string {
+export function camelKey(snakeKey: string): string {
   return snakeKey.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+export type SnapshotSchema = {
+  type?: string;
+  properties?: Record<string, SnapshotSchema>;
+  required?: string[];
+  items?: SnapshotSchema;
+  additionalProperties?: boolean;
+  [key: string]: unknown;
+};
+
+/**
+ * The schema the server validates an expected_snapshot against: every field also under its camelCase
+ * twin and none required, so the raw inspect result (the panel's camelCase keys) gets past the server's
+ * schema check as well as the snake_case expected_snapshot inspect attaches. toPanelShape, driven by
+ * the strict schema, still enforces required and unknown fields.
+ */
+export function acceptingCamelTwins<T extends SnapshotSchema>(schema: T): T {
+  if (schema.type === "array") return { ...schema, items: acceptingCamelTwins(schema.items as SnapshotSchema) };
+  if (schema.type !== "object" || !schema.properties) return schema;
+  const properties: Record<string, SnapshotSchema> = {};
+  for (const [key, child] of Object.entries(schema.properties)) {
+    properties[key] = properties[camelKey(key)] = acceptingCamelTwins(child);
+  }
+  const { required: _required, ...rest } = schema;
+  return { ...rest, properties } as T;
+}
+
+/**
+ * Convert a snapshot to the panel's camelCase shape, rejecting unknown or missing fields.
+ * Each field may arrive as its snake_case key (expected_snapshot) or its camelCase twin
+ * (the raw inspect result); giving both with different values is refused.
+ */
+export function toPanelShape(value: unknown, schema: SnapshotSchema, name: string): unknown {
+  if (schema.type === "array") {
+    if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
+    return value.map((item, position) => toPanelShape(item, schema.items as SnapshotSchema, `${name}[${position}]`));
+  }
+  if (schema.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
+    const record = value as Record<string, unknown>;
+    const properties = schema.properties ?? {};
+    const known = new Set(Object.keys(properties).flatMap((key) => [key, camelKey(key)]));
+    for (const key of Object.keys(record)) if (!known.has(key)) throw new Error(`${name} has an unknown field: ${key}`);
+    const out: Record<string, unknown> = {};
+    for (const key of schema.required ?? []) {
+      if (!(key in record) && !(camelKey(key) in record)) throw new Error(`${name}.${key} is required`);
+    }
+    for (const [key, child] of Object.entries(properties)) {
+      const camel = camelKey(key);
+      const both = camel !== key && key in record && camel in record;
+      if (both && JSON.stringify(record[key]) !== JSON.stringify(record[camel])) {
+        throw new Error(`${name}.${key} was given as both ${key} and ${camel} with different values`);
+      }
+      const given = key in record ? key : camel;
+      if (given in record) out[camel] = toPanelShape(record[given], child, `${name}.${key}`);
+    }
+    return out;
+  }
+  return value;
 }
 
 /**
@@ -110,4 +170,10 @@ function matchesSchemaValue(value: unknown, schema: JsonSchemaObject): boolean {
   if (Array.isArray(value) && ((schema.minItems !== undefined && value.length < schema.minItems) || (schema.maxItems !== undefined && value.length > schema.maxItems))) return false;
   if (Array.isArray(value) && schema.uniqueItems && new Set(value.map((item) => JSON.stringify(item))).size !== value.length) return false;
   return true;
+}
+
+/** expected_snapshot for an apply or update call: required, then converted by toPanelShape. */
+export function panelSnapshot(value: unknown, schema: SnapshotSchema, action: string): Record<string, unknown> {
+  if (value === undefined || value === null) throw new Error(`expected_snapshot is required for action: ${action}`);
+  return toPanelShape(value, schema, "expected_snapshot") as Record<string, unknown>;
 }

@@ -1,5 +1,5 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
-import { withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, panelSnapshot, withApplySnapshot } from "./uxp-apply-snapshot.js";
 
 export type Schema = {
   type?: string;
@@ -57,33 +57,6 @@ const expectedSnapshotSchema: Schema = {
   },
 };
 
-function camelKey(snakeKey: string): string {
-  return snakeKey.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
-}
-
-/** Convert a snake_case snapshot to the panel's camelCase shape, rejecting unknown or missing fields. */
-function toPanelShape(value: unknown, schema: Schema, name: string): unknown {
-  if (schema.type === "array") {
-    if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
-    return value.map((item, position) => toPanelShape(item, schema.items as Schema, `${name}[${position}]`));
-  }
-  if (schema.type === "object") {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
-    const record = value as Record<string, unknown>;
-    const properties = schema.properties ?? {};
-    for (const key of Object.keys(record)) if (!(key in properties)) throw new Error(`${name} has an unknown field: ${key}`);
-    const out: Record<string, unknown> = {};
-    for (const key of schema.required ?? []) {
-      if (!(key in record)) throw new Error(`${name}.${key} is required`);
-    }
-    for (const [key, child] of Object.entries(properties)) {
-      if (key in record) out[camelKey(key)] = toPanelShape(record[key], child, `${name}.${key}`);
-    }
-    return out;
-  }
-  return value;
-}
-
 function invoke(bridge: UxpWebSocketBridge, command: string, args: Record<string, unknown>) {
   return bridge.request(command, args)
     .then((result) => ({ success: true, data: { backend: "uxp", result } }))
@@ -102,7 +75,7 @@ export function getUxpUnnestWorkflowTools(bridge: UxpWebSocketBridge) {
           media_type: { type: "string", enum: ["video", "audio"], description: "Track type of the nest clip to unnest (either half of a picture-and-sound nest)." },
           track_index: { type: "integer", minimum: 0, maximum: 511 },
           clip_index: { type: "integer", minimum: 0, maximum: 511, description: "Clip index of the nest clip on that track." },
-          expected_snapshot: expectedSnapshotSchema,
+          expected_snapshot: acceptingCamelTwins(expectedSnapshotSchema),
           confirm_unnest: { type: "boolean", description: "Must be true for action: apply." },
           operation_id: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$", description: "Required replay-safe operation identifier for action: apply." },
         },
@@ -120,10 +93,9 @@ export function getUxpUnnestWorkflowTools(bridge: UxpWebSocketBridge) {
         const target = { mediaType: args.media_type, trackIndex: args.track_index, clipIndex: args.clip_index };
         if (args.action === "inspect") return withApplySnapshot(invoke(bridge, "sequence.unnest.inspect", target), expectedSnapshotSchema);
         if (args.action === "apply") {
-          if (!args.expected_snapshot) throw new Error("expected_snapshot is required for action: apply");
           return invoke(bridge, "sequence.unnest", {
             ...target,
-            expectedSnapshot: toPanelShape(args.expected_snapshot, expectedSnapshotSchema, "expected_snapshot"),
+            expectedSnapshot: panelSnapshot(args.expected_snapshot, expectedSnapshotSchema, "apply"),
             confirmUnnest: args.confirm_unnest,
             operationId: args.operation_id,
           });

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createServer } from "../src/server.js";
 import { inspectHostRecovery } from "../src/bridge/host-lease.js";
-import { cleanupTempDirs, makePrivateBridgeTempDir } from "./helpers/temp-dir.js";
+import { cleanupTempDirs, makeAnsweringBridgeTempDir } from "./helpers/temp-dir.js";
 
 const controls = vi.hoisted(() => ({ afterWrite: undefined as (() => void) | undefined, afterCancellation: undefined as (() => void) | undefined }));
 vi.mock("../src/tools/project.js", async () => {
@@ -53,7 +53,7 @@ vi.mock("../src/tools/project.js", async () => {
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { controls.afterWrite = undefined; controls.afterCancellation = undefined; for (const cleanup of cleanups.splice(0)) await cleanup(); cleanupTempDirs(); });
 async function connected() {
-  const tempDir = makePrivateBridgeTempDir("premiere-server-recovery-");
+  const tempDir = makeAnsweringBridgeTempDir("premiere-server-recovery-");
   const accepted: string[] = [], replied = new Set<string>();
   // Exercise the real private-file transport and ownership lease. This simulated
   // panel acknowledges package IPC only; it is not live Premiere evidence.

@@ -10,7 +10,7 @@ describe("public guarded append-only track-item duplicate MCP tool", () => {
     const tool = getUxpCloneWorkflowTools({ request } as unknown as UxpWebSocketBridge).duplicate_track_item_uxp;
     expect(tool.parameters).toMatchObject({
       additionalProperties: false, required: ["action", "media_type", "track_index", "clip_index"],
-      properties: { action: { enum: ["inspect", "apply"] }, expected_snapshot: { additionalProperties: false, required: ["project_guid", "sequence_id", "media_type", "track_index", "clip_index", "track_item_count", "source"] } },
+      properties: { action: { enum: ["inspect", "apply"] }, expected_snapshot: { additionalProperties: false } },
     });
     await tool.handler({
       action: "apply", media_type: "video", track_index: 0, clip_index: 0, confirm_duplicate: true, operation_id: "clone-tool-1",

@@ -4,7 +4,7 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { inspectHostRecovery } from "../src/bridge/host-lease.js";
 import { createServer } from "../src/server.js";
-import { cleanupTempDirs, makePrivateBridgeTempDir } from "./helpers/temp-dir.js";
+import { cleanupTempDirs, makeAnsweringBridgeTempDir } from "./helpers/temp-dir.js";
 import { refusalHost, type RefusalHostOptions } from "./helpers/refusal-host.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -14,7 +14,7 @@ afterEach(async () => {
 });
 
 async function connected(options: RefusalHostOptions = {}) {
-  const tempDir = makePrivateBridgeTempDir("premiere-definite-refusals-");
+  const tempDir = makeAnsweringBridgeTempDir("premiere-definite-refusals-");
   const host = refusalHost(options);
   const replied = new Set<string>();
   const panelErrors: unknown[] = [];

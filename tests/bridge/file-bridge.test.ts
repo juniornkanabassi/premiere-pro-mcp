@@ -25,6 +25,8 @@ import {
   getTempDir,
   getDefaultBridgeTempDir,
   getBridgeLiveness,
+  resetConnectorSeen,
+  markConnectorSeen,
   ensurePrivateBridgeDirectory,
   inspectWindowsBridgeDirectoryAcl,
   isWindowsCapabilitySid,
@@ -201,6 +203,7 @@ describe("getDarwinUserTempDirectory", () => {
 
 describe("sendCommand", () => {
   beforeEach(() => {
+    resetConnectorSeen();
     vi.clearAllMocks();
     mockedWriteFileSync.mockReset();
     descriptorPaths.clear();
@@ -234,6 +237,7 @@ describe("sendCommand", () => {
   });
 
   it("records implicit legacy edit dispatch and measured stages while explicit read-only preflights stay undispatched", async () => {
+    markConnectorSeen("/tmp/test-bridge"); // an older connector without a heartbeat that has answered before
     mockedExistsSync.mockImplementation((path) => !String(path).endsWith("bridge-heartbeat.json"));
     mockedReadFileSync.mockReturnValue('{"success":true,"data":{"verified":true}}');
     for (const send of [sendCommand, sendRawCommand]) {
@@ -838,6 +842,7 @@ describe("sendCommand", () => {
   });
 
   it("reports unknown mutation state when an edit times out with a stuck busy marker", async () => {
+    markConnectorSeen("/tmp/test-bridge"); // an older connector without a heartbeat that has answered before
     mockedExistsSync.mockImplementation((path) => String(path).includes("busy_"));
     mockedStatSync.mockImplementation((path) => String(path).includes("busy_")
       ? ({ mtimeMs: 0 } as unknown as ReturnType<typeof statSync>)
@@ -856,6 +861,7 @@ describe("sendCommand", () => {
   });
 
   it("explains a queued command behind a fresh busy operation and proves mutating request was not applied", async () => {
+    markConnectorSeen("/tmp/test-bridge"); // an older connector without a heartbeat that has answered before
     vi.setSystemTime(new Date(10_000));
     mockedExistsSync.mockImplementation((path) => {
       const value = String(path);
@@ -881,6 +887,7 @@ describe("sendCommand", () => {
   });
 
   it("cancels an unclaimed command behind a stale busy marker still within the hard cap", async () => {
+    markConnectorSeen("/tmp/test-bridge"); // an older connector without a heartbeat that has answered before
     vi.setSystemTime(new Date(10_000));
     mockedExistsSync.mockImplementation((path) => {
       const value = String(path);
@@ -930,6 +937,7 @@ describe("sendCommand", () => {
   });
 
   it("withdraws an unclaimed edit when no connector is running and says so, without an unknown outcome (live: create_caption_track)", async () => {
+    markConnectorSeen("/tmp/test-bridge"); // an older connector without a heartbeat that has answered before
     vi.setSystemTime(new Date(10_000));
     mockedExistsSync.mockImplementation((path) => {
       const value = String(path);
@@ -948,6 +956,38 @@ describe("sendCommand", () => {
     expect(result.error).toContain("not run");
     expect(result.error).not.toContain("outcome is unknown");
     expect(mockedRenameSync).toHaveBeenCalledWith(expect.stringMatching(/cmd_.*\.jsx$/), expect.stringMatching(/cmd_.*\.jsx\.cancelled$/));
+  });
+
+  it("refuses an edit at once when there is no heartbeat and the connector was never seen, without sending it (live: create_caption_track waited 30 s)", async () => {
+    mockedExistsSync.mockImplementation(() => false);
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700 } as unknown as ReturnType<typeof statSync>);
+
+    const result = await sendCommand("mutate", { tempDir: "/tmp/test-bridge", mutating: true });
+
+    expect(result).toMatchObject({ success: false, data: { mutationOutcome: "not_applied", timelineChanged: false } });
+    expect(result.error).toContain("The CEP connector is not running in Premiere Pro");
+    expect(mockedRenameSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps the old wait when a heartbeat file exists but reports no usable state (genuinely unknown)", async () => {
+    vi.setSystemTime(new Date(10_000));
+    mockedExistsSync.mockImplementation((path) => { const value = String(path); return !(value.includes("res_") || value.includes("busy_")); });
+    mockedReadFileSync.mockReturnValue('{"protocolVersion":1,"state":"unrecognised"}');
+    mockedReaddirSync.mockReturnValue([]);
+    mockedStatSync.mockReturnValue({ uid: myUid, mode: 0o700 } as unknown as ReturnType<typeof statSync>);
+
+    const promise = sendCommand("mutate", { tempDir: "/tmp/test-bridge", timeoutMs: 500, mutating: true });
+    await vi.advanceTimersByTimeAsync(600);
+    const result = await promise;
+
+    expect(mockedRenameSync).toHaveBeenCalled(); // it was published and waited for
+    expect(result.success).toBe(false);
+  });
+
+  it("does not refuse a read-only command for a missing heartbeat", async () => {
+    mockedExistsSync.mockImplementation((path) => String(path).includes("res_"));
+    mockedReadFileSync.mockReturnValue('{"success":true}');
+    await expect(sendCommand("read", { tempDir: "/tmp/test-bridge", mutating: false })).resolves.toMatchObject({ success: true });
   });
 
   it.each([
