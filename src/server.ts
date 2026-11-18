@@ -640,12 +640,14 @@ export function createServer(
 
     // Only tools that can change state advertise idempotency_key. A key sent
     // with a read-only action of a multi-action tool is accepted and ignored.
-    const acceptsIdempotencyKey = toolMayChangeState(name);
+    // Companion tools carry their own requestId and project; the CEP guards and a second key would only mislead.
+    const companion = name.startsWith("companion_");
+    const acceptsIdempotencyKey = !companion && toolMayChangeState(name);
     // The session guard tool carries its own guard schema; every other tool
     // accepts the guards per call. Under the compact profile the listed schema
     // omits them (they are still validated and honored when sent).
-    const advertisesGuards = name !== SESSION_GUARD_TOOL_NAME && !schemaProfile.compactGuards;
-    const acceptsGuardsUnlisted = name !== SESSION_GUARD_TOOL_NAME && schemaProfile.compactGuards;
+    const advertisesGuards = name !== SESSION_GUARD_TOOL_NAME && !companion && !schemaProfile.compactGuards;
+    const acceptsGuardsUnlisted = name !== SESSION_GUARD_TOOL_NAME && !companion && schemaProfile.compactGuards;
     const listedSchema = {
       ...tool.parameters,
       properties: {
