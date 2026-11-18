@@ -35,7 +35,9 @@ type PathFlavor = typeof posix | typeof win32;
 
 function absoluteFlavor(value: string): PathFlavor | null {
   if (/^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]/.test(value)) return win32;
-  if (value.startsWith("/") && !value.startsWith("//")) return posix;
+  // The panel accepts //host/share/... as a network path. Windows resolves it as UNC; POSIX as the local root.
+  if (value.startsWith("//")) return process.platform === "win32" ? win32 : posix;
+  if (value.startsWith("/")) return posix;
   return null;
 }
 
