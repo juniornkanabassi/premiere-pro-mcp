@@ -2,6 +2,7 @@
 import { fromJsonSchema, type JsonSchemaType } from "@modelcontextprotocol/server";
 import { describe, expect, it, vi } from "vitest";
 import { getUxpTools } from "../../src/tools/uxp.js";
+import { getUxpNextWorkflowTools } from "../../src/tools/uxp-next-workflows.js";
 import type { UxpWebSocketBridge } from "../../src/bridge/uxp-websocket-bridge.js";
 
 function tools() {
@@ -56,5 +57,24 @@ describe("encode_media_uxp", () => {
     expect(request.mock.calls.at(-1)).toHaveLength(2);
     await all.encode_media_uxp.handler({ action: "preflight", sequence_id: "s", preset_file: "/w/p.epr", output_file: "/w/out.mp4", export_type: "immediately" });
     expect(request).toHaveBeenLastCalledWith("encoder.preflight", { sequenceId: "s", presetFile: "/w/p.epr" });
+  });
+});
+
+describe("manage_source_clip_uxp unset marks (inspection A7)", () => {
+  it("carries an unset mark from inspect into the apply items as null, and update passes it on as a guard", async () => {
+    const request = vi.fn().mockResolvedValue({ count: 2, items: [
+      { projectItemId: "clip-1", mediaType: "video", inSeconds: null, outSeconds: 9 },
+      { projectItemId: "clip-2", mediaType: "audio", inSeconds: 1, outSeconds: 4 },
+    ] });
+    const tool = getUxpNextWorkflowTools({ request, getState: vi.fn() } as unknown as UxpWebSocketBridge).manage_source_clip_uxp;
+    const inspected = await tool.handler({ action: "inspect", items: [{ project_item_id: "clip-1", media_type: "video" }, { project_item_id: "clip-2", media_type: "audio" }] }) as { data: { items: Record<string, unknown>[] } };
+    expect(inspected.data.items).toEqual([
+      { project_item_id: "clip-1", media_type: "video", expected_in_seconds: null, expected_out_seconds: 9 },
+      { project_item_id: "clip-2", media_type: "audio", expected_in_seconds: 1, expected_out_seconds: 4 },
+    ]);
+    const update = { action: "update", items: [{ ...inspected.data.items[0], in_seconds: 1, out_seconds: 2 }], operation_id: "trim-1" };
+    expect(await valid(tool, update)).not.toHaveProperty("issues");
+    await tool.handler(update as never);
+    expect(request).toHaveBeenLastCalledWith("source.clip.update", { items: [{ projectItemId: "clip-1", mediaType: "video", expectedInSeconds: null, expectedOutSeconds: 9, inSeconds: 1, outSeconds: 2 }], operationId: "trim-1" });
   });
 });

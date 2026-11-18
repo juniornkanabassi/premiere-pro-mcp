@@ -119,8 +119,8 @@ type TrackStateArgs = {
 type SourceClipItem = {
   project_item_id?: string;
   media_type?: string;
-  expected_in_seconds?: number;
-  expected_out_seconds?: number;
+  expected_in_seconds?: number | null;
+  expected_out_seconds?: number | null;
   in_seconds?: number;
   out_seconds?: number;
   clear_in_out?: boolean;
@@ -172,8 +172,9 @@ export function getUxpNextWorkflowTools(bridge: UxpWebSocketBridge) {
   const sourceClipSnapshotSchema = { type: "array", minItems: 1, maxItems: 64, items: { type: "object", additionalProperties: false, properties: {
     project_item_id: { type: "string", minLength: 1, maxLength: 512 },
     media_type: { type: "string", enum: ["video", "audio"] },
-    expected_in_seconds: { type: "number", minimum: 0, maximum: 86400000, sourceKey: "inSeconds" },
-    expected_out_seconds: { type: "number", minimum: 0, maximum: 86400000, sourceKey: "outSeconds" },
+    // null: the mark was unset at inspection and must still be unset; omit the field for no guard.
+    expected_in_seconds: { type: ["number", "null"], minimum: 0, maximum: 86400000, sourceKey: "inSeconds" },
+    expected_out_seconds: { type: ["number", "null"], minimum: 0, maximum: 86400000, sourceKey: "outSeconds" },
   }, required: ["project_item_id", "media_type", "expected_in_seconds", "expected_out_seconds"] } };
   return {
     inspect_premiere_events_uxp: {
