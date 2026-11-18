@@ -972,6 +972,11 @@
         if (appPreferenceSetTails.get(preference) === tail) appPreferenceSetTails.delete(preference);
       });
     }
+    // These converters take no overwrite confirmation, so an existing destination is refused before the host sees it.
+    // shortcut: an unknown answer (no walkable workspace) still proceeds as before; refuse it too once every host can answer.
+    async function refuseExistingOutput(path) {
+      if (await outputFileExists(path) === true) throw refuse("UXP_DESTINATION_EXISTS", "outputFilePath already exists; choose a new file name. Nothing was written");
+    }
     async function exportInterchange(args) {
       assertOnlyKeys(args, ["format", "outputFilePath", "suppressUI", "operationId"]);
       const format = requiredString(args.format, "format");
@@ -980,6 +985,7 @@
       if (!ppro.ProjectConverter || typeof ppro.ProjectConverter[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Requested interchange format " + format + " is unavailable in this Premiere build");
       const suppressUI = optionalBoolean(args.suppressUI, true, "suppressUI");
       const outputFilePath = await allowedPath(args.outputFilePath, "outputFilePath", "file", true);
+      await refuseExistingOutput(outputFilePath);
       const context = await activeContext(false);
       const exported = await ppro.ProjectConverter[method](context.sequence, outputFilePath, suppressUI);
       if (!exported) throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not confirm the interchange export");
@@ -988,6 +994,7 @@
     async function exportAaf(args) {
       const input = validateAafArgs(args);
       input.outputFilePath = await allowedPath(input.outputFilePath, "outputFilePath", "file", true);
+      await refuseExistingOutput(input.outputFilePath);
       if (input.options.videoMixdownPresetPath != null) {
         input.options.videoMixdownPresetPath = await allowedPath(input.options.videoMixdownPresetPath, "videoMixdownPresetPath", "file");
       }
@@ -2248,7 +2255,8 @@
   function oneOfInt(value, name, allowed) { if (!Number.isInteger(value) || !allowed.includes(value)) throw refuse("UXP_INVALID_ARGUMENT", name + " must be one of " + allowed.join(", ")); return value; }
   function requireConfirmation(value, message) { if (value !== true) throw refuse("UXP_CONFIRMATION_REQUIRED", message + "; pass confirmNonUndoable=true after review"); }
   function requiredOperationId(value) { if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId is required and must be 1-128 safe characters"); return value; }
-  function validateOperationId(value) { if (value == null) return null; if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw refuse("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters"); return value; }
+  // "anonymous:" names the panel's own keys for calls without an ID; a caller who saw one in recovery must not reuse it.
+  function validateOperationId(value) { if (value == null) return null; if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value) || value.startsWith("anonymous:")) throw refuse("UXP_INVALID_ARGUMENT", "operationId must be 1-128 safe characters and must not start with anonymous:"); return value; }
   function simpleRevision(value) { var hash = 2166136261; for (var i = 0; i < value.length; i += 1) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 16777619); } return "uxp-" + (hash >>> 0).toString(16); }
   function commandError(code, message) { const error = new Error(message); error.code = code; return error; }
   // A refusal thrown before the handler's first host write. Tag only where call order proves no write ran.

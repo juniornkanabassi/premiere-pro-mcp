@@ -336,8 +336,7 @@
       return candidate.normalized.slice(root.normalized.length).replace(/^\//, "").split("/").filter(Boolean);
     }
 
-    async function resolveThroughGrantedFolder(candidatePath, options) {
-      const label = options && options.label || "path";
+    async function walkGrantedFolder(candidatePath, label) {
       if (!canWalkGrantedFolder()) {
         throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "The approved workspace folder cannot be walked on this host, so the path cannot be checked. Nothing was changed");
       }
@@ -355,6 +354,12 @@
           throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve " + label + " to a canonical filesystem path");
         }
       }
+      return entry;
+    }
+
+    async function resolveThroughGrantedFolder(candidatePath, options) {
+      const label = options && options.label || "path";
+      const entry = await walkGrantedFolder(candidatePath, label);
       const native = nativePathFor(entry);
       if (!native) {
         throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve " + label + " to a canonical filesystem path");
@@ -412,6 +417,18 @@
           throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve the folder of " + label + " to a canonical filesystem path");
         }
         canonicalCandidateValue = parseAbsolutePath(parentValue, label).normalized.replace(/\/$/, "") + "/" + name;
+        // A failed lookup is not proof the name is free (a dangling link or a lookup error fails the same way),
+        // so list the folder and accept only a name it does not hold, in any letter case.
+        // shortcut: the host writer still creates the file non-exclusively (UXP gives no O_EXCL); a name taken after this check is not caught.
+        let listed = null;
+        try {
+          const folder = await walkGrantedFolder(parent, label + " folder");
+          if (folder && typeof folder.getEntries === "function") listed = await folder.getEntries();
+        } catch (_) { listed = null; }
+        const wanted = name.normalize("NFC").toLowerCase();
+        if (!Array.isArray(listed) || listed.some((entry) => !entry || typeof entry.name !== "string" || entry.name.normalize("NFC").toLowerCase() === wanted)) {
+          throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", label + " could not be proven new: its folder cannot be listed, or it already holds that name but the name cannot be resolved (for example a broken link). Nothing was changed");
+        }
       }
       const canonicalRoot = parseAbsolutePath(canonicalRootValue, "workspace root");
       const canonicalCandidate = parseAbsolutePath(canonicalCandidateValue, label);

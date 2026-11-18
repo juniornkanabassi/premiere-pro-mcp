@@ -1490,7 +1490,7 @@
       const project = await activeProject(true);
       const clips = await resolveMediaHealthClips(project, input.map(function (item) { return item.projectItemId; }));
       const items = [];
-      for (let i = 0; i < input.length; i += 1) items.push(await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven));
+      for (let i = 0; i < input.length; i += 1) items.push(await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven, false));
       return { count: items.length, items, verificationBoundary: "source_in_out_readback" };
     }
 
@@ -1501,11 +1501,12 @@
       const clips = await resolveMediaHealthClips(project, input.map(function (item) { return item.projectItemId; }));
       const targets = [];
       for (let i = 0; i < input.length; i += 1) {
-        const before = await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven);
-        if (input[i].expectedInSeconds != null && !sameSeconds(before.inSeconds, input[i].expectedInSeconds)) {
+        const before = await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven, false);
+        // An expectation of null means "still unset"; an omitted one means no guard.
+        if (input[i].expectedInSeconds !== undefined && !sameMark(before.inSeconds, input[i].expectedInSeconds)) {
           throw commandError("UXP_STALE_TARGET", "A source in point changed before the transaction");
         }
-        if (input[i].expectedOutSeconds != null && !sameSeconds(before.outSeconds, input[i].expectedOutSeconds)) {
+        if (input[i].expectedOutSeconds !== undefined && !sameMark(before.outSeconds, input[i].expectedOutSeconds)) {
           throw commandError("UXP_STALE_TARGET", "A source out point changed before the transaction");
         }
         targets.push({ input: input[i], clip: clips[i], before });
@@ -1540,7 +1541,7 @@
       const items = [];
       let fullyVerified = true;
       for (let i = 0; i < targets.length; i += 1) {
-        const target = targets[i], after = await sourceClipSnapshot(target.clip, target.input.projectItemId, target.input.mediaType, target.input.mediaTypeGiven);
+        const target = targets[i], after = await sourceClipSnapshot(target.clip, target.input.projectItemId, target.input.mediaType, target.input.mediaTypeGiven, true);
         let trimVerified = true;
         if (target.input.inSeconds != null) trimVerified = trimVerified && sameSeconds(after.inSeconds, target.input.inSeconds);
         if (target.input.outSeconds != null) trimVerified = trimVerified && sameSeconds(after.outSeconds, target.input.outSeconds);
@@ -1590,7 +1591,8 @@
         const numberKeys = ["expectedInSeconds", "expectedOutSeconds", "inSeconds", "outSeconds"];
         for (let i = 0; i < numberKeys.length; i += 1) {
           const key = numberKeys[i];
-          if (item[key] != null) result[key] = boundedSeconds(item[key], "items[" + index + "]." + key);
+          if (item[key] === null && key.startsWith("expected")) result[key] = null;
+          else if (item[key] != null) result[key] = boundedSeconds(item[key], "items[" + index + "]." + key);
         }
         result.clearInOut = optionalBoolean(item.clearInOut, false, "items[" + index + "].clearInOut");
         result.scaleToFrame = optionalBoolean(item.scaleToFrame, false, "items[" + index + "].scaleToFrame");
@@ -1608,9 +1610,10 @@
       });
     }
 
-    // mediaTypeGiven false: the caller left mediaType to its video default, so an audio-only clip (whose video
-    // in/out reads as Premiere's negative "unset" value) is read as audio instead.
-    async function sourceClipSnapshot(clip, projectItemId, mediaType, mediaTypeGiven) {
+    // mediaTypeGiven false: the caller left mediaType to its video default. Unset video marks with set audio marks
+    // fit an audio-only clip and an AV clip marked on audio alone, and Premiere's API cannot tell them apart, so a read
+    // refuses and asks for mediaType. afterOwnWrite: the readback right after this call's own trim, which may read audio.
+    async function sourceClipSnapshot(clip, projectItemId, mediaType, mediaTypeGiven, afterOwnWrite) {
       if (typeof clip.getInPoint !== "function" || typeof clip.getOutPoint !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "This source clip cannot report in/out points");
       }
@@ -1623,7 +1626,9 @@
       const snapshot = await read(mediaType);
       if (mediaTypeGiven || mediaType !== "video" || snapshot.inSeconds != null || snapshot.outSeconds != null) return snapshot;
       const audio = await read("audio");
-      return audio.inSeconds != null || audio.outSeconds != null ? audio : snapshot;
+      if (audio.inSeconds == null && audio.outSeconds == null) return snapshot;
+      if (afterOwnWrite) return audio;
+      throw refuse("UXP_INVALID_ARGUMENT", "Pass mediaType for " + projectItemId + ": its video in/out is unset and its audio in/out is set, so it may be audio-only or a video clip marked on audio only");
     }
 
     // A source point is never negative; Premiere reports an unset one as a large negative value (-400000 s in the 196 run).
@@ -1636,6 +1641,8 @@
       const seconds = value && Number(value.seconds);
       return Number.isFinite(seconds) ? seconds : null;
     }
+
+    function sameMark(actual, expected) { return expected === null ? actual === null : sameSeconds(actual, expected); }
 
     function sameSeconds(left, right) {
       return typeof left === "number" && Math.abs(left - right) <= 1e-6;

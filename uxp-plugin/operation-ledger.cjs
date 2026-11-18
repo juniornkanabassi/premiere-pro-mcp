@@ -119,6 +119,17 @@
       if (raw.length > MAX_STORAGE_CHARS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger is full of unresolved operations; inspect and acknowledge operation recovery");
       try { storage.setItem(STORAGE_KEY, raw); lastRaw = raw; } catch (_) { throw failure("UXP_OPERATION_LEDGER_UNAVAILABLE", "Cannot preserve operation reservation; no new host mutation was dispatched"); }
     }
+    // Change the records and store them as one step: if the write fails, memory goes back to what is stored,
+    // so this panel never reports a fence cleared that a restarted panel would still see.
+    function commit(mutate) {
+      const saved = Array.from(records, ([id, record]) => [id, record, record.outcome]), filter = retiredFilter.slice(), hex = retiredHex, count = retiredCount;
+      try { if (mutate) mutate(); persist(); } catch (error) {
+        records.clear();
+        for (const [id, record, outcome] of saved) { record.outcome = outcome; records.set(id, record); }
+        retiredFilter = filter; retiredHex = hex; retiredCount = count;
+        throw error;
+      }
+    }
     function serialize() {
       if (retiredHex === null) { let hex = ""; for (const byte of retiredFilter) hex += (byte < 16 ? "0" : "") + byte.toString(16); retiredHex = hex; }
       return JSON.stringify({ version: 2, sessionId, records: Array.from(records.values()), retired: retiredHex, retiredCount });
@@ -152,31 +163,31 @@
         if (isRetired(id)) throw failure("UXP_OPERATION_EXPIRED", "Operation ID was used before and its finished record has been retired; replay is not authorized. Use a new operation ID");
         if (options.requireDurability === true && !durable) throw failure("UXP_OPERATION_LEDGER_UNAVAILABLE", "Persistent operation storage is unavailable; no host mutation was dispatched");
         if (corrupt) throw failure("UXP_RECOVERY_REQUIRED", "Stored operation ledger cannot be validated; mutations are blocked");
-        // Retire a batch of the oldest finished records so the store is not rewritten at every edit near the limit.
-        if (records.size >= MAX_OPERATIONS) retireOldest(MAX_OPERATIONS / 2);
-        if (records.size >= MAX_OPERATIONS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger holds " + MAX_OPERATIONS + " unresolved operations; inspect and acknowledge operation recovery");
-        const record = { id, binding, scope: scope(identity), outcome: "pending" };
-        records.set(id, record);
-        try { persist(); } catch (error) { records.delete(id); throw error; }
+        commit(() => {
+          // Retire a batch of the oldest finished records so the store is not rewritten at every edit near the limit.
+          if (records.size >= MAX_OPERATIONS) retireOldest(MAX_OPERATIONS / 2);
+          if (records.size >= MAX_OPERATIONS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger holds " + MAX_OPERATIONS + " unresolved operations; inspect and acknowledge operation recovery");
+          records.set(id, { id, binding, scope: scope(identity), outcome: "pending" });
+        });
       },
       // ephemeral: a panel-generated key that no caller can send again, so a finished one needs no tombstone.
       finish(id, outcome, ephemeral) {
         refresh(false); const record = records.get(id);
         if (!record) return;
-        record.outcome = ["verified", "committed", "committed_unverified", "failed"].includes(outcome) ? outcome : "unknown";
-        if (ephemeral === true && record.outcome !== "unknown") records.delete(id);
-        persist();
+        commit(() => {
+          record.outcome = ["verified", "committed", "committed_unverified", "failed"].includes(outcome) ? outcome : "unknown";
+          if (ephemeral === true && record.outcome !== "unknown") records.delete(id);
+        });
       },
       get retiredCount() { return retiredCount; },
-      unknown(id) { refresh(false); const record = records.get(id); if (record) { record.outcome = "unknown"; persist(); } },
-      releasePreflight(id) { refresh(false); records.delete(id); persist(); },
+      unknown(id) { refresh(false); const record = records.get(id); if (record) commit(() => { record.outcome = "unknown"; }); },
+      releasePreflight(id) { refresh(false); commit(() => { records.delete(id); }); },
       inspect,
       acknowledge(identity, args) {
         const view = inspect(identity);
         if (corrupt) throw failure("UXP_RECOVERY_REQUIRED", "Corrupt operation ledger requires manual repair; acknowledgement cannot discard it");
         if (args.reviewed !== true || args.expectedRecoveryRevision !== view.recoveryRevision || args.expectedIdentityRevision !== view.identityRevision || canonical(args.operationIds) !== canonical(view.operations.map((item) => item.id))) throw failure("UXP_STALE_RECOVERY", "Reviewed recovery must match the latest inspected operation IDs, revision, and current host identity");
-        for (const record of view.operations) records.get(record.id).outcome = "consumed";
-        persist();
+        commit(() => { for (const record of view.operations) records.get(record.id).outcome = "consumed"; });
         return { acknowledged: true, replayAuthorized: false, reconciledOperationIds: view.operations.map((item) => item.id), recoveryRequired: false, boundary: "user_reviewed_current_host_state", outcome: "verified" };
       }
     };

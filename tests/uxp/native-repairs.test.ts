@@ -127,7 +127,7 @@ function parameterHost(options: { keyframesSupported?: boolean } = {}) {
     Constants: { TrackItemType: { CLIP: 1 }, InterpolationMode: { LINEAR: 1, HOLD: 2, BEZIER: 3, TIME: 4 } },
   };
   const registry = Commands.createCommandRegistry({ ppro, Protocol, storage: stored() });
-  return { registry, project, position, scale };
+  return { registry, project, position, scale, sequence, addAction };
 }
 const motion = { mediaType: "video", trackIndex: 0, clipIndex: 0, componentIndex: 0 };
 
@@ -149,8 +149,9 @@ describe("refusals made before any host write never block the next edit", () => 
   });
   it("a write that then fails still fences", async () => {
     const host = parameterHost();
-    host.scale.createAddKeyframeAction.mockImplementationOnce(() => { throw new Error("host refused the keyframe"); });
-    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 1, value: 50, operationId: "half-done" })).rejects.toThrow(/animation was already turned on/);
+    // A point key turns animation on in its own commit first, so a failure after it is a half-done write.
+    host.position.createAddKeyframeAction.mockImplementationOnce(() => { throw new Error("host refused the keyframe"); });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "half-done" })).rejects.toThrow(/animation was already turned on/);
     await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true, operations: [expect.objectContaining({ id: "half-done" })] });
   });
 });
@@ -172,7 +173,8 @@ describe("add_keyframe takes a point", () => {
   });
   it("keeps the scalar contract and refuses a point and a value together", async () => {
     const host = parameterHost();
-    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 2, value: 120, operationId: "scale" })).resolves.toMatchObject({ outcome: "verified", after: { value: 120, keyframeTimesSeconds: [2] } });
+    // A scalar first key keeps its single baseline transaction (inspection A5), so no automatic key is removed.
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 2, value: 120, operationId: "scale" })).resolves.toMatchObject({ outcome: "verified", automaticKeyframeCleanup: "none", after: { value: 120, keyframeTimesSeconds: [0, 2] } });
     await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 2, value: 1, point: { x: 0, y: 0 }, operationId: "both" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
     await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 2, point: { x: 0 }, operationId: "half-point" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
   });
@@ -187,7 +189,7 @@ describe("output paths that do not exist yet", () => {
   const Workspace = require("../../uxp-plugin/workspace.cjs");
   // Approved folder /Work with Renders/ (real) and Escape/ (a link that resolves outside). Nothing else exists.
   function walkingBroker() {
-    const folder = (nativePath: string, children: Record<string, unknown> = {}) => ({ isFolder: true, nativePath, getEntry: vi.fn(async (name: string) => { if (!(name in children)) throw new Error("missing"); return children[name]; }) });
+    const folder = (nativePath: string, children: Record<string, unknown> = {}) => ({ isFolder: true, nativePath, getEntry: vi.fn(async (name: string) => { if (!(name in children)) throw new Error("missing"); return children[name]; }), getEntries: vi.fn(async () => Object.keys(children).map((name) => ({ name }))) });
     const root = folder("/Work", { Renders: folder("/Work/Renders"), Escape: folder("/Elsewhere") });
     const fs = { getFolder: vi.fn(async () => root), createPersistentToken: vi.fn(async () => "token"), getDataFolder: vi.fn(async () => ({ createFile: vi.fn(async () => ({ write: vi.fn() })) })) };
     const broker = Workspace.createWorkspaceBroker({ fs });
@@ -238,11 +240,13 @@ describe("source in/out on audio-only clips", () => {
     } });
     return { definitions, points };
   }
-  it("reports unset points as null and reads an audio-only clip as audio when media type is left out", async () => {
+  it("reports unset points as null and verifies an audio-only trim when media type is left out", async () => {
     const { definitions } = audioOnly();
     await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1" }] })).resolves.toMatchObject({ items: [{ mediaType: "video", inSeconds: null, outSeconds: null }] });
     await expect(definitions["source.clip.update"].handler({ items: [{ projectItemId: "music-1", inSeconds: 12, outSeconds: 40 }] })).resolves.toMatchObject({ outcome: "verified", items: [{ mediaType: "audio", trimVerified: true, after: { inSeconds: 12, outSeconds: 40 } }] });
-    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1" }] })).resolves.toMatchObject({ items: [{ mediaType: "audio", inSeconds: 12, outSeconds: 40 }] });
+    // Unset video with set audio marks is ambiguous to a later read (inspection A7): it names the media type.
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1" }] })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1", mediaType: "audio" }] })).resolves.toMatchObject({ items: [{ mediaType: "audio", inSeconds: 12, outSeconds: 40 }] });
   });
   it("still reads exactly the media type a caller names", async () => {
     const { definitions } = audioOnly();
@@ -256,5 +260,143 @@ describe("track item update", () => {
     await expect(host.registry.dispatch("trackItem.update", { mediaType: "video", trackIndex: 0, clipIndex: 0, startSeconds: 0, endSeconds: 3.4, inSeconds: 71.5, outSeconds: 74.9, operationId: "full-trim" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true, message: expect.stringContaining("two separate updates") });
     await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
     expect(host.project.executeTransaction).not.toHaveBeenCalled();
+  });
+});
+
+// Inspection (Sol, 18 Nov 2026) section A: each test failed before its fix.
+describe("inspection A1: a failed ledger write never clears the running panel's fence", () => {
+  function flaky() {
+    const storage = stored(); let failing = false;
+    const setItem = storage.setItem;
+    storage.setItem = (key: string, value: string) => { if (failing) throw new Error("QuotaExceededError"); return setItem(key, value); };
+    return { storage, fail: (value: boolean) => { failing = value; } };
+  }
+  it("keeps the operation unknown in memory when the acknowledgement cannot be stored", () => {
+    const { storage, fail } = flaky();
+    const ledger = Ledger.createOperationLedger({ storage, sessionId: "session-1", digest });
+    ledger.reserve("op-1", digest("a"), identity); ledger.unknown("op-1");
+    const view = ledger.inspect(identity);
+    fail(true);
+    expect(() => ledger.acknowledge(identity, { reviewed: true, expectedRecoveryRevision: view.recoveryRevision, expectedIdentityRevision: view.identityRevision, operationIds: ["op-1"] })).toThrow(/Cannot preserve/);
+    expect(ledger.inspect(identity)).toMatchObject({ recoveryRequired: true, operations: [expect.objectContaining({ id: "op-1", outcome: "unknown" })] });
+    expect(Ledger.createOperationLedger({ storage, digest }).inspect(identity)).toMatchObject({ recoveryRequired: true });
+  });
+  it("keeps a finish that cannot be stored unresolved, as a restarted panel sees it", () => {
+    const { storage, fail } = flaky();
+    const ledger = Ledger.createOperationLedger({ storage, sessionId: "session-1", digest });
+    ledger.reserve("op-2", digest("b"), identity);
+    fail(true);
+    expect(() => ledger.finish("op-2", "verified")).toThrow(/Cannot preserve/);
+    expect(ledger.inspect(identity).recoveryRequired).toBe(true);
+    expect(Ledger.createOperationLedger({ storage, digest }).inspect(identity)).toMatchObject({ recoveryRequired: true, operations: [expect.objectContaining({ id: "op-2", outcome: "unknown" })] });
+  });
+});
+
+describe("inspection A2: a panel-generated anonymous key cannot be sent back as an operation ID", () => {
+  it("runs the handler once even when a caller replays the anonymous key it saw in recovery", async () => {
+    const storage = stored();
+    let release: () => void = () => {}, calls = 0;
+    const panel = host(storage, async () => { if (++calls === 1) await new Promise<void>((resolve) => { release = resolve; }); return { outcome: "verified" }; });
+    const first = panel.registry.dispatch("test.mutate", { value: 1 });
+    await vi.waitFor(() => expect(panel.mutation).toHaveBeenCalledTimes(1));
+    const seen = (await panel.registry.dispatch("operations.recovery.inspect", {})).operations[0].id as string;
+    expect(seen).toMatch(/^anonymous:/);
+    release(); await first;
+    await expect(panel.registry.dispatch("test.mutate", { value: 1, operationId: seen })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
+    expect(panel.mutation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("inspection A4/A5: first keyframe safety", () => {
+  it("refuses, and deletes nothing, when the active sequence changes between turning animation on and adding the key", async () => {
+    const host = parameterHost(), other = parameterHost();
+    other.sequence.guid = "sequence-2";
+    other.position.state.varying = true; other.position.state.keys.set(0, { x: 0, y: 0 }); other.position.state.keys.set(2, { x: 1, y: 1 });
+    host.project.executeTransaction.mockImplementationOnce((callback: (compound: { addAction: typeof host.addAction }) => void) => { callback({ addAction: host.addAction }); host.project.getActiveSequence.mockResolvedValue(other.sequence); return true; });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "switched" })).rejects.toMatchObject({ code: "UXP_STALE_TARGET" });
+    expect([...other.position.state.keys.keys()]).toEqual([0, 2]);
+    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true });
+  });
+  it("keeps a key the editor added between the two commits and reports the cleanup as skipped", async () => {
+    const host = parameterHost();
+    host.project.executeTransaction.mockImplementationOnce((callback: (compound: { addAction: typeof host.addAction }) => void) => { callback({ addAction: host.addAction }); host.project.getActiveSequence.mockImplementationOnce(async () => { host.position.state.keys.set(3, { x: 0.9, y: 0.9 }); return host.sequence; }); return true; });
+    const result = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "editor-key" });
+    expect(result).toMatchObject({ outcome: "committed_unverified", automaticKeyframeCleanup: "skipped", removedAutomaticKeyframeTimesSeconds: [] });
+    expect([...host.position.state.keys.keys()].sort()).toEqual([0, 1, 3]);
+  });
+  it("adds a first scalar key in one undoable transaction, as before", async () => {
+    const host = parameterHost();
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 2, value: 120, operationId: "scale-1" })).resolves.toMatchObject({ outcome: "verified" });
+    expect(host.project.executeTransaction).toHaveBeenCalledTimes(1);
+    expect(host.scale.state.varying).toBe(true);
+  });
+});
+
+describe("inspection A6: a new output file needs proof that its name is free", () => {
+  const Workspace = require("../../uxp-plugin/workspace.cjs");
+  // /Work/Renders holds a dangling link "old.mp4": listed in the folder, but looking it up fails like a missing file.
+  function broker(options: { listing?: boolean } = {}) {
+    const renders = { isFolder: true, nativePath: "/Work/Renders", getEntry: vi.fn(async () => { throw new Error("missing"); }), ...(options.listing === false ? {} : { getEntries: vi.fn(async () => [{ name: "old.mp4" }]) }) };
+    const root = { isFolder: true, nativePath: "/Work", getEntry: vi.fn(async (name: string) => { if (name !== "Renders") throw new Error("missing"); return renders; }), getEntries: vi.fn(async () => [renders]) };
+    return Workspace.createWorkspaceBroker({ fs: { getFolder: vi.fn(async () => root), createPersistentToken: vi.fn(async () => "token"), getDataFolder: vi.fn(async () => ({ createFile: vi.fn(async () => ({ write: vi.fn() })) })) } });
+  }
+  it("refuses a name that is listed but cannot be resolved (a dangling link), in any letter case", async () => {
+    const value = broker(); await value.requestRoot();
+    await expect(value.assertPathAllowed("/Work/Renders/old.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_CANONICAL_PATH_UNAVAILABLE" });
+    await expect(value.assertPathAllowed("/Work/Renders/OLD.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_CANONICAL_PATH_UNAVAILABLE" });
+    await expect(value.assertPathAllowed("/Work/Renders/new.mp4", { label: "outputFile", kind: "file", mayCreate: true })).resolves.toBe("/Work/Renders/new.mp4");
+  });
+  it("refuses when the folder cannot be listed, because absence is not proven", async () => {
+    const value = broker({ listing: false }); await value.requestRoot();
+    await expect(value.assertPathAllowed("/Work/Renders/new.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_CANONICAL_PATH_UNAVAILABLE" });
+  });
+});
+
+describe("inspection A7: unset source marks round-trip as a stale guard", () => {
+  const NextWorkflows = require("../../uxp-plugin/next-workflows.cjs");
+  // An AV clip whose video marks are unset and whose audio marks are set.
+  function clipHost(points: { videoIn: number; videoOut: number; audioIn: number; audioOut: number }) {
+    const clip = {
+      name: "Interview", getId: vi.fn(() => "av-1"),
+      getInPoint: vi.fn(async (type: number) => ({ seconds: type === 2 ? points.audioIn : points.videoIn })),
+      getOutPoint: vi.fn(async (type: number) => ({ seconds: type === 2 ? points.audioOut : points.videoOut })),
+      createSetInOutPointsAction: vi.fn((inPoint: { seconds: number }, outPoint: { seconds: number }) => ({ apply: () => { points.videoIn = inPoint.seconds; points.videoOut = outPoint.seconds; } })),
+      createSetInPointAction: vi.fn(), createSetOutPointAction: vi.fn(), createClearInOutPointsAction: vi.fn(), createSetScaleToFrameSizeAction: vi.fn(),
+    };
+    const project = {
+      getRootItem: vi.fn(async () => ({ getItems: vi.fn(async () => [clip]) })),
+      lockedAccess: vi.fn((callback: () => void) => callback()),
+      executeTransaction: vi.fn((callback: (compound: { addAction: (action: { apply: () => void }) => boolean }) => void) => { callback({ addAction: (action) => { action.apply(); return true; } }); return true; }),
+    };
+    return NextWorkflows.createNextWorkflowDefinitions({ ppro: {
+      Project: { getActiveProject: vi.fn(async () => project) }, ClipProjectItem: { cast: vi.fn((item: unknown) => item) }, ProjectItem: { cast: vi.fn((item: unknown) => item) },
+      FolderItem: { cast: vi.fn(() => null) }, TickTime: { createWithSeconds: vi.fn((seconds: number) => ({ seconds })) }, Constants: { MediaType: { VIDEO: 1, AUDIO: 2 } },
+    } });
+  }
+  it("asks for a media type when unset video marks and set audio marks leave it ambiguous", async () => {
+    const definitions = clipHost({ videoIn: -400000, videoOut: -400000, audioIn: 5, audioOut: 9 });
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "av-1" }] })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", message: expect.stringContaining("mediaType") });
+    await expect(definitions["source.clip.update"].handler({ items: [{ projectItemId: "av-1", inSeconds: 1, outSeconds: 2 }] })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT" });
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "av-1", mediaType: "audio" }] })).resolves.toMatchObject({ items: [{ mediaType: "audio", inSeconds: 5, outSeconds: 9 }] });
+  });
+  it("treats an explicit null expectation as 'still unset' and refuses once a mark was set", async () => {
+    const points = { videoIn: -400000, videoOut: -400000, audioIn: -400000, audioOut: -400000 };
+    const definitions = clipHost(points);
+    points.videoIn = 3; // someone set a mark after the inspection
+    await expect(definitions["source.clip.update"].handler({ items: [{ projectItemId: "av-1", mediaType: "video", expectedInSeconds: null, expectedOutSeconds: null, inSeconds: 1, outSeconds: 2 }] })).rejects.toMatchObject({ code: "UXP_STALE_TARGET" });
+    points.videoIn = -400000;
+    await expect(definitions["source.clip.update"].handler({ items: [{ projectItemId: "av-1", mediaType: "video", expectedInSeconds: null, expectedOutSeconds: null, inSeconds: 1, outSeconds: 2 }] })).resolves.toMatchObject({ outcome: "verified" });
+  });
+});
+
+describe("inspection A8: OTIO, FCPXML and AAF never overwrite an existing file", () => {
+  it("refuses an existing interchange destination before calling the converter, and leaves no fence", async () => {
+    const exporter = vi.fn(async () => true);
+    const sequence = { guid: "sequence-1" }, project = { guid: "project-1", getActiveSequence: async () => sequence };
+    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project }, ProjectConverter: { exportAsOpenTimelineIO: exporter, exportAsFinalCutProXML: exporter } }, Protocol, storage: stored(), fileExists: async (path: string) => path.endsWith("taken.otio"), workspace: { status: () => ({ configured: true, canonicalPathValidation: "available" }), assertPathAllowed: async (path: string) => path } });
+    await expect(registry.dispatch("interchange.export", { format: "otio", outputFilePath: "/Work/taken.otio", operationId: "x1" })).rejects.toMatchObject({ code: "UXP_DESTINATION_EXISTS", noHostWrite: true });
+    expect(exporter).not.toHaveBeenCalled();
+    await expect(registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+    await expect(registry.dispatch("interchange.export", { format: "otio", outputFilePath: "/Work/fresh.otio", operationId: "x2" })).resolves.toMatchObject({ exported: true });
   });
 });

@@ -1613,32 +1613,52 @@
         return { context, point, value, timeSeconds, time, before };
       });
       const { point, value, timeSeconds, time, before } = prepared;
-      let context = prepared.context, automatic = [];
-      if (!before.timeVarying) {
-        // Turning the stopwatch on makes Premiere add keyframes of its own; note them so only those are removed.
+      let context = prepared.context, automatic = [], cleanup = "none";
+      if (!before.timeVarying && !point) {
+        // A scalar first key: animation on and the key in one undoable transaction, as before point support.
         context.project.lockedAccess(() => {
-          commitActions(context.project, "Enable effect parameter animation", [context.param.createSetTimeVaryingAction(true)]);
-        });
-        context = await parameterContext(args, true);
-        automatic = completeKeyframeTimes(context.param).filter((seconds) => !before.keyframeTimesSeconds.some((old) => numbersEqual(old, seconds)) && !numbersEqual(seconds, timeSeconds));
-      }
-      try {
-        context.project.lockedAccess(() => {
-          const actions = automatic.map((seconds) => context.param.createRemoveKeyframeAction(tick(seconds, "timeSeconds"), true)), keyframe = context.param.createKeyframe(value);
+          const keyframe = context.param.createKeyframe(value);
           keyframe.position = time;
-          actions.push(context.param.createAddKeyframeAction(keyframe));
-          commitActions(context.project, "Add effect keyframe", actions);
+          commitActions(context.project, "Add effect keyframe", [context.param.createSetTimeVaryingAction(true), context.param.createAddKeyframeAction(keyframe)]);
         });
-      } catch (error) {
-        if (!before.timeVarying && error && typeof error === "object") error.message = (error.message || String(error)) + " (animation was already turned on for this parameter; inspect it before retrying)";
-        throw error;
+      } else {
+        let enabled = null;
+        if (!before.timeVarying) {
+          // Turning the stopwatch on makes Premiere add keyframes of its own. Read the keys either side of that
+          // commit under the same lock, so only keys this commit made count as automatic.
+          context.project.lockedAccess(() => {
+            const old = completeKeyframeTimes(context.param);
+            commitActions(context.project, "Enable effect parameter animation", [context.param.createSetTimeVaryingAction(true)]);
+            try { enabled = { old, now: completeKeyframeTimes(context.param) }; } catch (_) { enabled = null; }
+          });
+          const sequenceId = guidString(context.sequence.guid);
+          context = await parameterContext({ ...args, expectedComponentId: context.componentId, expectedParamName: context.paramName }, true);
+          if (guidString(context.sequence.guid) !== sequenceId) throw commandError("UXP_STALE_TARGET", "The active sequence changed after animation was turned on; no keyframe was added or removed. Inspect the parameter before retrying");
+          cleanup = "skipped";
+        }
+        try {
+          context.project.lockedAccess(() => {
+            // Remove only when the keys are exactly as that commit left them; otherwise their origin is unproven.
+            if (enabled && sameNumberArrays(completeKeyframeTimes(context.param), enabled.now)) {
+              automatic = enabled.now.filter((seconds) => !enabled.old.some((old) => numbersEqual(old, seconds)) && !numbersEqual(seconds, timeSeconds));
+              cleanup = "done";
+            }
+            const actions = automatic.map((seconds) => context.param.createRemoveKeyframeAction(tick(seconds, "timeSeconds"), true)), keyframe = context.param.createKeyframe(value);
+            keyframe.position = time;
+            actions.push(context.param.createAddKeyframeAction(keyframe));
+            commitActions(context.project, "Add effect keyframe", actions);
+          });
+        } catch (error) {
+          if (!before.timeVarying && error && typeof error === "object") error.message = (error.message || String(error)) + " (animation was already turned on for this parameter; inspect it before retrying)";
+          throw error;
+        }
       }
       const afterContext = await parameterContext(args, true), after = await parameterSnapshot(afterContext, timeSeconds);
       const present = after.keyframeTimesSeconds.some((seconds) => numbersEqual(seconds, timeSeconds));
       const leftover = automatic.filter((seconds) => after.keyframeTimesSeconds.some((current) => numbersEqual(current, seconds)));
       if (point) { let read = null; try { read = hostParameterValue(after.value, "point"); } catch (_) {} after.value = read; }
-      const verified = present && leftover.length === 0 && (point ? pointsEqual(after.value, point) : valuesEqual(after.value, value));
-      return mutationResult(verified, { added: true, timeBase: "clip_media_time", ...(point ? { point } : {}), removedAutomaticKeyframeTimesSeconds: automatic, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
+      const verified = present && leftover.length === 0 && cleanup !== "skipped" && (point ? pointsEqual(after.value, point) : valuesEqual(after.value, value));
+      return mutationResult(verified, { added: true, timeBase: "clip_media_time", ...(point ? { point } : {}), removedAutomaticKeyframeTimesSeconds: automatic, automaticKeyframeCleanup: cleanup, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
     }
 
     async function removeParameterKeyframe(args) {
