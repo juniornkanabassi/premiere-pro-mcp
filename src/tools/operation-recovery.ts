@@ -26,6 +26,7 @@ const HOST_STATE_SCRIPT = `
   return __result(snapshot);
 `;
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function reviewToken(bound: unknown): string { return "review-v1:" + digest(bound); }
 export function getOperationRecoveryTools(uxpBridge: UxpWebSocketBridge | undefined, bridgeOptions?: BridgeOptions) {
   const properties = {
     backend: { type: "string", enum: ["cep", "uxp"], description: "Execution backend whose uncertain operations should be inspected." },
@@ -33,16 +34,19 @@ export function getOperationRecoveryTools(uxpBridge: UxpWebSocketBridge | undefi
   async function inspect(backend: "cep" | "uxp") {
     if (backend === "uxp") {
       if (!uxpBridge) throw new Error("UXP bridge is not configured");
-      const panel = await uxpBridge.request("operations.recovery.inspect") as { recoveryRevision: string; identityRevision: string; operations: { id: string }[] };
+      const panel = await uxpBridge.request("operations.recovery.inspect") as { recoveryRequired?: boolean; recoveryRevision: string; identityRevision: string; operations: { id: string }[] };
       const transport = uxpBridge.getOperationRecovery();
       const shared = inspectHostRecovery(getTempDir(bridgeOptions));
-      return { backend, recoveryRequired: Boolean((panel as { recoveryRequired?: boolean }).recoveryRequired || transport.recoveryRequired || shared.recoveryRequired), panel, transport, shared, hostStateRevision: panel.identityRevision };
+      const view = { backend, recoveryRequired: Boolean(panel.recoveryRequired || transport.recoveryRequired || shared.recoveryRequired), panel, transport, shared, hostStateRevision: panel.identityRevision };
+      // One token binds everything an acknowledgement would clear: host state, the panel's IDs and every raised fence.
+      return { ...view, reviewToken: reviewToken({ backend, hostStateRevision: view.hostStateRevision, panel: { recoveryRequired: Boolean(panel.recoveryRequired), recoveryRevision: panel.recoveryRevision, operationIds: panel.operations.map((item) => item.id) }, transport: transport.recoveryRequired ? transport.recoveryRevision : null, shared: shared.recoveryRequired ? shared.recoveryRevision : null }) };
     }
     if (backend !== "cep") throw new Error("backend must be cep or uxp");
     const state = inspectHostRecovery(getTempDir(bridgeOptions));
     const snapshot = await sendCommand(buildToolScript(HOST_STATE_SCRIPT), { ...bridgeOptions, mutating: false, mutationOnTimeout: false });
     if (!snapshot.success) throw new Error(snapshot.error || "Host recovery snapshot unavailable");
-    return { backend, ...state, hostStateRevision: digest(snapshot.data), snapshotBoundary: "bounded_active_sequence_clip_identity_and_ranges", snapshot: snapshot.data };
+    const hostStateRevision = digest(snapshot.data);
+    return { backend, ...state, hostStateRevision, snapshotBoundary: "bounded_active_sequence_clip_identity_and_ranges", snapshot: snapshot.data, reviewToken: reviewToken({ backend, hostStateRevision, shared: state.recoveryRequired ? state.recoveryRevision : null }) };
   }
   return {
     get_last_operations: {
@@ -60,7 +64,7 @@ export function getOperationRecoveryTools(uxpBridge: UxpWebSocketBridge | undefi
       },
     },
     inspect_operation_recovery: {
-      description: "Inspect unknown execution outcomes and a bounded current host-state revision. Inspection remains available while dependent mutations are blocked. No edit is replayed.",
+      description: "Inspect unknown execution outcomes and a bounded current host-state revision. Inspection remains available while dependent mutations are blocked. No edit is replayed. Returns reviewToken: after reviewing the state, pass it to acknowledge_operation_recovery to clear every raised fence in one step.",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       parameters: { type: "object", additionalProperties: false, properties: { ...properties, include_snapshot: { type: "boolean", description: "Include the bounded CEP clip snapshot (default true). Set false for compact status checks; host-state revision is still computed from the full snapshot. UXP diagnostics are unchanged." } }, required: ["backend"] },
       handler: async (args: { backend: "cep" | "uxp"; include_snapshot?: boolean }) => {
@@ -76,30 +80,29 @@ export function getOperationRecoveryTools(uxpBridge: UxpWebSocketBridge | undefi
       },
     },
     acknowledge_operation_recovery: {
-      description: "Acknowledge user-reviewed reconciliation of uncertain execution after current-state inspection. Requires the exact latest recovery and host-state revisions. Consumed operation IDs remain unavailable for replay; acknowledgement does not undo or retry a host edit.",
+      description: "After reviewing current Premiere state, clear the recovery fence in one step: pass the review_token from the latest inspect_operation_recovery. The token binds the host state, the uncertain operation IDs and every raised fence (panel, transport, shared); if anything changed since that inspection it is refused as stale and you inspect again. Acknowledging records that you reconciled the state. It never undoes, retries or authorises replaying an edit: consumed operation IDs stay consumed.",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       parameters: { type: "object", additionalProperties: false, properties: {
         ...properties,
-        expected_recovery_revision: { type: "string", maxLength: 256, description: "CEP recoveryRevision or UXP transport.recoveryRevision returned by inspection." },
-        expected_host_state_revision: { type: "string", maxLength: 256, description: "Exact hostStateRevision returned by the latest inspected bounded host state." },
-        expected_panel_recovery_revision: { type: "string", maxLength: 256, description: "UXP panel.recoveryRevision returned by inspection; required for UXP." },
-        expected_shared_recovery_revision: { type: "string", maxLength: 256, description: "UXP shared.recoveryRevision when shared Premiere execution recovery is required." },
+        review_token: { type: "string", minLength: 1, maxLength: 256, description: "reviewToken returned by the latest inspect_operation_recovery for this backend, unchanged." },
         reviewed: { type: "boolean", const: true, description: "True only after reviewing current host state and reconciling the uncertain operations." },
-      }, required: ["backend", "expected_recovery_revision", "expected_host_state_revision", "reviewed"] },
-      handler: async (args: { backend: "cep" | "uxp"; expected_recovery_revision: string; expected_host_state_revision: string; expected_panel_recovery_revision?: string; expected_shared_recovery_revision?: string; reviewed: boolean }) => {
+      }, required: ["backend", "review_token", "reviewed"] },
+      handler: async (args: { backend: "cep" | "uxp"; review_token: string; reviewed: boolean }) => {
         const work = async () => {
           if (args.reviewed !== true) throw new Error("reviewed must be true after reconciliation");
           const view = await inspect(args.backend);
-          if (view.hostStateRevision !== args.expected_host_state_revision) throw new Error("HOST_STALE_RECOVERY: current host state changed; inspect again");
+          if (view.reviewToken !== args.review_token) throw new Error("STALE_REVIEW_TOKEN: Premiere or the recovery state changed since that inspection (or the token is from another inspection); call inspect_operation_recovery again, review the current state and pass its new reviewToken");
+          const cleared: string[] = [];
           if (view.backend === "uxp" && "panel" in view) {
             if (!uxpBridge) throw new Error("UXP bridge is not configured");
-            if (view.panel.recoveryRevision !== args.expected_panel_recovery_revision || view.transport.recoveryRevision !== args.expected_recovery_revision) throw new Error("UXP_STALE_RECOVERY: recovery ledger changed; inspect again");
-            if (view.shared.recoveryRequired && view.shared.recoveryRevision !== args.expected_shared_recovery_revision) throw new Error("HOST_STALE_RECOVERY: shared recovery revision changed; inspect again");
-            await uxpBridge.request("operations.recovery.acknowledge", { expectedRecoveryRevision: view.panel.recoveryRevision, expectedIdentityRevision: view.panel.identityRevision, operationIds: view.panel.operations.map((item) => item.id), reviewed: true });
-            uxpBridge.acknowledgeOperationRecovery(args.expected_recovery_revision, true);
-            if (view.shared.recoveryRequired) acknowledgeHostRecovery(getTempDir(bridgeOptions), args.expected_shared_recovery_revision!, true);
-          } else acknowledgeHostRecovery(getTempDir(bridgeOptions), args.expected_recovery_revision, true);
-          return { success: true, data: { acknowledged: true, replayAuthorized: false, boundary: "user_reviewed_current_host_state", outcome: "verified" } };
+            if (view.panel.recoveryRequired) {
+              await uxpBridge.request("operations.recovery.acknowledge", { expectedRecoveryRevision: view.panel.recoveryRevision, expectedIdentityRevision: view.panel.identityRevision, operationIds: view.panel.operations.map((item) => item.id), reviewed: true });
+              cleared.push("panel");
+            }
+            if (view.transport.recoveryRequired) { uxpBridge.acknowledgeOperationRecovery(view.transport.recoveryRevision, true); cleared.push("transport"); }
+            if (view.shared.recoveryRequired) { acknowledgeHostRecovery(getTempDir(bridgeOptions), view.shared.recoveryRevision!, true); cleared.push("shared"); }
+          } else if (view.recoveryRequired) { acknowledgeHostRecovery(getTempDir(bridgeOptions), (view as { recoveryRevision: string }).recoveryRevision, true); cleared.push("shared"); }
+          return { success: true, data: { acknowledged: true, cleared, nothingToAcknowledge: cleared.length === 0, replayAuthorized: false, boundary: "user_reviewed_current_host_state", outcome: "verified" } };
         };
         try { return await withBridgeWorkflow(bridgeOptions, work); } catch (error) { return { success: false, error: error instanceof Error ? error.message : String(error) }; }
       },

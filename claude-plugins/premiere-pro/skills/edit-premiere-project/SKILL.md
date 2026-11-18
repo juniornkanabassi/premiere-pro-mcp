@@ -136,8 +136,9 @@ applying their unchanged single-use token. Unknown source bounds, locks, links,
 retiming or descriptor evidence cause a refusal. Sequential CEP steps may
 partially commit; fresh structural readback is separate from playback.
 
-Unknown host outcomes require `inspect_operation_recovery` and reviewed,
-revision-bound `acknowledge_operation_recovery`. Consumed IDs remain consumed.
+Unknown host outcomes require `inspect_operation_recovery`, a review of current
+state, then `acknowledge_operation_recovery` with its unchanged `reviewToken`.
+Consumed IDs remain consumed.
 UXP edits require matching command/receipt versions, durable ledger storage and
 native cryptographic entropy; older unversioned panels remain read-only. Bounded clip snapshots do not replace
 actual effect/source reconciliation, and reconnecting never grants ID replay.

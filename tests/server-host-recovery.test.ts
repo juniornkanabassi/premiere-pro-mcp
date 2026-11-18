@@ -93,12 +93,10 @@ async function connected() {
 async function reviewedAcknowledge(client: Client) {
   const inspected = await client.callTool({ name: "inspect_operation_recovery", arguments: { backend: "cep" } });
   expect(inspected.structuredContent?.error, "Recovery inspection must succeed before using its revisions").toBeUndefined();
-  expect(inspected, "Recovery inspection must succeed before using its revisions").toMatchObject({ structuredContent: { ok: true, data: { recoveryRevision: expect.any(String), hostStateRevision: expect.any(String) } } });
+  expect(inspected, "Recovery inspection must succeed before using its revisions").toMatchObject({ structuredContent: { ok: true, data: { recoveryRevision: expect.any(String), hostStateRevision: expect.any(String), reviewToken: expect.any(String) } } });
   expect(inspected.isError).toBeFalsy();
-  const data = (inspected.structuredContent as { data: { recoveryRevision: string; hostStateRevision: string } }).data;
-  const acknowledged = await client.callTool({ name: "acknowledge_operation_recovery", arguments: {
-    backend: "cep", expected_recovery_revision: data.recoveryRevision, expected_host_state_revision: data.hostStateRevision, reviewed: true,
-  } });
+  const data = (inspected.structuredContent as { data: { reviewToken: string } }).data;
+  const acknowledged = await client.callTool({ name: "acknowledge_operation_recovery", arguments: { backend: "cep", review_token: data.reviewToken, reviewed: true } });
   expect(acknowledged.isError).toBeFalsy();
 }
 
