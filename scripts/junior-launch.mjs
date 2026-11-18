@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { companionWriter } from '../dist/companion-policy.js';
+import { companionWriter, shortsToolList } from '../dist/companion-policy.js';
 const cli = process.env.PREMIERE_COMPANION_CLI;
 if (!cli || !cli.startsWith('/')) throw new Error('Set PREMIERE_COMPANION_CLI to the installed Companion bin/binboy.mjs absolute path');
 const args = process.argv.slice(2);
@@ -17,7 +17,7 @@ if (args[0] !== '--mcp') {
   process.env.PREMIERE_MCP_CAPABILITIES = writer === 'companion' ? 'inspect,edit,export,filesystem' : 'inspect';
   if (writer === 'companion') {
     const manifest = JSON.parse(execFileSync(process.execPath, [cli, 'mcp-manifest'], { encoding: 'utf8', timeout: 10000, maxBuffer: 2 * 1024 * 1024 }));
-    process.env.PREMIERE_MCP_TOOL_LIST = manifest.tools.map(t => 'companion_' + t.name).join(',');
+    process.env.PREMIERE_MCP_TOOL_LIST = shortsToolList(manifest.tools);
   } else {
     delete process.env.PREMIERE_MCP_TOOL_LIST;
   }

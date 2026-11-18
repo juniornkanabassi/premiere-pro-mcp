@@ -22,3 +22,11 @@ export function writerPermits(name: string, mutating: boolean): boolean {
   const writer = companionWriter();
   return !mutating || !writer || (name.startsWith("companion_") ? writer === "companion" : writer === "native");
 }
+
+// Read-only planners shown beside Companion in the Shorts profile. They never call Premiere.
+export const SHORTS_PLANNERS = ["detect_repeated_takes", "plan_pause_tightening", "plan_filler_word_removal", "convert_timeline_time"] as const;
+
+/** The Shorts profile's explicit tool list: every manifest command, then the planners. */
+export function shortsToolList(manifestTools: readonly { name: string }[]): string {
+  return [...manifestTools.map(tool => "companion_" + tool.name), ...SHORTS_PLANNERS].join(",");
+}

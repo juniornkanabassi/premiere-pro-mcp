@@ -17,3 +17,7 @@ The central guard enforces the writer choice even when a tool is called without 
 ## Rollback
 
 Remove the single MCP registration from each client and the personal launcher, preserving unrelated entries. The project’s local state folder records exact backups and verification. No Adobe or Companion installation is changed by this adapter.
+
+## Shorts profile
+
+`premiere-ai --mcp` lists every Companion manifest command plus four read-only planners (`detect_repeated_takes`, `plan_pause_tightening`, `plan_filler_word_removal`, `convert_timeline_time`) and the two diagnostics, about 62 tools with Companion 1.10.0 (`shortsToolList` in `src/companion-policy.ts`). New manifest commands appear without a change here. Companion tools no longer advertise the CEP guards or `idempotency_key` (they have `project` and `requestId`). Each result carries a small receipt (command, writer, target, state, jobId, changed, verified) with the payload capped at 24,000 characters. The server instructions give the order for making a Short, naming only registered tools.
