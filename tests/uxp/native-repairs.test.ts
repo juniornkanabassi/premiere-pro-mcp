@@ -114,10 +114,14 @@ function parameterHost(options: { keyframesSupported?: boolean } = {}) {
     };
     return param;
   };
-  const position = makeParam("Position", new PointF(0.5, 0.5)), scale = makeParam("Scale", 100);
-  const component = { getMatchName: vi.fn(async () => "AE.ADBE Motion"), getDisplayName: vi.fn(async () => "Motion"), getParamCount: vi.fn(() => 2), getParam: vi.fn((index: number) => index === 0 ? position : scale) };
-  const trackItem = { getComponentChain: vi.fn(async () => ({ getComponentCount: () => 1, getComponentAtIndex: () => component })), getStartTime: async () => ({ seconds: 0 }) };
-  const track = { getTrackItems: vi.fn(async () => [trackItem]) };
+  const makeClip = (startSeconds: number) => {
+    const position = makeParam("Position", new PointF(0.5, 0.5)), scale = makeParam("Scale", 100);
+    const component = { getMatchName: vi.fn(async () => "AE.ADBE Motion"), getDisplayName: vi.fn(async () => "Motion"), getParamCount: vi.fn(() => 2), getParam: vi.fn((index: number) => index === 0 ? position : scale) };
+    const trackItem = { getComponentChain: vi.fn(async () => ({ getComponentCount: () => 1, getComponentAtIndex: () => component })), getStartTime: async () => ({ seconds: startSeconds }) };
+    return { position, scale, trackItem };
+  };
+  const { position, scale, trackItem } = makeClip(0), items: unknown[] = [trackItem];
+  const track = { getTrackItems: vi.fn(async () => [...items]) };
   const sequence = { guid: "sequence-1", getVideoTrackCount: vi.fn(async () => 1), getVideoTrack: vi.fn(async () => track), getAudioTrackCount: vi.fn(async () => 0), getAudioTrack: vi.fn() };
   const addAction = (action: { apply: () => void }) => { action.apply(); return true; };
   const project = { guid: "project-1", getActiveSequence: vi.fn(async () => sequence), lockedAccess: vi.fn((callback: () => void) => callback()), executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }) };
@@ -127,7 +131,7 @@ function parameterHost(options: { keyframesSupported?: boolean } = {}) {
     Constants: { TrackItemType: { CLIP: 1 }, InterpolationMode: { LINEAR: 1, HOLD: 2, BEZIER: 3, TIME: 4 } },
   };
   const registry = Commands.createCommandRegistry({ ppro, Protocol, storage: stored() });
-  return { registry, project, position, scale, sequence, addAction };
+  return { registry, project, position, scale, sequence, addAction, items, makeClip };
 }
 const motion = { mediaType: "video", trackIndex: 0, clipIndex: 0, componentIndex: 0 };
 
@@ -308,21 +312,37 @@ describe("inspection A2: a panel-generated anonymous key cannot be sent back as 
 });
 
 describe("inspection A4/A5: first keyframe safety", () => {
-  it("refuses, and deletes nothing, when the active sequence changes between turning animation on and adding the key", async () => {
+  it("writes only the original clip when the active sequence changes between the commits, and reports it unverified", async () => {
     const host = parameterHost(), other = parameterHost();
     other.sequence.guid = "sequence-2";
     other.position.state.varying = true; other.position.state.keys.set(0, { x: 0, y: 0 }); other.position.state.keys.set(2, { x: 1, y: 1 });
     host.project.executeTransaction.mockImplementationOnce((callback: (compound: { addAction: typeof host.addAction }) => void) => { callback({ addAction: host.addAction }); host.project.getActiveSequence.mockResolvedValue(other.sequence); return true; });
-    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "switched" })).rejects.toMatchObject({ code: "UXP_STALE_TARGET" });
+    const result = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "switched" });
     expect([...other.position.state.keys.keys()]).toEqual([0, 2]);
-    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true });
+    expect(other.position.createRemoveKeyframeAction).not.toHaveBeenCalled();
+    expect([...host.position.state.keys.keys()]).toEqual([1]);
+    expect(result).toMatchObject({ outcome: "committed_unverified", targetLocated: false, automaticKeyframeCleanup: "done", removedAutomaticKeyframeTimesSeconds: [0] });
   });
   it("keeps a key the editor added between the two commits and reports the cleanup as skipped", async () => {
     const host = parameterHost();
-    host.project.executeTransaction.mockImplementationOnce((callback: (compound: { addAction: typeof host.addAction }) => void) => { callback({ addAction: host.addAction }); host.project.getActiveSequence.mockImplementationOnce(async () => { host.position.state.keys.set(3, { x: 0.9, y: 0.9 }); return host.sequence; }); return true; });
+    // The editor adds a key at 3 just before the second lock is taken.
+    host.project.lockedAccess.mockImplementationOnce((callback: () => void) => callback()).mockImplementationOnce((callback: () => void) => { host.position.state.keys.set(3, { x: 0.9, y: 0.9 }); return callback(); });
     const result = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "editor-key" });
     expect(result).toMatchObject({ outcome: "committed_unverified", automaticKeyframeCleanup: "skipped", removedAutomaticKeyframeTimesSeconds: [] });
     expect([...host.position.state.keys.keys()].sort()).toEqual([0, 1, 3]);
+  });
+  it("never touches another clip that takes the index between the two commits (round 2, new finding 1)", async () => {
+    const host = parameterHost(), b = host.makeClip(10);
+    host.items.push(b.trackItem);
+    // Clip B, same Motion effect and Position name, already animated with a user key at 0.
+    b.position.state.varying = true; b.position.state.keys.set(0, { x: 0.7, y: 0.7 });
+    // The editor removes clip A right after the stopwatch commit, so B becomes clip 0.
+    host.project.executeTransaction.mockImplementationOnce((callback: (compound: { addAction: typeof host.addAction }) => void) => { callback({ addAction: host.addAction }); host.items.shift(); return true; });
+    const result = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, expectedParamName: "Position", timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "replaced" });
+    expect([...b.position.state.keys.entries()]).toEqual([[0, { x: 0.7, y: 0.7 }]]);
+    expect(b.position.createRemoveKeyframeAction).not.toHaveBeenCalled();
+    expect(b.position.createAddKeyframeAction).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ outcome: "committed_unverified", verified: false });
   });
   it("adds a first scalar key in one undoable transaction, as before", async () => {
     const host = parameterHost();

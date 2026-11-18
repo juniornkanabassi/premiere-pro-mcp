@@ -1613,7 +1613,8 @@
         return { context, point, value, timeSeconds, time, before };
       });
       const { point, value, timeSeconds, time, before } = prepared;
-      let context = prepared.context, automatic = [], cleanup = "none";
+      const context = prepared.context;
+      let automatic = [], cleanup = "none";
       if (!before.timeVarying && !point) {
         // A scalar first key: animation on and the key in one undoable transaction, as before point support.
         context.project.lockedAccess(() => {
@@ -1631,12 +1632,10 @@
             commitActions(context.project, "Enable effect parameter animation", [context.param.createSetTimeVaryingAction(true)]);
             try { enabled = { old, now: completeKeyframeTimes(context.param) }; } catch (_) { enabled = null; }
           });
-          const sequenceId = guidString(context.sequence.guid);
-          context = await parameterContext({ ...args, expectedComponentId: context.componentId, expectedParamName: context.paramName }, true);
-          if (guidString(context.sequence.guid) !== sequenceId) throw commandError("UXP_STALE_TARGET", "The active sequence changed after animation was turned on; no keyframe was added or removed. Inspect the parameter before retrying");
           cleanup = "skipped";
         }
         try {
+          // Same param handle as the stopwatch commit, never a fresh lookup by index: another clip may hold that index now.
           context.project.lockedAccess(() => {
             // Remove only when the keys are exactly as that commit left them; otherwise their origin is unproven.
             if (enabled && sameNumberArrays(completeKeyframeTimes(context.param), enabled.now)) {
@@ -1653,12 +1652,20 @@
           throw error;
         }
       }
-      const afterContext = await parameterContext(args, true), after = await parameterSnapshot(afterContext, timeSeconds);
+      // Read back through the handles that were written. They may belong to a clip that has since been removed or moved,
+      // so the edit counts as verified only if a fresh lookup at the requested index finds exactly the same keys and value.
+      const readValue = (snapshot) => { if (!point) return snapshot.value; try { return hostParameterValue(snapshot.value, "point"); } catch (_) { return null; } };
+      const after = await parameterSnapshot(context, timeSeconds);
+      after.value = readValue(after);
+      let targetLocated = false;
+      try {
+        const current = await parameterSnapshot(await parameterContext({ ...args, expectedComponentId: context.componentId, expectedParamName: context.paramName }, true), timeSeconds);
+        targetLocated = sameNumberArrays(current.keyframeTimesSeconds, after.keyframeTimesSeconds) && (point ? pointsEqual(readValue(current), after.value) : valuesEqual(current.value, after.value));
+      } catch (_) {}
       const present = after.keyframeTimesSeconds.some((seconds) => numbersEqual(seconds, timeSeconds));
       const leftover = automatic.filter((seconds) => after.keyframeTimesSeconds.some((current) => numbersEqual(current, seconds)));
-      if (point) { let read = null; try { read = hostParameterValue(after.value, "point"); } catch (_) {} after.value = read; }
-      const verified = present && leftover.length === 0 && cleanup !== "skipped" && (point ? pointsEqual(after.value, point) : valuesEqual(after.value, value));
-      return mutationResult(verified, { added: true, timeBase: "clip_media_time", ...(point ? { point } : {}), removedAutomaticKeyframeTimesSeconds: automatic, automaticKeyframeCleanup: cleanup, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
+      const verified = targetLocated && present && leftover.length === 0 && cleanup !== "skipped" && (point ? pointsEqual(after.value, point) : valuesEqual(after.value, value));
+      return mutationResult(verified, { added: true, timeBase: "clip_media_time", ...(point ? { point } : {}), removedAutomaticKeyframeTimesSeconds: automatic, automaticKeyframeCleanup: cleanup, targetLocated, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
     }
 
     async function removeParameterKeyframe(args) {
