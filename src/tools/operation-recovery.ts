@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { type BridgeOptions, getTempDir, sendCommand, withBridgeWorkflow } from "../bridge/file-bridge.js";
 import { acknowledgeHostRecovery, inspectHostRecovery } from "../bridge/host-lease.js";
 import { buildToolScript } from "../bridge/script-builder.js";
@@ -26,7 +26,9 @@ const HOST_STATE_SCRIPT = `
   return __result(snapshot);
 `;
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
-function reviewToken(bound: unknown): string { return "review-v1:" + digest(bound); }
+// Keyed with a secret held only by this server process, so only an inspection here can issue a token.
+const REVIEW_KEY = randomBytes(32);
+function reviewToken(bound: unknown): string { return "review-v1:" + createHmac("sha256", REVIEW_KEY).update(JSON.stringify(bound)).digest("hex"); }
 export function getOperationRecoveryTools(uxpBridge: UxpWebSocketBridge | undefined, bridgeOptions?: BridgeOptions) {
   const properties = {
     backend: { type: "string", enum: ["cep", "uxp"], description: "Execution backend whose uncertain operations should be inspected." },

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   sendCommand: vi.fn(), inspectHostRecovery: vi.fn(), acknowledgeHostRecovery: vi.fn(), withBridgeWorkflow: vi.fn(async (_options: unknown, work: () => Promise<unknown>) => work()),
@@ -57,6 +58,17 @@ describe("reviewed operation reconciliation tools", () => {
     expect(bridge.request).toHaveBeenCalledWith("operations.recovery.acknowledge", { expectedRecoveryRevision: "panel-revision", expectedIdentityRevision: "host-state", operationIds: ["uncertain-1", "uncertain-2"], reviewed: true });
     expect(bridge.acknowledgeOperationRecovery).toHaveBeenCalledWith("transport-revision", true);
     expect(mocks.acknowledgeHostRecovery).toHaveBeenCalledWith("/private/bridge", "cep-revision", true);
+  });
+  it("refuses a token a client builds itself from the inspected fields (inspection A3)", async () => {
+    const panel = { recoveryRequired: true, recoveryRevision: "panel-revision", identityRevision: "host-state", operations: [{ id: "uncertain-1" }] };
+    const bridge = { request: vi.fn(async (command: string) => command === "operations.recovery.inspect" ? panel : { acknowledged: true }), getOperationRecovery: vi.fn(() => ({ recoveryRequired: false, recoveryRevision: "transport-clean" })), acknowledgeOperationRecovery: vi.fn() };
+    const tools = getOperationRecoveryTools(bridge as unknown as UxpWebSocketBridge);
+    const inspection = await tools.inspect_operation_recovery.handler({ backend: "uxp" }) as { data: { hostStateRevision: string; shared: { recoveryRevision: string } } };
+    const bound = { backend: "uxp", hostStateRevision: inspection.data.hostStateRevision, panel: { recoveryRequired: true, recoveryRevision: panel.recoveryRevision, operationIds: ["uncertain-1"] }, transport: null, shared: inspection.data.shared.recoveryRevision };
+    const forged = "review-v1:" + createHash("sha256").update(JSON.stringify(bound)).digest("hex");
+    await expect(tools.acknowledge_operation_recovery.handler({ backend: "uxp", review_token: forged, reviewed: true })).resolves.toMatchObject({ success: false, error: expect.stringContaining("STALE_REVIEW_TOKEN") });
+    expect(bridge.request).not.toHaveBeenCalledWith("operations.recovery.acknowledge", expect.anything());
+    expect(mocks.acknowledgeHostRecovery).not.toHaveBeenCalled();
   });
   it("clears a shared-only fence with the same one token (the 196 run's 1,089 failed acknowledgements)", async () => {
     const panel = { recoveryRequired: false, recoveryRevision: "panel-clean", identityRevision: "host-state", operations: [] };
