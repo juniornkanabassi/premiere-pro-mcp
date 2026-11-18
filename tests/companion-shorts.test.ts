@@ -9,11 +9,12 @@ import { DETAIL_LIMIT } from "../src/tools/companion.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-// The 56 Companion 1.10.0 manifest commands, plus one this adapter has never seen.
-const NAMES = ["status", "bins", "open", "close", "save", "import", "refresh", "autosync", "sequence_create", "sequence_list", "marker_add", "marker_list", "place", "remove", "job", "roots_list", "file_loose", "presets_export", "presets_effects", "presets_show", "sequence_settings", "sequence_duplicate", "sequence_new", "sequence_inout", "timeline", "edit", "effect_available", "effect_list", "effect_apply", "effect_set", "effect_add", "effect_remove", "colour_status", "colour_set", "export", "export_frame", "export_status", "audio_channels", "audio_clean", "roughcut", "short_setup", "bin_create", "bin_move", "bin_rename", "bin_label", "bin_layout", "stringout", "transcript_export", "transcript_import", "transcript_run", "audio_level", "sequence_vertical", "build", "multicam", "autocam", "captions_import"];
+// The 60 Companion 1.11.0 manifest commands, with its readOnly flags, plus one this adapter has never seen.
+const NAMES = ["status", "bins", "open", "close", "save", "import", "refresh", "autosync", "sequence_create", "sequence_list", "marker_add", "marker_list", "place", "remove", "job", "roots_list", "file_loose", "job_resolve", "presets_export", "presets_effects", "presets_show", "sequence_settings", "sequence_duplicate", "sequence_new", "sequence_inout", "timeline", "edit", "effect_available", "effect_list", "effect_apply", "effect_set", "effect_add", "effect_remove", "colour_status", "colour_set", "export", "export_frame", "export_status", "export_review", "audio_channels", "audio_clean", "roughcut", "short_setup", "first_cut", "bin_create", "bin_move", "bin_rename", "bin_label", "bin_layout", "stringout", "transcript_export", "transcript_import", "transcript_run", "audio_level", "sequence_vertical", "build", "finish", "multicam", "autocam", "captions_import"];
+const READ_ONLY = new Set(["status", "bins", "sequence_list", "marker_list", "job", "roots_list", "presets_export", "presets_effects", "presets_show", "timeline", "effect_available", "effect_list", "colour_status", "export_status", "first_cut"]);
 const s = { type: "string", minLength: 1 };
 const tools = [
-  ...NAMES.map(name => ({ name, description: `Fake ${name}.`, argv: name.split("_"), positional: [], inputSchema: { type: "object", properties: { project: s, sequence: s, track: s, index: { type: "integer" } }, required: [], additionalProperties: false } })),
+  ...NAMES.map(name => ({ name, description: `Fake ${name}.`, argv: name.split("_"), positional: [], ...(READ_ONLY.has(name) ? { readOnly: true } : {}), inputSchema: { type: "object", properties: { project: s, sequence: s, track: s, index: { type: "integer" } }, required: [], additionalProperties: false } })),
   { name: "first_cut_plan", description: "Plan a first cut from a transcript.", argv: ["first-cut", "plan"], positional: ["clip"], inputSchema: { type: "object", additionalProperties: false, required: ["clip"], properties: {
     clip: { ...s, description: "Clip name." }, mode: { type: "string", enum: ["tight", "loose"], description: "Default tight." }, padFrames: { type: "integer" } } } },
 ];
@@ -23,7 +24,8 @@ const fs = require("node:fs"); const a = process.argv.slice(2);
 if (a[0] === "mcp-manifest") { console.log(JSON.stringify({ name: "premiere-companion", tools: ${JSON.stringify(tools)} })); process.exit(0); }
 fs.appendFileSync(process.env.FAKE_LOG, a.join(" ") + "\\n");
 if (a[0] === "place") console.log(JSON.stringify({ jobId: "j1", state: "done", result: { placed: 1, sequence: "199 - 01 Rough Cut", items: [1, 2, 3] } }));
-else if (a[0] === "presets") console.log(JSON.stringify({ jobId: null, state: "done", result: { presets: Array.from({ length: 900 }, (_, i) => ({ name: "Preset " + i, path: "/x/".repeat(40) + i })) } }));
+// presets export answers with the bare grouped list, no envelope (Companion bin/binboy.mjs cliPresets).
+else if (a[0] === "presets") console.log(JSON.stringify(Object.fromEntries(Array.from({ length: 90 }, (_, f) => ["Folder " + f, Array.from({ length: 20 }, (_, i) => "Preset " + f + "." + i)]))));
 else { console.log(JSON.stringify({ jobId: null, state: "guard-refused", error: { code: "no-grant", message: "no open grant" } })); process.exit(3); }
 `;
 
@@ -88,12 +90,13 @@ describe("Shorts profile", () => {
     try {
       const placed = await client.callTool({ name: "companion_place", arguments: { sequence: "199 - 01 Rough Cut", track: "V2" } });
       expect(data(placed)).toMatchObject({ command: "place", writer: "premiere-companion", target: { sequence: "199 - 01 Rough Cut" }, state: "done", jobId: "j1",
-        changed: { placed: 1, items: "3 item(s)" }, verified: expect.stringContaining("read the change back") });
-      expect((placed as { structuredContent: { receipt: { outcome: string } } }).structuredContent.receipt.outcome).toBe("verified");
+        changed: { placed: 1, items: "3 item(s)" }, recovery: { kind: "jobId", id: "j1", lookup: "companion_job" }, verified: expect.stringContaining("no read-back") });
+      expect((placed as { structuredContent: { receipt: { outcome: string } } }).structuredContent.receipt.outcome).toBe("committed_unverified");
 
       const presets = await client.callTool({ name: "companion_presets_export", arguments: {} });
       const listing = data(presets);
       expect(listing).toMatchObject({ writer: null, changed: "nothing (read-only)", truncated: { limit: DETAIL_LIMIT } });
+      expect(listing.detail).toHaveProperty("Folder 0");
       expect((listing.truncated as { characters: number }).characters).toBeGreaterThan(DETAIL_LIMIT);
       expect(JSON.stringify(listing.detail).length).toBeLessThanOrEqual(DETAIL_LIMIT);
       expect(JSON.stringify((presets as { content: { text: string }[] }).content).length).toBeLessThan(DETAIL_LIMIT + 4000);

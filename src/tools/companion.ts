@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { companionAuthority, companionWriter } from "../companion-policy.js";
+import { companionWriter, setCompanionReadOnly } from "../companion-policy.js";
 import { markHostDispatch } from "../workflows/invocation-context.js";
 import { getTranscriptWordEditTools } from "./transcript-word-edits.js";
 
@@ -31,7 +31,7 @@ async function execute(cli: string, argv: string[]): Promise<{ stdout: string }>
 }
 interface Schema { type: string; enum?: unknown[]; minLength?: number; minItems?: number; items?: Schema }
 interface CompanionTool {
-  name: string; description: string; argv: string[]; positional: string[];
+  name: string; description: string; argv: string[]; positional: string[]; readOnly?: boolean;
   inputSchema: { type: string; properties: Record<string, Schema>; required?: string[]; additionalProperties: boolean };
 }
 
@@ -74,61 +74,87 @@ const PROPERTY_HINTS: Record<string, string> = {
   start: "Time in seconds (like 12.5) or timecode HH:MM:SS:FF.",
   id: "Job or export id from an earlier Companion result (jobId).",
 };
+// out is a trim time beside in (edit, place, sequence_inout) and a destination file everywhere else (export, export_frame, transcript_export, first_cut).
+const OUT_FILE = "Output file path.";
 function describeProperties(schema: CompanionTool["inputSchema"]): CompanionTool["inputSchema"] {
+  const hint = (key: string) => key === "out" && !Object.hasOwn(schema.properties, "in") ? OUT_FILE : PROPERTY_HINTS[key];
   return { ...schema, properties: Object.fromEntries(Object.entries(schema.properties).map(([key, value]) =>
-    [key, (value as { description?: string }).description || !PROPERTY_HINTS[key] ? value : { ...value, description: PROPERTY_HINTS[key] }])) };
+    [key, (value as { description?: string }).description || !hint(key) ? value : { ...value, description: hint(key) }])) };
 }
 
 export const DETAIL_LIMIT = 24_000;
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Json : undefined;
+// A row that reports a failure; capping keeps these before ordinary rows so a cap never hides one.
+const failedRow = (item: unknown): boolean => { const row = record(item); return !!row && (row.ok === false || (row.error !== undefined && row.error !== null) || /fail|error|refused|unknown/i.test(String(row.state ?? row.status ?? ""))); };
+const count = (list: unknown[]) => { const failed = list.filter(failedRow).length; return `${list.length} item(s)${failed ? `, ${failed} failed` : ""}`; };
 // One line per field: scalars as they are, lists as a count. Enough for "what changed" without the payload.
 function brief(value: unknown): unknown {
   const object = record(value);
-  if (!object) return Array.isArray(value) ? `${value.length} item(s)` : typeof value === "string" ? value.slice(0, 160) : value ?? null;
+  if (!object) return Array.isArray(value) ? count(value) : typeof value === "string" ? value.slice(0, 160) : value ?? null;
   return Object.fromEntries(Object.entries(object).slice(0, 12).map(([key, field]) =>
-    [key, Array.isArray(field) ? `${field.length} item(s)` : record(field) ? "{...}" : typeof field === "string" ? field.slice(0, 160) : field]));
+    [key, Array.isArray(field) ? count(field) : record(field) ? "{...}" : typeof field === "string" ? field.slice(0, 160) : field]));
 }
+// Long strings are replaced, never cut: a cut JSON string (a transcript) reads as content but cannot be parsed.
 function shrink(value: unknown, depth = 0): unknown {
-  if (typeof value === "string") return value.length > 400 ? value.slice(0, 400) + "..." : value;
-  if (Array.isArray(value)) return depth > 5 ? `${value.length} item(s)` : [...value.slice(0, 50).map(item => shrink(item, depth + 1)), ...(value.length > 50 ? [`... ${value.length - 50} more`] : [])];
+  if (typeof value === "string") return value.length > 400 ? `[${value.length} characters omitted]` : value;
+  if (Array.isArray(value)) {
+    if (depth > 5) return count(value);
+    const keep = new Set(value.flatMap((item, i) => failedRow(item) ? [i] : []).slice(0, 50));
+    for (let i = 0; keep.size < 50 && i < value.length; i++) keep.add(i);
+    const kept = value.filter((_, i) => keep.has(i)).map(item => shrink(item, depth + 1));
+    return value.length > 50 ? [...kept, `... ${value.length - 50} more (failed rows kept first)`] : kept;
+  }
   const object = record(value);
   return !object ? value : depth > 5 ? "{...}" : Object.fromEntries(Object.entries(object).map(([key, field]) => [key, shrink(field, depth + 1)]));
 }
 
 /** The small, consistent receipt every Companion-backed result carries, with the payload capped. */
 export function companionReceipt(tool: CompanionTool, args: Json, output: unknown, writes: boolean, ok = true): Json {
-  const out = record(output) ?? {};
-  const result = out.result;
-  const state = typeof out.state === "string" ? out.state : undefined;
-  const error = record(out.error);
-  const size = JSON.stringify(result ?? null).length;
-  let detail = size > DETAIL_LIMIT ? shrink(result) : result;
-  if (JSON.stringify(detail ?? null).length > DETAIL_LIMIT) detail = brief(result);
+  // Companion answers with an envelope (state, jobId / exportId / refreshId, result, plus fields such as an export's paths)
+  // or, for presets, roots, colour and first-cut, with the bare value itself.
+  const out = record(output);
+  const envelope = out && ["state", "jobId", "exportId", "refreshId"].some(key => Object.hasOwn(out, key)) ? out : undefined;
+  const { state: rawState, jobId, exportId, refreshId, error: rawError, result, ...meta } = envelope ?? {};
+  const payload = !envelope ? output : Object.keys(meta).length ? { ...meta, ...(result !== undefined ? { result } : {}) } : result;
+  const state = typeof rawState === "string" ? rawState : undefined;
+  const error = record(rawError) ?? (typeof rawError === "string" ? { message: rawError } : undefined);
+  const size = JSON.stringify(payload ?? null).length;
+  let detail = size > DETAIL_LIMIT ? shrink(payload) : payload;
+  if (JSON.stringify(detail ?? null).length > DETAIL_LIMIT) detail = brief(payload);
   const finished = ok && (state === "done" || (state === undefined && !error));
   const pending = ok && (state === "queued" || state === "running");
+  // A dry run: the tool takes apply and it was not passed, or audio_level was asked only to measure.
+  const preview = writes && ((Object.hasOwn(tool.inputSchema.properties, "apply") && args.apply !== true) || args.measureOnly === true);
+  const recovery = exportId != null ? { kind: "exportId", id: exportId, lookup: "companion_export_status" }
+    : jobId != null ? { kind: "jobId", id: jobId, lookup: "companion_job" }
+    : refreshId != null ? { kind: "refreshId", id: refreshId, lookup: null, note: "No tool looks up a refresh id. Check companion_bins for the files, or run companion_refresh with wait: true to follow it to the end." }
+    : null;
+  const payloadRecord = record(result) ?? record(payload);
   return {
     command: tool.argv.join(" "),
     writer: writes ? "premiere-companion" : null,
     target: {
-      project: args.project ?? record(result)?.project ?? "the single project Companion has granted",
-      ...(args.sequence ?? args.seq ?? record(result)?.sequence ? { sequence: args.sequence ?? args.seq ?? record(result)?.sequence } : {}),
+      project: args.project ?? payloadRecord?.project ?? "the single project Companion has granted",
+      ...(args.sequence ?? args.seq ?? payloadRecord?.sequence ? { sequence: args.sequence ?? args.seq ?? payloadRecord?.sequence } : {}),
     },
     state: state ?? null,
-    jobId: out.jobId ?? null,
-    changed: !writes ? "nothing (read-only)" : finished ? brief(result) ?? "done" : pending ? "accepted, not finished yet" : "nothing confirmed",
+    jobId: jobId ?? exportId ?? null,
+    recovery,
+    changed: !writes ? "nothing (read-only)" : preview && finished ? "nothing (preview)" : finished ? brief(result ?? payload) ?? "done" : pending ? "accepted, not finished yet" : "nothing confirmed",
     verified: !writes ? "read directly through Companion"
-      : finished ? "Companion read the change back from Premiere before reporting done; picture and sound were not rendered or checked"
-      : pending ? "not yet: poll companion_job (or companion_export_status for an export id) until it is done"
+      : preview && finished ? "preview only: nothing was changed in Premiere"
+      : finished ? "Companion reported done. This result carries no read-back of Premiere: check with companion_timeline, companion_bins or companion_marker_list before relying on it. Picture and sound were not rendered or checked."
+      : pending ? (recovery?.lookup ? `not yet: poll ${recovery.lookup} with id ${String(recovery.id)} until it is done` : `not yet: ${recovery?.note ?? "no id was returned; read back the project before any dependent edit"}`)
       : state === "unknown" ? "outcome unknown: do not retry; read companion_job and the timeline before any dependent edit"
       : "nothing was confirmed",
-    // Read by the server's mutation receipt (outcome, verificationScope, accepted); no top-level "result" key, so it reads these fields.
-    ...(writes && finished ? { outcome: "verified", verificationScope: "Premiere Companion read-back before done" } : {}),
+    // Read by the server's mutation receipt (outcome, accepted); no top-level "result" key, so it reads these fields.
+    ...(writes && finished ? { outcome: preview ? "not_applied" : "committed_unverified" } : {}),
     ...(writes && pending ? { outcome: "committed_unverified", accepted: true } : {}),
     ...(writes && (state === "guard-refused" || state === "no-panel") ? { outcome: "not_applied" } : {}),
     ...(error ? { error } : {}),
     detail: detail ?? null,
-    ...(detail !== result ? { truncated: { characters: size, limit: DETAIL_LIMIT, note: "Output capped. Call again with narrower arguments (one sequence, one preset by name with companion_presets_show, one job with companion_job)." } } : {}),
+    ...(detail !== payload ? { truncated: { characters: size, limit: DETAIL_LIMIT, note: "Output capped: long text is replaced by its length and failed rows are kept first. Call again with narrower arguments (one sequence, one preset by name with companion_presets_show, one job with companion_job). For a whole transcript, pass out to companion_transcript_export to write it to a file." } } : {}),
   };
 }
 
@@ -175,11 +201,12 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
   const manifest = JSON.parse(execFileSync(process.execPath, [cli, "mcp-manifest"], { encoding: "utf8", timeout: 10000, maxBuffer: 2 * 1024 * 1024 }));
   if (manifest.name !== "premiere-companion" || !Array.isArray(manifest.tools)) throw new Error("Invalid Premiere Companion manifest");
   const seen = new Set<string>();
+  setCompanionReadOnly((manifest.tools as CompanionTool[]).filter(tool => tool.readOnly === true).map(tool => tool.name));
   const tools = Object.fromEntries((manifest.tools as CompanionTool[]).map(tool => {
     if (!/^[a-z][a-z0-9_]*$/.test(tool.name) || seen.has(tool.name) || !Array.isArray(tool.argv) || !tool.argv.every(x => typeof x === "string") || !Array.isArray(tool.positional) || !tool.inputSchema?.properties) throw new Error("Invalid or duplicate Companion tool");
     seen.add(tool.name);
     const name = "companion_" + tool.name;
-    const writes = companionAuthority(name)!.length > 1;
+    const writes = tool.readOnly !== true;
     return [name, {
       description: `Premiere Companion: ${tool.description} ${writes ? "Writes through Companion's grant, locks and job queue. Never retry an unknown outcome." : "Read-only."}`,
       parameters: describeProperties(tool.inputSchema),

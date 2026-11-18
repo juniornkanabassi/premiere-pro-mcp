@@ -1,13 +1,15 @@
 // Companion remains the only writer unless the operator restarts in native mode.
-export const COMPANION_READ_TOOLS = new Set([
-  "status", "bins", "sequence_list", "marker_list", "job", "roots_list",
-  "presets_export", "presets_effects", "presets_show", "timeline",
-  "effect_available", "effect_list", "colour_status", "export_status",
-]);
+// Read-only commands are the ones Companion's own manifest marks readOnly: true (1.11.0 on); a command without the flag is a writer,
+// so a renamed or remapped command can never keep inspect-only authority by its name alone.
+const companionReadOnly = new Set<string>();
+export function setCompanionReadOnly(names: Iterable<string>): void {
+  companionReadOnly.clear();
+  for (const name of names) companionReadOnly.add(name);
+}
 
 export function companionAuthority(name: string): readonly ("inspect" | "edit" | "export" | "filesystem")[] | undefined {
   if (!name.startsWith("companion_")) return undefined;
-  return COMPANION_READ_TOOLS.has(name.slice(10))
+  return companionReadOnly.has(name.slice(10))
     ? ["inspect"] : ["inspect", "edit", "export", "filesystem"];
 }
 

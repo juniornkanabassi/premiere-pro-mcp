@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { companionArguments, getCompanionTools } from "../src/tools/companion.js";
 import { guardToolHandler, isToolPermitted, resolveCapabilities } from "../src/security/capabilities.js";
+import { setCompanionReadOnly } from "../src/companion-policy.js";
 import { currentInvocation, withInvocationContext } from "../src/workflows/invocation-context.js";
 import { mutationReceipt } from "../src/workflows/mutation-receipt.js";
 
@@ -28,6 +29,7 @@ describe("Companion integration", () => {
   });
   it("allows exactly one writer, including direct handler calls", async () => {
     vi.stubEnv("PREMIERE_COMPANION_CLI", "/fixture/companion.mjs");
+    setCompanionReadOnly(["status"]); // as a manifest marking status readOnly: true would
     const handler = vi.fn(async () => ({ success: true }));
     const authority = resolveCapabilities("inspect,edit,export,filesystem");
     expect(isToolPermitted("companion_status", authority)).toBe(true);
@@ -68,8 +70,8 @@ describe("Companion integration", () => {
     const cli = join(dir, "fake.mjs");
     writeFileSync(cli, `if(process.argv[2]==='mcp-manifest') console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: [tool] })})); else console.log(JSON.stringify({state:'done',result:{moved:1}}));`);
     await withInvocationContext({}, async () => {
-      const result = await getCompanionTools(cli).companion_bin_move.handler({ items: ["a"], to: "b" });
-      expect(mutationReceipt(result.success, result.data, currentInvocation(), "companion_bin_move")).toMatchObject({ dispatch: "dispatched", outcome: "verified" });
+      const result = await getCompanionTools(cli).companion_bin_move.handler({ items: ["a"], to: "b", apply: true });
+      expect(mutationReceipt(result.success, result.data, currentInvocation(), "companion_bin_move")).toMatchObject({ dispatch: "dispatched", outcome: "committed_unverified" });
     });
   });
   it("captures large CLI JSON even when the CLI exits immediately", async () => {
