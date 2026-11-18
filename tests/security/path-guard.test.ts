@@ -18,7 +18,8 @@ symlinkSync(outside, linkedDir, process.platform === "win32" ? "junction" : "dir
 afterAll(() => rmSync(base, { recursive: true, force: true }));
 
 describe("server-side symlink confinement for UXP paths (#640)", () => {
-  it("walks a forward-slash UNC-style path the panel accepts too (inspection A6)", () => {
+  // On Windows "/" + a drive path is not a valid path at all; the UNC case there is in path-guard-unc.test.ts.
+  it.skipIf(process.platform === "win32")("walks a forward-slash UNC-style path the panel accepts too (inspection A6)", () => {
     // The panel parses //host/share/... as a network path; on POSIX the same string reaches the local root.
     expect(findSymlinkedSegment("/" + join(linkedDir, "out.mp4"))).not.toBeNull();
     expect(() => assertNoSymlinkedPaths({ outputFilePath: "/" + join(linkedDir, "out.mp4") })).toThrow(SymlinkPathError);
