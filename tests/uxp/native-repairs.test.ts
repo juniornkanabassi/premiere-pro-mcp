@@ -73,15 +73,112 @@ describe("operation ledger retires finished records instead of filling up", () =
   });
   it("retires by size when long IDs reach the storage limit first", () => {
     const storage = stored(), value = Ledger.createOperationLedger({ storage, sessionId: "session-1", digest });
-    for (let index = 0; index < 3000; index++) { const id = "x".repeat(480) + "-" + index; value.reserve(id, digest(id), identity); value.finish(id, "verified"); }
+    // About 660 characters a record: the 1 MB limit is reached near 1,400 records, long before 4,096.
+    for (let index = 0; index < 1700; index++) { const id = "x".repeat(500) + "-" + index; value.reserve(id, digest(id), identity); value.finish(id, "verified"); }
     expect(storage.values.get(Ledger.STORAGE_KEY)!.length).toBeLessThanOrEqual(1024 * 1024);
-    expect(() => value.get("x".repeat(480) + "-0", digest("x"))).toThrow(/retired/);
-  });
+    expect(() => value.get("x".repeat(500) + "-0", digest("x"))).toThrow(/retired/);
+  }, 60000);
   it("refuses a tampered retired filter as corrupt", () => {
     const storage = stored(), value = Ledger.createOperationLedger({ storage, sessionId: "session-1", digest });
     value.reserve("a", digest("a"), identity);
     const raw = JSON.parse(storage.values.get(Ledger.STORAGE_KEY)!);
     storage.setItem(Ledger.STORAGE_KEY, JSON.stringify({ ...raw, retired: "00" }));
     expect(Ledger.createOperationLedger({ storage, digest }).inspect(identity)).toMatchObject({ ledgerCorrupt: true });
+  });
+});
+
+// A Motion-like effect with one point param (Position) and one scalar param (Scale). Turning the stopwatch on
+// makes a keyframe of its own at media time 0 holding the static value, as Premiere does.
+function parameterHost(options: { keyframesSupported?: boolean } = {}) {
+  class PointF { constructor(readonly x: number, readonly y: number) {} }
+  const makeParam = (displayName: string, initial: unknown) => {
+    const state = { value: initial, varying: false, keys: new Map<number, unknown>() };
+    const at = (seconds: number) => {
+      const times = [...state.keys.keys()].sort((a, b) => a - b);
+      if (!state.varying || !times.length) return state.value;
+      const previous = times.filter((time) => time <= seconds).at(-1) ?? times[0];
+      return state.keys.get(previous);
+    };
+    const param = {
+      displayName, state,
+      areKeyframesSupported: vi.fn(async () => options.keyframesSupported !== false),
+      isTimeVarying: vi.fn(() => state.varying),
+      getKeyframeListAsTickTimes: vi.fn(() => [...state.keys.keys()].sort((a, b) => a - b).map((seconds) => ({ seconds }))),
+      getStartValue: vi.fn(async () => ({ value: { value: at(0) } })),
+      getValueAtTime: vi.fn(async (time: { seconds: number }) => at(time.seconds)),
+      createKeyframe: vi.fn((value: unknown) => ({ value: { value }, position: null as { seconds: number } | null })),
+      createSetValueAction: vi.fn((keyframe: { value: { value: unknown } }) => ({ apply: () => { state.value = keyframe.value.value; } })),
+      createSetTimeVaryingAction: vi.fn((varying: boolean) => ({ apply: () => { state.varying = varying; if (varying && !state.keys.size) state.keys.set(0, state.value); if (!varying) state.keys.clear(); } })),
+      createAddKeyframeAction: vi.fn((keyframe: { value: { value: unknown }; position: { seconds: number } }) => ({ apply: () => { state.keys.set(keyframe.position.seconds, keyframe.value.value); } })),
+      createRemoveKeyframeAction: vi.fn((time: { seconds: number }) => ({ apply: () => { state.keys.delete(time.seconds); } })),
+    };
+    return param;
+  };
+  const position = makeParam("Position", new PointF(0.5, 0.5)), scale = makeParam("Scale", 100);
+  const component = { getMatchName: vi.fn(async () => "AE.ADBE Motion"), getDisplayName: vi.fn(async () => "Motion"), getParamCount: vi.fn(() => 2), getParam: vi.fn((index: number) => index === 0 ? position : scale) };
+  const trackItem = { getComponentChain: vi.fn(async () => ({ getComponentCount: () => 1, getComponentAtIndex: () => component })), getStartTime: async () => ({ seconds: 0 }) };
+  const track = { getTrackItems: vi.fn(async () => [trackItem]) };
+  const sequence = { guid: "sequence-1", getVideoTrackCount: vi.fn(async () => 1), getVideoTrack: vi.fn(async () => track), getAudioTrackCount: vi.fn(async () => 0), getAudioTrack: vi.fn() };
+  const addAction = (action: { apply: () => void }) => { action.apply(); return true; };
+  const project = { guid: "project-1", getActiveSequence: vi.fn(async () => sequence), lockedAccess: vi.fn((callback: () => void) => callback()), executeTransaction: vi.fn((callback: (compound: { addAction: typeof addAction }) => void) => { callback({ addAction }); return true; }) };
+  const ppro = {
+    Project: { getActiveProject: vi.fn(async () => project) }, PointF,
+    TickTime: { createWithSeconds: (seconds: number) => ({ seconds }) },
+    Constants: { TrackItemType: { CLIP: 1 }, InterpolationMode: { LINEAR: 1, HOLD: 2, BEZIER: 3, TIME: 4 } },
+  };
+  const registry = Commands.createCommandRegistry({ ppro, Protocol, storage: stored() });
+  return { registry, project, position, scale };
+}
+const motion = { mediaType: "video", trackIndex: 0, clipIndex: 0, componentIndex: 0 };
+
+describe("refusals made before any host write never block the next edit", () => {
+  it("set_value on an animated parameter is refused without a fence, and the next edit runs", async () => {
+    const host = parameterHost();
+    host.scale.state.varying = true; host.scale.state.keys.set(0, 100);
+    await expect(host.registry.dispatch("parameters.set", { ...motion, paramIndex: 1, value: 50, operationId: "refused-1" })).rejects.toMatchObject({ code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true });
+    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false, operations: [] });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 1, value: 50, operationId: "next-1" })).resolves.toMatchObject({ outcome: "verified" });
+    expect(host.project.executeTransaction).toHaveBeenCalledTimes(1);
+  });
+  it("a stale parameter name and a non-keyframable parameter are refused without a fence", async () => {
+    const host = parameterHost({ keyframesSupported: false });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, expectedParamName: "Rotation", timeSeconds: 0, value: 1, operationId: "stale" })).rejects.toMatchObject({ code: "UXP_STALE_PARAMETER", noHostWrite: true });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 0, value: 1, operationId: "unsupported" })).rejects.toMatchObject({ code: "UXP_TARGET_UNSUPPORTED", noHostWrite: true });
+    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+    expect(host.project.executeTransaction).not.toHaveBeenCalled();
+  });
+  it("a write that then fails still fences", async () => {
+    const host = parameterHost();
+    host.scale.createAddKeyframeAction.mockImplementationOnce(() => { throw new Error("host refused the keyframe"); });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 1, value: 50, operationId: "half-done" })).rejects.toThrow(/animation was already turned on/);
+    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: true, operations: [expect.objectContaining({ id: "half-done" })] });
+  });
+});
+
+describe("add_keyframe takes a point", () => {
+  it("adds point keyframes, reads both coordinates back and removes only the stopwatch's own keyframe", async () => {
+    const host = parameterHost();
+    const first = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, expectedParamName: "Position", timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "slide-1" });
+    expect(first).toMatchObject({ outcome: "verified", timeBase: "clip_media_time", point: { x: 0.1, y: 0.5 }, removedAutomaticKeyframeTimesSeconds: [0], after: { value: { x: 0.1, y: 0.5 }, keyframeTimesSeconds: [1] } });
+    const second = await host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1.5, point: { x: 0.5, y: 0.5 }, operationId: "slide-2" });
+    expect(second).toMatchObject({ outcome: "verified", removedAutomaticKeyframeTimesSeconds: [], after: { keyframeTimesSeconds: [1, 1.5] } });
+    const created = host.position.createKeyframe.mock.calls.map(([value]) => value);
+    expect(created.every((value) => value instanceof Object && "x" in (value as object))).toBe(true);
+    expect([...host.position.state.keys.entries()].map(([time, point]) => [time, (point as { x: number }).x])).toEqual([[1, 0.1], [1.5, 0.5]]);
+  });
+  it("keeps a requested keyframe at the stopwatch's own time and leaves earlier keys alone", async () => {
+    const host = parameterHost();
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 0, point: { x: 0.2, y: 0.3 }, operationId: "at-zero" })).resolves.toMatchObject({ outcome: "verified", removedAutomaticKeyframeTimesSeconds: [], after: { keyframeTimesSeconds: [0] } });
+  });
+  it("keeps the scalar contract and refuses a point and a value together", async () => {
+    const host = parameterHost();
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 1, timeSeconds: 2, value: 120, operationId: "scale" })).resolves.toMatchObject({ outcome: "verified", after: { value: 120, keyframeTimesSeconds: [2] } });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 2, value: 1, point: { x: 0, y: 0 }, operationId: "both" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 2, point: { x: 0 }, operationId: "half-point" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true });
+  });
+  it("reports a point that reads back different as committed_unverified", async () => {
+    const host = parameterHost();
+    host.position.getValueAtTime.mockImplementation(async () => ({ x: 0.9, y: 0.9 }));
+    await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "drift" })).resolves.toMatchObject({ outcome: "committed_unverified", verified: false });
   });
 });

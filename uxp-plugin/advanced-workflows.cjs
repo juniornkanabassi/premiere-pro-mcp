@@ -1048,7 +1048,7 @@
 
     async function parameterContext(args, mutation) {
       const allowed = ["mediaType", "trackIndex", "clipIndex", "componentIndex", "paramIndex", "expectedComponentId", "expectedParamName", "timeSeconds"];
-      if (mutation) allowed.push("value", "endSeconds", "interpolation", "operationId");
+      if (mutation) allowed.push("value", "point", "endSeconds", "interpolation", "operationId");
       assertObject(args); assertOnlyKeys(args, allowed);
       const mediaType = enumValue(args.mediaType, "mediaType", ["video", "audio"]), trackIndex = nonNegativeInt(args.trackIndex, "trackIndex"), clipIndex = nonNegativeInt(args.clipIndex, "clipIndex"), componentIndex = nonNegativeInt(args.componentIndex, "componentIndex"), paramIndex = nonNegativeInt(args.paramIndex, "paramIndex");
       const context = await activeContext(mutation), item = await trackItemAt(context.sequence, mediaType, trackIndex, clipIndex), chain = await item.getComponentChain();
@@ -1279,12 +1279,15 @@
     }
 
     async function setPointParameter(args) {
-      const input = validatePointParameterSet(args), point = createPoint(input.point);
-      const initialContext = await pointParameterContext(input, true);
+      const input = validatePointParameterSet(args), point = await beforeWrite(async () => createPoint(input.point));
+      const initialContext = await beforeWrite(() => pointParameterContext(input, true));
       return withPointParameterLock(pointParameterLockKey(initialContext), async () => {
-        const context = await pointParameterContext(input, true), before = await pointParameterSnapshot(context);
-        assertPointSnapshot(before, input.expectedSnapshot);
-        if (before.timeVarying) throw commandError("UXP_TARGET_UNSUPPORTED", "PointF updates support only non-time-varying parameters; keyframed PointF edits are not exposed");
+        const { context, before } = await beforeWrite(async () => {
+          const context = await pointParameterContext(input, true), before = await pointParameterSnapshot(context);
+          assertPointSnapshot(before, input.expectedSnapshot);
+          if (before.timeVarying) throw refuse("UXP_TARGET_UNSUPPORTED", "set_point_value changes only a non-animated PointF parameter; use add_keyframe with point for an animated one");
+          return { context, before };
+        });
         context.project.lockedAccess(() => {
           const action = context.param.createSetValueAction(context.param.createKeyframe(point), true);
           commitActions(context.project, "Set PointF effect parameter", [action]);
@@ -1558,11 +1561,14 @@
     }
 
     async function setParameterTimeVarying(args) {
-      const input = validateParameterTimeVaryingSet(args), initialContext = await parameterTimeVaryingContext(input, true);
+      const input = validateParameterTimeVaryingSet(args), initialContext = await beforeWrite(() => parameterTimeVaryingContext(input, true));
       return withParameterTimeVaryingLock(parameterTimeVaryingLockKey(initialContext), async () => {
-        const context = await parameterTimeVaryingContext(input, true), before = await parameterTimeVaryingSnapshot(context, true);
-        if (!before.keyframesSupported) throw commandError("UXP_TARGET_UNSUPPORTED", "This parameter does not support keyframes");
-        assertExpectedParameterTimeVarying(before, input.expectedTimeVarying, input.expectedKeyframeTimesSeconds);
+        const { context, before } = await beforeWrite(async () => {
+          const context = await parameterTimeVaryingContext(input, true), before = await parameterTimeVaryingSnapshot(context, true);
+          if (!before.keyframesSupported) throw refuse("UXP_TARGET_UNSUPPORTED", "This parameter does not support keyframes");
+          assertExpectedParameterTimeVarying(before, input.expectedTimeVarying, input.expectedKeyframeTimesSeconds);
+          return { context, before };
+        });
         if (before.timeVarying === input.timeVarying) {
           return verifiedNoopResult({ updated: false, unchanged: true, before, after: before }, "parameter_time_varying_noop_readback");
         }
@@ -1581,8 +1587,12 @@
     }
 
     async function setParameterValue(args) {
-      const context = await parameterContext(args, true), value = scalarValue(args.value), before = await parameterSnapshot(context, args.timeSeconds);
-      if (before.timeVarying) throw commandError("UXP_TARGET_UNSUPPORTED", "Use add_keyframe to change a time-varying parameter");
+      const { context, value, before } = await beforeWrite(async () => {
+        if (args && args.point !== undefined) throw refuse("UXP_INVALID_ARGUMENT", "set_value takes a scalar value; use set_point_value for a static point");
+        const context = await parameterContext(args, true), value = scalarValue(args.value), before = await parameterSnapshot(context, args.timeSeconds);
+        if (before.timeVarying) throw refuse("UXP_TARGET_UNSUPPORTED", "Use add_keyframe to change a time-varying parameter");
+        return { context, value, before };
+      });
       context.project.lockedAccess(() => {
         const keyframe = context.param.createKeyframe(value);
         commitActions(context.project, "Set effect parameter", [context.param.createSetValueAction(keyframe, true)]);
@@ -1591,23 +1601,51 @@
       return mutationResult(verified, { updated: true, before, after }, "parameter_value_readback", "Set effect parameter");
     }
 
+    // timeSeconds is the clip's media time (sequence time - clip start + clip in point), as keyframe positions are.
     async function addParameterKeyframe(args) {
-      const context = await parameterContext(args, true), value = scalarValue(args.value), timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), time = tick(timeSeconds, "timeSeconds"), before = await parameterSnapshot(context);
-      if (!before.keyframesSupported) throw commandError("UXP_TARGET_UNSUPPORTED", "This parameter does not support keyframes");
-      context.project.lockedAccess(() => {
-        const actions = [], keyframe = context.param.createKeyframe(value);
-        keyframe.position = time;
-        if (!before.timeVarying) actions.push(context.param.createSetTimeVaryingAction(true));
-        actions.push(context.param.createAddKeyframeAction(keyframe));
-        commitActions(context.project, "Add effect keyframe", actions);
+      const prepared = await beforeWrite(async () => {
+        if (args && args.point !== undefined && args.value !== undefined) throw refuse("UXP_INVALID_ARGUMENT", "Give value or point, not both");
+        const point = args && args.point !== undefined ? pointValue(args.point, "point") : null;
+        const context = await parameterContext(args, true), value = point ? createPoint(point) : scalarValue(args.value);
+        const timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), time = tick(timeSeconds, "timeSeconds"), before = await parameterSnapshot(context);
+        if (!before.keyframesSupported) throw refuse("UXP_TARGET_UNSUPPORTED", "This parameter does not support keyframes");
+        if (before.keyframesLimited) throw refuse("UXP_PROJECT_TOO_LARGE", "Parameter has more than " + MAX_KEYFRAMES + " keyframes");
+        return { context, point, value, timeSeconds, time, before };
       });
-      const after = await parameterSnapshot(context, timeSeconds), verified = after.keyframeTimesSeconds.some((seconds) => numbersEqual(seconds, timeSeconds)) && valuesEqual(after.value, value);
-      return mutationResult(verified, { added: true, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
+      const { point, value, timeSeconds, time, before } = prepared;
+      let context = prepared.context, automatic = [];
+      if (!before.timeVarying) {
+        // Turning the stopwatch on makes Premiere add keyframes of its own; note them so only those are removed.
+        context.project.lockedAccess(() => {
+          commitActions(context.project, "Enable effect parameter animation", [context.param.createSetTimeVaryingAction(true)]);
+        });
+        context = await parameterContext(args, true);
+        automatic = completeKeyframeTimes(context.param).filter((seconds) => !before.keyframeTimesSeconds.some((old) => numbersEqual(old, seconds)) && !numbersEqual(seconds, timeSeconds));
+      }
+      try {
+        context.project.lockedAccess(() => {
+          const actions = automatic.map((seconds) => context.param.createRemoveKeyframeAction(tick(seconds, "timeSeconds"), true)), keyframe = context.param.createKeyframe(value);
+          keyframe.position = time;
+          actions.push(context.param.createAddKeyframeAction(keyframe));
+          commitActions(context.project, "Add effect keyframe", actions);
+        });
+      } catch (error) {
+        if (!before.timeVarying && error && typeof error === "object") error.message = (error.message || String(error)) + " (animation was already turned on for this parameter; inspect it before retrying)";
+        throw error;
+      }
+      const afterContext = await parameterContext(args, true), after = await parameterSnapshot(afterContext, timeSeconds);
+      const present = after.keyframeTimesSeconds.some((seconds) => numbersEqual(seconds, timeSeconds));
+      const leftover = automatic.filter((seconds) => after.keyframeTimesSeconds.some((current) => numbersEqual(current, seconds)));
+      if (point) { let read = null; try { read = hostParameterValue(after.value, "point"); } catch (_) {} after.value = read; }
+      const verified = present && leftover.length === 0 && (point ? pointsEqual(after.value, point) : valuesEqual(after.value, value));
+      return mutationResult(verified, { added: true, timeBase: "clip_media_time", ...(point ? { point } : {}), removedAutomaticKeyframeTimesSeconds: automatic, before, after }, "parameter_keyframe_readback", "Add effect keyframe");
     }
 
     async function removeParameterKeyframe(args) {
-      const context = await parameterContext(args, true), timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400);
-      const beforeTimes = completeKeyframeTimes(context.param);
+      const { context, timeSeconds, beforeTimes } = await beforeWrite(async () => {
+        const context = await parameterContext(args, true), timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400);
+        return { context, timeSeconds, beforeTimes: completeKeyframeTimes(context.param) };
+      });
       const existed = beforeTimes.some((seconds) => numbersEqual(seconds, timeSeconds));
       if (!existed) return verifiedNoopResult({ removed: false, unchanged: true, timeSeconds, after: await parameterSnapshot(context) }, "parameter_keyframe_absence_preflight");
       context.project.lockedAccess(() => {
@@ -1618,9 +1656,11 @@
     }
 
     async function removeParameterKeyframeRange(args) {
-      const context = await parameterContext(args, true), start = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), end = finiteNumber(args.endSeconds, "endSeconds", 0, 86400);
-      if (end < start) throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds");
-      const beforeTimes = completeKeyframeTimes(context.param);
+      const { context, start, end, beforeTimes } = await beforeWrite(async () => {
+        const context = await parameterContext(args, true), start = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), end = finiteNumber(args.endSeconds, "endSeconds", 0, 86400);
+        if (end < start) throw refuse("UXP_INVALID_ARGUMENT", "endSeconds must be greater than or equal to timeSeconds");
+        return { context, start, end, beforeTimes: completeKeyframeTimes(context.param) };
+      });
       const existed = beforeTimes.some((seconds) => seconds != null && seconds >= start && seconds <= end);
       if (!existed) return verifiedNoopResult({ removed: false, unchanged: true, startSeconds: start, endSeconds: end, after: await parameterSnapshot(context) }, "parameter_keyframe_range_absence_preflight");
       context.project.lockedAccess(() => {
@@ -1631,9 +1671,12 @@
     }
 
     async function setParameterInterpolation(args) {
-      const context = await parameterContext(args, true), timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), modeName = enumValue(args.interpolation, "interpolation", ["linear", "hold", "bezier", "time"]), constants = ppro.Constants && ppro.Constants.InterpolationMode || {};
-      const mode = constants[modeName.toUpperCase()];
-      if (mode == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Interpolation constants are unavailable");
+      const { context, timeSeconds, modeName, mode } = await beforeWrite(async () => {
+        const context = await parameterContext(args, true), timeSeconds = finiteNumber(args.timeSeconds, "timeSeconds", 0, 86400), modeName = enumValue(args.interpolation, "interpolation", ["linear", "hold", "bezier", "time"]), constants = ppro.Constants && ppro.Constants.InterpolationMode || {};
+        const mode = constants[modeName.toUpperCase()];
+        if (mode == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Interpolation constants are unavailable");
+        return { context, timeSeconds, modeName, mode };
+      });
       context.project.lockedAccess(() => {
         commitActions(context.project, "Set keyframe interpolation", [context.param.createSetInterpolationAtKeyframeAction(tick(timeSeconds, "timeSeconds"), mode, true)]);
       });
@@ -2769,6 +2812,8 @@
   // Refusal raised before any host write (argument validation, confirmations): the recovery fence need not treat it as unknown.
   // Use only where call order rules out a prior write; never after an executeTransaction, setMute, setActiveSequence, import or save.
   function refuse(code, message) { const error = commandError(code, message); error.noHostWrite = true; return error; }
+  // Runs the host reads that come before a handler's first write: whatever they throw changed nothing, so it must not fence.
+  async function beforeWrite(read) { try { return await read(); } catch (error) { if (error && typeof error === "object") error.noHostWrite = true; throw error; } }
 
   return { createAdvancedWorkflowDefinitions };
 });

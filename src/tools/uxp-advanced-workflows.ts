@@ -579,7 +579,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     automate_effect_parameters_uxp: {
-      description: "Inspect or transactionally set scalar effect parameters; inspect or guardedly set static PointF x/y and Color RGBA parameters; locate individual keyframes including a bounded native nearest-range lookup; adjust keyframes/interpolation; and control explicit time-varying animation mode through documented UXP actions. Interpolation verification covers the stored mode only, not rendering; Premiere 26.5.2 Windows has a reported temporal-curve render gap. Inspect playback or exported pixels. Disabling animation requires a complete inspected keyframe-time snapshot and confirmation.",
+      description: "Inspect or transactionally set scalar effect parameters; inspect or guardedly set static PointF x/y and Color RGBA parameters; add scalar or point (x/y, e.g. Motion Position) keyframes, which turn animation on when needed and remove only the keyframe Premiere makes for that; locate individual keyframes including a bounded native nearest-range lookup; adjust keyframes/interpolation; and control explicit time-varying animation mode through documented UXP actions. Interpolation verification covers the stored mode only, not rendering; Premiere 26.5.2 Windows has a reported temporal-curve render gap. Inspect playback or exported pixels. Disabling animation requires a complete inspected keyframe-time snapshot and confirmation. Keyframe times (time_seconds, end_seconds) are the clip's media time, not sequence time: media time = sequence time - clip start + clip in point.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -598,7 +598,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
               y: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
             },
             required: ["x", "y"],
-            description: "Requested static PointF x/y value for set_point_value.",
+            description: "PointF x/y: the static value for set_point_value, or the keyframe value for add_keyframe (instead of value).",
           },
           color: {
             type: "object", additionalProperties: false,
@@ -789,7 +789,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
             ...operation(args),
           });
         }
-        return invoke(bridge, commands[args.action], { ...common, ...compact({ value: args.value, endSeconds: args.end_seconds, interpolation: args.interpolation }), ...operation(args) });
+        return invoke(bridge, commands[args.action], { ...common, ...compact({ value: args.value, point: args.action === "add_keyframe" ? args.point : undefined, endSeconds: args.end_seconds, interpolation: args.interpolation }), ...operation(args) });
       },
     },
 

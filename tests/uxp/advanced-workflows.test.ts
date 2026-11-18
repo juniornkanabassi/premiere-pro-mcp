@@ -1052,9 +1052,10 @@ describe("advanced stable Premiere UXP workflows", () => {
     })).rejects.toMatchObject({ code: "UXP_STALE_POINT_PARAMETER" });
     expect(value.project.executeTransaction).not.toHaveBeenCalled();
     await acknowledgeReviewedRefusal(value, ["point-stale"]);
+    // The stale refusal wrote nothing, so it released its ID (lane E): a retry is refused for the same reason, not as consumed.
     await expect(value.registry.dispatch("parameters.point.set", {
       ...target, expectedSnapshot, point: { x: 1100, y: 600 }, confirmSetPoint: true, operationId: "point-stale",
-    })).rejects.toMatchObject({ code: "UXP_OPERATION_CONSUMED" });
+    })).rejects.toMatchObject({ code: "UXP_STALE_POINT_PARAMETER", noHostWrite: true });
 
     await expect(value.registry.dispatch("parameters.point.set", {
       ...target, expectedSnapshot, point: { x: 1100, y: 600 }, confirmSetPoint: true,
