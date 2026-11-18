@@ -369,7 +369,7 @@
           const result = await runWithWatchdog(operationKey, command, definition.handler(input), meta.deadlineMs, input);
           // ranOnSequenceId is the sequence that was active when the handler started.
           const envelope = { operationId: operationId || null, outcome: result && result.outcome ? result.outcome : "verified", ranOnSequenceId: current.sequenceGuid || null, ...(sequencePin ? { sequencePin } : {}), ...result };
-          operationLedger.finish(operationKey, envelope.outcome);
+          operationLedger.finish(operationKey, envelope.outcome, !operationId);
           completedOperations.set(operationKey, envelope);
           if (completedOperations.size > 256) completedOperations.delete(completedOperations.keys().next().value);
           return envelope;

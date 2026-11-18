@@ -35,10 +35,8 @@ describe("documented UXP cryptographic session identity", () => {
     await restored.registry.dispatch("test.mutate", { value: 2 });
     const persisted = JSON.parse(storage.values.get(Ledger.STORAGE_KEY)!);
     expect(persisted.sessionId).toBe("panel-00000000-0000-4000-8000-000000000001");
-    expect(persisted.records.map((record: { id: string }) => record.id)).toEqual([
-      "anonymous:panel-00000000-0000-4000-8000-000000000001:invocation-00000000-0000-4000-8000-000000000002:1",
-      "anonymous:panel-00000000-0000-4000-8000-000000000001:invocation-00000000-0000-4000-8000-000000000003:1",
-    ]);
+    // Finished anonymous keys are panel-generated and can never be sent again, so they are not kept (lane E).
+    expect(persisted.records).toEqual([]);
     expect(randomUUID).toHaveBeenCalledTimes(3);
     expect(weakRandom).not.toHaveBeenCalled();
   });
@@ -136,12 +134,6 @@ describe("canonical operation binding and durable consumed receipts", () => {
     const unavailable = Ledger.createOperationLedger({ digest, storage: { getItem: () => null, setItem: () => { throw new Error("quota"); } } });
     expect(() => unavailable.reserve("x", digest("x"), identity)).toThrow(/no new host mutation/);
     expect(unavailable.get("x", digest("x"))).toBeNull();
-  });
-  it("keeps consumed tombstones until its explicit bounded capacity", () => {
-    const value = ledger();
-    for (let index = 0; index < Ledger.MAX_OPERATIONS; index++) { value.reserve("id-" + index, digest(String(index)), identity); value.finish("id-" + index, "verified"); }
-    expect(() => value.reserve("overflow", digest("overflow"), identity)).toThrow(/cannot be silently evicted/);
-    expect(value.get("id-0", digest("0"))).toMatchObject({ outcome: "verified" });
   });
   it("refreshes durable bindings across separate panel contexts without overwriting consumed IDs", () => {
     const storage = stored(), first = ledger(storage), second = ledger(storage);

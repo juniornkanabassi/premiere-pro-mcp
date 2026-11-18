@@ -7,6 +7,10 @@
   const STORAGE_KEY = "premiere-mcp.operation-ledger.v1";
   const MAX_OPERATIONS = 4096;
   const MAX_STORAGE_CHARS = 1024 * 1024;
+  // Retired IDs live in a fixed-size Bloom filter: it never fills and has no false negatives, so a retired ID can
+  // never be reused. A false positive refuses a fresh ID (about 1 in 150 after 50,000 retired IDs); the caller picks another.
+  const RETIRED_FILTER_BYTES = 65536, RETIRED_FILTER_HASHES = 7;
+  const TERMINAL = ["consumed", "verified", "committed", "committed_unverified", "failed"];
   function failure(code, message) { const error = new Error(message); error.code = code; return error; }
   function createSecureSessionId(prefix) {
     // These global UXP Crypto APIs are documented since UXP 6.2 (Premiere
@@ -51,15 +55,41 @@
     let sessionId = options.sessionId || null;
     if (sessionId && (typeof sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId))) throw failure("UXP_INVALID_ARGUMENT", "Invalid injected operation session identity");
     const records = new Map();
-    let corrupt = false;
+    let retiredFilter = new Uint8Array(RETIRED_FILTER_BYTES), retiredHex = null, retiredCount = 0;
+    let corrupt = false, lastRaw = null;
+    function filterBits(id) {
+      const hex = digest("retired-operation:" + id).slice(7), bits = [];
+      for (let index = 0; index < RETIRED_FILTER_HASHES; index++) bits.push(parseInt(hex.slice(index * 5, index * 5 + 5), 16) % (RETIRED_FILTER_BYTES * 8));
+      return bits;
+    }
+    function isRetired(id) { return filterBits(id).every((bit) => (retiredFilter[bit >> 3] & (1 << (bit & 7))) !== 0); }
+    // Oldest first (Map insertion order). Unresolved (pending/unknown) records are never retired.
+    function retireOldest(keep) {
+      let changed = false;
+      for (const [id, record] of records) {
+        if (records.size <= keep) break;
+        if (!TERMINAL.includes(record.outcome)) continue;
+        for (const bit of filterBits(id)) retiredFilter[bit >> 3] |= 1 << (bit & 7);
+        records.delete(id); retiredCount++; changed = true;
+      }
+      if (changed) retiredHex = null;
+      return changed;
+    }
     function refresh(initial) {
       if (!durable) return;
       try {
         const raw = storage.getItem(STORAGE_KEY);
+        // Unchanged since this context last read or wrote it: skip parsing up to 1 MB on every step of every edit.
+        if (raw && raw === lastRaw) return;
         if (raw) {
           if (raw.length > MAX_STORAGE_CHARS) throw new Error("Oversized ledger");
           const value = JSON.parse(raw);
-          if (value.version !== 1 || typeof value.sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(value.sessionId) || !Array.isArray(value.records) || value.records.length > MAX_OPERATIONS || Object.keys(value).some((key) => !["version", "sessionId", "records"].includes(key))) throw new Error("Invalid ledger");
+          // Version 1 stores (no retired filter) are migrated on the next write; a full one retires its oldest finished records.
+          if ((value.version !== 1 && value.version !== 2) || typeof value.sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(value.sessionId) || !Array.isArray(value.records) || value.records.length > MAX_OPERATIONS || Object.keys(value).some((key) => !["version", "sessionId", "records", "retired", "retiredCount"].includes(key))) throw new Error("Invalid ledger");
+          if (value.version === 2 && (typeof value.retired !== "string" || value.retired.length !== RETIRED_FILTER_BYTES * 2 || !/^[a-f0-9]*$/.test(value.retired) || !Number.isSafeInteger(value.retiredCount) || value.retiredCount < 0)) throw new Error("Invalid retired filter");
+          if (value.version === 1 && ("retired" in value || "retiredCount" in value)) throw new Error("Invalid ledger");
+          const filter = new Uint8Array(RETIRED_FILTER_BYTES);
+          if (value.version === 2 && value.retired !== retiredHex) for (let index = 0; index < RETIRED_FILTER_BYTES; index++) filter[index] = parseInt(value.retired.substr(index * 2, 2), 16);
           sessionId = value.sessionId;
           const incoming = new Map();
           for (const record of value.records) {
@@ -70,6 +100,8 @@
           }
           records.clear();
           for (const [id, record] of incoming) records.set(id, record);
+          if (value.version === 2) { if (value.retired !== retiredHex) { retiredFilter = filter; retiredHex = value.retired; } retiredCount = value.retiredCount; }
+          lastRaw = raw;
         } else if (records.size > 0) corrupt = true;
       } catch (_) { corrupt = true; }
     }
@@ -81,9 +113,15 @@
     function persist() {
       assertSecureIdentity();
       if (!storage || typeof storage.setItem !== "function") return;
-      const raw = JSON.stringify({ version: 1, sessionId, records: Array.from(records.values()) });
-      if (raw.length > MAX_STORAGE_CHARS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger is full; reconnect alone does not make retry safe");
-      try { storage.setItem(STORAGE_KEY, raw); } catch (_) { throw failure("UXP_OPERATION_LEDGER_UNAVAILABLE", "Cannot preserve operation reservation; no new host mutation was dispatched"); }
+      let raw = serialize();
+      // Long IDs can reach the size limit before the count limit: retire finished records until the store fits.
+      while (raw.length > MAX_STORAGE_CHARS && retireOldest(Math.floor(records.size * 3 / 4))) raw = serialize();
+      if (raw.length > MAX_STORAGE_CHARS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger is full of unresolved operations; inspect and acknowledge operation recovery");
+      try { storage.setItem(STORAGE_KEY, raw); lastRaw = raw; } catch (_) { throw failure("UXP_OPERATION_LEDGER_UNAVAILABLE", "Cannot preserve operation reservation; no new host mutation was dispatched"); }
+    }
+    function serialize() {
+      if (retiredHex === null) { let hex = ""; for (const byte of retiredFilter) hex += (byte < 16 ? "0" : "") + byte.toString(16); retiredHex = hex; }
+      return JSON.stringify({ version: 2, sessionId, records: Array.from(records.values()), retired: retiredHex, retiredCount });
     }
     function scope(identity) { return digest(canonical({ backend: "uxp", sessionId, project: identity.projectGuid || null })); }
     function bind(command, args, identity) { refresh(false); assertSecureIdentity(); return digest(canonical({ version: 1, backend: "uxp", sessionId, command, args, identity })); }
@@ -103,6 +141,7 @@
         refresh(false);
         const record = records.get(id);
         if (record && record.binding !== binding) throw failure("UXP_OPERATION_CONFLICT", "Operation ID is bound to different arguments, project, sequence, or command; inspect current state and use a new reviewed operation ID");
+        if (!record && isRetired(id)) throw failure("UXP_OPERATION_EXPIRED", "Operation ID was used before and its finished record has been retired; replay is not authorized. Inspect current state and use a new operation ID");
         return record || null;
       },
       assertReady(identity) { if (inspect(identity).recoveryRequired) throw failure("UXP_RECOVERY_REQUIRED", "An earlier mutation has unknown outcome. Inspect operation recovery and current project state before acknowledging reviewed reconciliation"); },
@@ -110,14 +149,25 @@
         refresh(false);
         assertSecureIdentity();
         if (records.has(id)) throw failure("UXP_OPERATION_CONSUMED", "Operation ID was already reserved by another panel context; inspect its outcome before proceeding");
+        if (isRetired(id)) throw failure("UXP_OPERATION_EXPIRED", "Operation ID was used before and its finished record has been retired; replay is not authorized. Use a new operation ID");
         if (options.requireDurability === true && !durable) throw failure("UXP_OPERATION_LEDGER_UNAVAILABLE", "Persistent operation storage is unavailable; no host mutation was dispatched");
         if (corrupt) throw failure("UXP_RECOVERY_REQUIRED", "Stored operation ledger cannot be validated; mutations are blocked");
-        if (records.size >= MAX_OPERATIONS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger reached its bounded capacity; consumed IDs cannot be silently evicted");
+        // Retire a batch of the oldest finished records so the store is not rewritten at every edit near the limit.
+        if (records.size >= MAX_OPERATIONS) retireOldest(MAX_OPERATIONS / 2);
+        if (records.size >= MAX_OPERATIONS) throw failure("UXP_OPERATION_LEDGER_FULL", "Operation ledger holds " + MAX_OPERATIONS + " unresolved operations; inspect and acknowledge operation recovery");
         const record = { id, binding, scope: scope(identity), outcome: "pending" };
         records.set(id, record);
         try { persist(); } catch (error) { records.delete(id); throw error; }
       },
-      finish(id, outcome) { refresh(false); const record = records.get(id); if (record) { record.outcome = ["verified", "committed", "committed_unverified", "failed"].includes(outcome) ? outcome : "unknown"; persist(); } },
+      // ephemeral: a panel-generated key that no caller can send again, so a finished one needs no tombstone.
+      finish(id, outcome, ephemeral) {
+        refresh(false); const record = records.get(id);
+        if (!record) return;
+        record.outcome = ["verified", "committed", "committed_unverified", "failed"].includes(outcome) ? outcome : "unknown";
+        if (ephemeral === true && record.outcome !== "unknown") records.delete(id);
+        persist();
+      },
+      get retiredCount() { return retiredCount; },
       unknown(id) { refresh(false); const record = records.get(id); if (record) { record.outcome = "unknown"; persist(); } },
       releasePreflight(id) { refresh(false); records.delete(id); persist(); },
       inspect,
