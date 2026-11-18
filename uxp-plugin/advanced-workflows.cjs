@@ -2317,7 +2317,7 @@
     async function encodeSequence(args) {
       assertObject(args); assertOnlyKeys(args, ["sequenceId", "exportType", "outputFile", "presetFile", "exportFull", "confirmExternalWrite", "operationId"]);
       requireExternalWrite(args.confirmExternalWrite);
-      const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), manager = encoderManager(), output = await allowedPath(args.outputFile, "outputFile", "file"), preset = await allowedPath(args.presetFile, "presetFile", "file");
+      const project = await activeProject(false), sequence = await resolveSequence(project, args.sequenceId), manager = encoderManager(), output = await allowedPath(args.outputFile, "outputFile", "file", true), preset = await allowedPath(args.presetFile, "presetFile", "file");
       const full = optionalBoolean(args.exportFull, true, "exportFull");
       const job = beginEncoderJob("sequence", args.operationId, {
         schemaVersion: "premiere-mcp.encoder-lineage.v1", projectId: guidString(project.guid), sequenceId: guidString(sequence.guid), projectItemId: null,
@@ -2332,7 +2332,7 @@
     async function encodeProjectItem(args) {
       assertObject(args); assertOnlyKeys(args, ["projectItemId", "outputFile", "presetFile", "workArea", "removeUponCompletion", "startQueueImmediately", "confirmExternalWrite", "operationId"]);
       requireExternalWrite(args.confirmExternalWrite);
-      const project = await activeProject(false), clip = asClip(await resolveProjectItem(project, args.projectItemId, true), "projectItemId"), manager = encoderManager(), output = await allowedPath(args.outputFile, "outputFile", "file"), preset = await allowedPath(args.presetFile, "presetFile", "file");
+      const project = await activeProject(false), clip = asClip(await resolveProjectItem(project, args.projectItemId, true), "projectItemId"), manager = encoderManager(), output = await allowedPath(args.outputFile, "outputFile", "file", true), preset = await allowedPath(args.presetFile, "presetFile", "file");
       const workArea = boundedInt(args.workArea == null ? 0 : args.workArea, "workArea", 0, 16), removeUponCompletion = optionalBoolean(args.removeUponCompletion, false, "removeUponCompletion"), startQueueImmediately = optionalBoolean(args.startQueueImmediately, true, "startQueueImmediately");
       const job = beginEncoderJob("projectItem", args.operationId, {
         schemaVersion: "premiere-mcp.encoder-lineage.v1", projectId: guidString(project.guid), sequenceId: null, projectItemId: await projectItemId(clip),
@@ -2347,7 +2347,7 @@
     async function encodeFile(args) {
       assertObject(args); assertOnlyKeys(args, ["filePath", "outputFile", "presetFile", "inSeconds", "outSeconds", "workArea", "removeUponCompletion", "startQueueImmediately", "confirmExternalWrite", "operationId"]);
       requireExternalWrite(args.confirmExternalWrite);
-      const manager = encoderManager(), input = await allowedPath(args.filePath, "filePath", "file"), output = await allowedPath(args.outputFile, "outputFile", "file"), preset = await allowedPath(args.presetFile, "presetFile", "file"), start = finiteNumber(args.inSeconds, "inSeconds", 0, 86400), end = finiteNumber(args.outSeconds, "outSeconds", 0, 86400);
+      const manager = encoderManager(), input = await allowedPath(args.filePath, "filePath", "file"), output = await allowedPath(args.outputFile, "outputFile", "file", true), preset = await allowedPath(args.presetFile, "presetFile", "file"), start = finiteNumber(args.inSeconds, "inSeconds", 0, 86400), end = finiteNumber(args.outSeconds, "outSeconds", 0, 86400);
       if (end <= start) throw refuse("UXP_INVALID_ARGUMENT", "outSeconds must be greater than inSeconds");
       const inTime = tick(start), outTime = tick(end), workArea = boundedInt(args.workArea == null ? 0 : args.workArea, "workArea", 0, 16), removeUponCompletion = optionalBoolean(args.removeUponCompletion, false, "removeUponCompletion"), startQueueImmediately = optionalBoolean(args.startQueueImmediately, true, "startQueueImmediately");
       const project = await ppro.Project.getActiveProject();
@@ -2460,9 +2460,9 @@
         operation: operationSemantics({ mutatesProject: false, externalSideEffect: true, verificationStatus: "not_verified", verificationBoundary: "encoder_host_return", verificationEvidence: [{ type: "host_return", accepted: true }], undoSupported: false, cancellationSupported: true }) };
     }
 
-    async function allowedPath(value, label, kind) {
+    async function allowedPath(value, label, kind, mayCreate) {
       const path = boundedString(value, label, 4096);
-      return workspace && typeof workspace.assertPathAllowed === "function" ? await workspace.assertPathAllowed(path, { label, kind }) : path;
+      return workspace && typeof workspace.assertPathAllowed === "function" ? await workspace.assertPathAllowed(path, { label, kind, ...(mayCreate === true ? { mayCreate: true } : {}) }) : path;
     }
 
     async function boundedPathArray(value, name, maximum, kind) {

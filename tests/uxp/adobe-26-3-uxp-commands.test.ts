@@ -157,7 +157,7 @@ describe("Adobe Premiere Pro 26.3 UXP commands", () => {
       options: { mixdownVideo: true, sampleRate: 48000, audioFileFormat: "wav", videoMixdownPresetPath: "/presets/prores.epr" },
     })).resolves.toMatchObject({ exported: true, format: "aaf", outcome: "committed_unverified", outputVerified: false });
     expect(value.aafOptionValues).toEqual({ mixdownVideo: true, sampleRate: 48000, audioFileFormat: 1, videoMixdownPresetPath: "/presets/prores.epr" });
-    expect(value.workspace.assertPathAllowed).toHaveBeenNthCalledWith(1, "/exports/edit.aaf", { label: "outputFilePath", kind: "file" });
+    expect(value.workspace.assertPathAllowed).toHaveBeenNthCalledWith(1, "/exports/edit.aaf", { label: "outputFilePath", kind: "file", mayCreate: true });
     expect(value.workspace.assertPathAllowed).toHaveBeenNthCalledWith(2, "/presets/prores.epr", { label: "videoMixdownPresetPath", kind: "file" });
   });
 

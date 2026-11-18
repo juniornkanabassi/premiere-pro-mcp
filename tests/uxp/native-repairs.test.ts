@@ -182,3 +182,35 @@ describe("add_keyframe takes a point", () => {
     await expect(host.registry.dispatch("parameters.keyframeAdd", { ...motion, paramIndex: 0, timeSeconds: 1, point: { x: 0.1, y: 0.5 }, operationId: "drift" })).resolves.toMatchObject({ outcome: "committed_unverified", verified: false });
   });
 });
+
+describe("output paths that do not exist yet", () => {
+  const Workspace = require("../../uxp-plugin/workspace.cjs");
+  // Approved folder /Work with Renders/ (real) and Escape/ (a link that resolves outside). Nothing else exists.
+  function walkingBroker() {
+    const folder = (nativePath: string, children: Record<string, unknown> = {}) => ({ isFolder: true, nativePath, getEntry: vi.fn(async (name: string) => { if (!(name in children)) throw new Error("missing"); return children[name]; }) });
+    const root = folder("/Work", { Renders: folder("/Work/Renders"), Escape: folder("/Elsewhere") });
+    const fs = { getFolder: vi.fn(async () => root), createPersistentToken: vi.fn(async () => "token"), getDataFolder: vi.fn(async () => ({ createFile: vi.fn(async () => ({ write: vi.fn() })) })) };
+    const broker = Workspace.createWorkspaceBroker({ fs });
+    return broker;
+  }
+  it("accepts a new file in an approved folder only when the caller says it may be created", async () => {
+    const broker = walkingBroker(); await broker.requestRoot();
+    await expect(broker.assertPathAllowed("/Work/Renders/preview.mp4", { label: "outputFile", kind: "file" })).rejects.toMatchObject({ code: "UXP_CANONICAL_PATH_UNAVAILABLE" });
+    await expect(broker.assertPathAllowed("/Work/Renders/preview.mp4", { label: "outputFile", kind: "file", mayCreate: true })).resolves.toBe("/Work/Renders/preview.mp4");
+    await expect(broker.assertPathAllowed("/Work/new.prproj", { label: "path", kind: "file", mayCreate: true })).resolves.toBe("/Work/new.prproj");
+  });
+  it("still refuses a new file whose folder resolves outside or does not exist", async () => {
+    const broker = walkingBroker(); await broker.requestRoot();
+    await expect(broker.assertPathAllowed("/Work/Escape/out.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_PATH_OUTSIDE_WORKSPACE" });
+    await expect(broker.assertPathAllowed("/Work/Missing/out.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_CANONICAL_PATH_UNAVAILABLE" });
+    await expect(broker.assertPathAllowed("/Other/out.mp4", { label: "outputFile", kind: "file", mayCreate: true })).rejects.toMatchObject({ code: "UXP_PATH_OUTSIDE_WORKSPACE" });
+  });
+  it("project create asks for a may-create check (encode, AAF and interchange outputs do too)", async () => {
+    const assertPathAllowed = vi.fn(async (path: string) => path);
+    const project = { guid: "p", path: "/Work/new.prproj", name: "new" };
+    const ppro = { Project: { getActiveProject: vi.fn(async () => null), getProject: vi.fn(), createProject: vi.fn(async () => project), isProject: vi.fn(() => false), open: vi.fn() }, ProjectUtils: { getProjectViewIds: vi.fn(async () => []), getProjectFromViewId: vi.fn() } };
+    const registry = Commands.createCommandRegistry({ ppro, Protocol, storage: stored(), workspace: { assertPathAllowed, status: () => ({ configured: true, canonicalPathValidation: "available" }), fileExists: async () => false } });
+    await registry.dispatch("project.sessions.create", { path: "/Work/new.prproj", confirmExternalWrite: true, operationId: "create-1" }).catch(() => undefined);
+    expect(assertPathAllowed).toHaveBeenCalledWith("/Work/new.prproj", expect.objectContaining({ kind: "file", mayCreate: true }));
+  });
+});

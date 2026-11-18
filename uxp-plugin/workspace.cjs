@@ -394,8 +394,24 @@
           canonicalCandidateValue = await resolveThroughGrantedFolder(candidate.normalized, { label, kind });
         }
       } catch (error) {
-        if (error && /^UXP_[A-Z0-9_]+$/.test(error.code || "")) throw error;
-        throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve " + label + " to a canonical filesystem path");
+        const code = error && error.code || "";
+        const newFile = options && options.mayCreate === true && kind === "file" && canonicalRootValue != null && (!code || code === "UXP_CANONICAL_PATH_UNAVAILABLE");
+        if (!newFile) {
+          if (/^UXP_[A-Z0-9_]+$/.test(code)) throw error;
+          throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve " + label + " to a canonical filesystem path");
+        }
+        // An output file that does not exist yet: resolve its folder instead and keep the new name.
+        // shortcut: a dangling symlink at the new name is not detected (UXP has no lstat); upgrade when it does.
+        const slash = candidate.normalized.lastIndexOf("/"), name = candidate.normalized.slice(slash + 1), parent = candidate.normalized.slice(0, slash) || "/";
+        if (!name || name === "." || name === "..") throw workspaceError("UXP_INVALID_ARGUMENT", label + " must name a file");
+        let parentValue;
+        try {
+          parentValue = typeof canonicalResolver === "function" ? await canonicalResolver(parent, { label: label + " folder", kind: "directory" }) : await resolveThroughGrantedFolder(parent, { label: label + " folder", kind: "directory" });
+        } catch (parentError) {
+          if (parentError && /^UXP_[A-Z0-9_]+$/.test(parentError.code || "")) throw parentError;
+          throw workspaceError("UXP_CANONICAL_PATH_UNAVAILABLE", "This UXP host could not resolve the folder of " + label + " to a canonical filesystem path");
+        }
+        canonicalCandidateValue = parseAbsolutePath(parentValue, label).normalized.replace(/\/$/, "") + "/" + name;
       }
       const canonicalRoot = parseAbsolutePath(canonicalRootValue, "workspace root");
       const canonicalCandidate = parseAbsolutePath(canonicalCandidateValue, label);

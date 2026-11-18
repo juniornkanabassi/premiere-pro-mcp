@@ -979,7 +979,7 @@
       const method = format === "otio" ? "exportAsOpenTimelineIO" : "exportAsFinalCutProXML";
       if (!ppro.ProjectConverter || typeof ppro.ProjectConverter[method] !== "function") throw commandError("UXP_COMMAND_UNAVAILABLE", "Requested interchange format " + format + " is unavailable in this Premiere build");
       const suppressUI = optionalBoolean(args.suppressUI, true, "suppressUI");
-      const outputFilePath = await allowedPath(args.outputFilePath, "outputFilePath", "file");
+      const outputFilePath = await allowedPath(args.outputFilePath, "outputFilePath", "file", true);
       const context = await activeContext(false);
       const exported = await ppro.ProjectConverter[method](context.sequence, outputFilePath, suppressUI);
       if (!exported) throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not confirm the interchange export");
@@ -987,7 +987,7 @@
     }
     async function exportAaf(args) {
       const input = validateAafArgs(args);
-      input.outputFilePath = await allowedPath(input.outputFilePath, "outputFilePath", "file");
+      input.outputFilePath = await allowedPath(input.outputFilePath, "outputFilePath", "file", true);
       if (input.options.videoMixdownPresetPath != null) {
         input.options.videoMixdownPresetPath = await allowedPath(input.options.videoMixdownPresetPath, "videoMixdownPresetPath", "file");
       }
@@ -1923,12 +1923,12 @@
     function operationSemantics(options) {
       return Protocol && typeof Protocol.operationSemantics === "function" ? Protocol.operationSemantics(options) : undefined;
     }
-    async function allowedPath(value, label, kind) {
+    async function allowedPath(value, label, kind, mayCreate) {
       // Every call site resolves its path before the host write, so a refusal here wrote nothing.
       try {
         const path = requiredString(value, label);
         return workspace && typeof workspace.assertPathAllowed === "function"
-          ? await workspace.assertPathAllowed(path, { label, kind })
+          ? await workspace.assertPathAllowed(path, { label, kind, ...(mayCreate === true ? { mayCreate: true } : {}) })
           : path;
       } catch (error) { if (error && typeof error === "object") error.noHostWrite = true; throw error; }
     }

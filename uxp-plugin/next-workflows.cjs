@@ -488,7 +488,7 @@
     async function createProjectSession(args) {
       assertOnlyKeys(args, ["path", "confirmExternalWrite", "confirmOverwrite", "operationId"]);
       requireConfirmation(args.confirmExternalWrite, "confirmExternalWrite", "Creating a project writes a new file");
-      const path = await allowedWorkspacePath(args.path, "path");
+      const path = await allowedWorkspacePath(args.path, "path", true);
       await rejectExistingProject(path, args.confirmOverwrite);
       const project = await ppro.Project.createProject(path);
       assertProjectPath(project, path, "created project");
@@ -519,7 +519,7 @@
       requireConfirmation(args.confirmExternalWrite, "confirmExternalWrite", "Save As writes a new project file and retargets the project handle");
       const project = await targetProject(args.projectId);
       if (args.expectedPath != null) assertProjectPath(project, requiredPath(args.expectedPath, "expectedPath"), "target project");
-      const path = await allowedWorkspacePath(args.path, "path");
+      const path = await allowedWorkspacePath(args.path, "path", true);
       await rejectExistingProject(path, args.confirmOverwrite);
       if (typeof project.saveAs !== "function" || !await project.saveAs(path)) {
         throw commandError("UXP_VERIFICATION_FAILED", "Premiere did not confirm Save As");
@@ -539,7 +539,7 @@
       assertProjectPath(project, sourcePath, "source project");
       const paths = [];
       for (let i = 0; i < args.paths.length; i += 1) {
-        const path = await allowedWorkspacePath(args.paths[i], "paths[" + i + "]");
+        const path = await allowedWorkspacePath(args.paths[i], "paths[" + i + "]", true);
         if (samePath(path, sourcePath) || paths.some(function (item) { return samePath(item, path); })) {
           throw refuse("UXP_INVALID_ARGUMENT", "Branch paths must be distinct from the source and each other");
         }
@@ -1731,12 +1731,12 @@
       return project;
     }
 
-    async function allowedWorkspacePath(value, label) {
+    async function allowedWorkspacePath(value, label, mayCreate) {
       const path = requiredPath(value, label);
       if (!deps.workspace || typeof deps.workspace.assertPathAllowed !== "function") {
         throw commandError("UXP_WORKSPACE_REQUIRED", "An approved UXP workspace is required");
       }
-      return deps.workspace.assertPathAllowed(path, { label, kind: "file" });
+      return deps.workspace.assertPathAllowed(path, { label, kind: "file", ...(mayCreate === true ? { mayCreate: true } : {}) });
     }
 
     // Premiere 26.5.1's Project.isProject(path) is true for any *.prproj path,
