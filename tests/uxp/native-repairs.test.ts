@@ -409,14 +409,42 @@ describe("inspection A7: unset source marks round-trip as a stale guard", () => 
   });
 });
 
-describe("inspection A8: OTIO, FCPXML and AAF never overwrite an existing file", () => {
-  it("refuses an existing interchange destination before calling the converter, and leaves no fence", async () => {
+describe("inspection A8: OTIO, FCPXML and AAF run only when the destination is proven absent", () => {
+  // fileExists answers true (exists), false (proven absent), null (cannot tell) or throws (lookup failed).
+  function exportHost(answer: (path: string) => Promise<boolean | null>) {
     const exporter = vi.fn(async () => true);
     const sequence = { guid: "sequence-1" }, project = { guid: "project-1", getActiveSequence: async () => sequence };
-    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project }, ProjectConverter: { exportAsOpenTimelineIO: exporter, exportAsFinalCutProXML: exporter } }, Protocol, storage: stored(), fileExists: async (path: string) => path.endsWith("taken.otio"), workspace: { status: () => ({ configured: true, canonicalPathValidation: "available" }), assertPathAllowed: async (path: string) => path } });
-    await expect(registry.dispatch("interchange.export", { format: "otio", outputFilePath: "/Work/taken.otio", operationId: "x1" })).rejects.toMatchObject({ code: "UXP_DESTINATION_EXISTS", noHostWrite: true });
-    expect(exporter).not.toHaveBeenCalled();
-    await expect(registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
-    await expect(registry.dispatch("interchange.export", { format: "otio", outputFilePath: "/Work/fresh.otio", operationId: "x2" })).resolves.toMatchObject({ exported: true });
+    const registry = Commands.createCommandRegistry({ ppro: { Project: { getActiveProject: async () => project }, AAFExportOptions: () => ({}), ProjectConverter: { exportAsOpenTimelineIO: exporter, exportAsFinalCutProXML: exporter, exportAAF: exporter } }, Protocol, storage: stored(), fileExists: answer, workspace: { status: () => ({ configured: true, canonicalPathValidation: "available" }), assertPathAllowed: async (path: string) => path } });
+    return { registry, exporter };
+  }
+  const formats = [
+    { name: "otio", command: "interchange.export", args: (path: string) => ({ format: "otio", outputFilePath: path + ".otio" }) },
+    { name: "fcpxml", command: "interchange.export", args: (path: string) => ({ format: "fcpxml", outputFilePath: path + ".xml" }) },
+    { name: "aaf", command: "interchange.aaf.export", args: (path: string) => ({ outputFilePath: path + ".aaf" }) },
+  ];
+  for (const format of formats) {
+    it(format.name + ": refuses an existing, unknown or unreadable destination before the converter, and runs on proven absence", async () => {
+      for (const [answer, code] of [[async () => true, "UXP_DESTINATION_EXISTS"], [async () => null, "UXP_CANONICAL_PATH_UNAVAILABLE"], [async () => { throw new Error("lookup failed"); }, "UXP_CANONICAL_PATH_UNAVAILABLE"]] as const) {
+        const value = exportHost(answer);
+        await expect(value.registry.dispatch(format.command, { ...format.args("/Work/out"), operationId: "x1" })).rejects.toMatchObject({ code, noHostWrite: true });
+        expect(value.exporter).not.toHaveBeenCalled();
+        await expect(value.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+      }
+      const fresh = exportHost(async () => false);
+      await expect(fresh.registry.dispatch(format.command, { ...format.args("/Work/fresh"), operationId: "x2" })).resolves.toMatchObject({ exported: true });
+      expect(fresh.exporter).toHaveBeenCalledTimes(1);
+    });
+  }
+  it("the workspace answers false only when the folder listing proves the name absent; a failed lookup of a listed name is unknown", async () => {
+    const Workspace = require("../../uxp-plugin/workspace.cjs");
+    const make = (listing: string[] | null) => {
+      const work = { isFolder: true, nativePath: "/Work", getEntry: vi.fn(async () => { throw new Error("lookup failed"); }), ...(listing ? { getEntries: vi.fn(async () => listing.map((name) => ({ name }))) } : {}) };
+      return Workspace.createWorkspaceBroker({ fs: { getFolder: vi.fn(async () => work), createPersistentToken: vi.fn(async () => "token"), getDataFolder: vi.fn(async () => ({ createFile: vi.fn(async () => ({ write: vi.fn() })) })) } });
+    };
+    const listed = make(["Taken.otio"]); await listed.requestRoot();
+    await expect(listed.fileExists("/Work/taken.otio")).resolves.toBeNull();
+    await expect(listed.fileExists("/Work/fresh.otio")).resolves.toBe(false);
+    const unlisted = make(null); await unlisted.requestRoot();
+    await expect(unlisted.fileExists("/Work/fresh.otio")).resolves.toBeNull();
   });
 });

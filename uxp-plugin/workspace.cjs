@@ -454,9 +454,16 @@
       let entry = rootEntry;
       for (let index = 0; index < segments.length; index += 1) {
         if (!entry || typeof entry.getEntry !== "function") return false;
+        const folder = entry;
         try {
-          entry = await entry.getEntry(segments[index]);
+          entry = await folder.getEntry(segments[index]);
         } catch (_) {
+          // A failed lookup is not proof of absence (a broken link or a host error fails the same way):
+          // answer false only when the folder's listing lacks the name in any letter case, otherwise unknown.
+          let listed = null;
+          try { if (typeof folder.getEntries === "function") listed = await folder.getEntries(); } catch (_) { listed = null; }
+          const wanted = segments[index].normalize("NFC").toLowerCase();
+          if (!Array.isArray(listed) || listed.some((child) => !child || typeof child.name !== "string" || child.name.normalize("NFC").toLowerCase() === wanted)) return null;
           return false;
         }
       }

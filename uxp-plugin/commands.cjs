@@ -972,10 +972,13 @@
         if (appPreferenceSetTails.get(preference) === tail) appPreferenceSetTails.delete(preference);
       });
     }
-    // These converters take no overwrite confirmation, so an existing destination is refused before the host sees it.
-    // shortcut: an unknown answer (no walkable workspace) still proceeds as before; refuse it too once every host can answer.
+    // These converters take no overwrite confirmation, so they run only when the workspace proves the name absent.
+    // The generic getEntryWithUrl fallback cannot prove absence (it fails for files that exist), so only deps.fileExists counts.
     async function refuseExistingOutput(path) {
-      if (await outputFileExists(path) === true) throw refuse("UXP_DESTINATION_EXISTS", "outputFilePath already exists; choose a new file name. Nothing was written");
+      let known = null;
+      try { known = typeof deps.fileExists === "function" ? await deps.fileExists(path) : null; } catch (_) { known = null; }
+      if (known === true) throw refuse("UXP_DESTINATION_EXISTS", "outputFilePath already exists; choose a new file name. Nothing was written");
+      if (known !== false) throw refuse("UXP_CANONICAL_PATH_UNAVAILABLE", "outputFilePath could not be proven new in the approved workspace folder, and this export cannot refuse to overwrite. Nothing was written");
     }
     async function exportInterchange(args) {
       assertOnlyKeys(args, ["format", "outputFilePath", "suppressUI", "operationId"]);

@@ -1221,6 +1221,8 @@ describe("UXP command registry", () => {
 
   it("exports supported interchange formats and configures AME", async () => {
     const value = host();
+    // Interchange exports run only on a destination the workspace proves absent.
+    value.registry = Commands.createCommandRegistry({ ppro: value.ppro, fs: {}, Protocol, fileExists: async () => false });
     await expect(value.registry.dispatch("interchange.export", {
       format: "otio", outputFilePath: "/tmp/edit.otio",
     })).resolves.toMatchObject({ exported: true, format: "otio", outcome: "committed_unverified", outputVerified: false });
@@ -1235,7 +1237,7 @@ describe("UXP command registry", () => {
 
   it.each(["otio", "fcpxml"])("probes interchange formats independently (%s only)", async (format) => {
     const value = host();
-    value.registry = Commands.createCommandRegistry({ ppro: value.ppro, Protocol, workspace: { status: () => ({ canonicalPathValidation: "available" }), assertPathAllowed: async (path: string) => path } });
+    value.registry = Commands.createCommandRegistry({ ppro: value.ppro, Protocol, fileExists: async () => false, workspace: { status: () => ({ canonicalPathValidation: "available" }), assertPathAllowed: async (path: string) => path } });
     const unavailable = format === "otio" ? "exportAsFinalCutProXML" : "exportAsOpenTimelineIO";
     delete (value.ppro.ProjectConverter as Record<string, unknown>)[unavailable];
     await expect(value.registry.capabilities()).resolves.toMatchObject({ commands: { "interchange.export": { supported: true, formats: { otio: format === "otio", fcpxml: format === "fcpxml" } } } });

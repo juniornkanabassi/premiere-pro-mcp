@@ -65,7 +65,7 @@ function adobe263Host() {
     assertPathAllowed: vi.fn((path: string) => path),
   };
   return {
-    registry: Commands.createCommandRegistry({ ppro, Protocol, workspace }), ppro, project, source, audioTrack, marker, aafOptionValues, workspace,
+    registry: Commands.createCommandRegistry({ ppro, Protocol, workspace, fileExists: async () => false }), ppro, project, source, audioTrack, marker, aafOptionValues, workspace,
   };
 }
 

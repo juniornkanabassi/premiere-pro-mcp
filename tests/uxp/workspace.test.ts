@@ -152,6 +152,7 @@ describe("least-privilege UXP workspace broker", () => {
         if (!written.has(name)) throw new Error("missing");
         return { isFolder: false, name, nativePath: "D:\\Projects\\Film\\frames\\" + name };
       }),
+      getEntries: vi.fn(async () => [...written].map((name) => ({ name }))),
     };
     const root = {
       isFolder: true, name: "Approved Media", nativePath: "D:\\Projects\\Film",
