@@ -626,7 +626,7 @@ export function getUxpNextWorkflowTools(bridge: UxpWebSocketBridge) {
       },
     },
     manage_source_clip_uxp: {
-      description: "Inspect or transactionally update source-clip in/out points and request scale-to-frame for up to 64 media items. In/out values are read back; Adobe exposes no getter for clear or scale state, so those requests remain committed-unverified.",
+      description: "Inspect or transactionally update source-clip in/out points and request scale-to-frame for up to 64 media items. In/out values are read back; Adobe exposes no getter for clear or scale state, so those requests remain committed-unverified. Without media_type an audio-only clip is read as audio; an unset point reads as null.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,

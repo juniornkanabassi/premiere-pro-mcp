@@ -1490,7 +1490,7 @@
       const project = await activeProject(true);
       const clips = await resolveMediaHealthClips(project, input.map(function (item) { return item.projectItemId; }));
       const items = [];
-      for (let i = 0; i < input.length; i += 1) items.push(await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType));
+      for (let i = 0; i < input.length; i += 1) items.push(await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven));
       return { count: items.length, items, verificationBoundary: "source_in_out_readback" };
     }
 
@@ -1501,7 +1501,7 @@
       const clips = await resolveMediaHealthClips(project, input.map(function (item) { return item.projectItemId; }));
       const targets = [];
       for (let i = 0; i < input.length; i += 1) {
-        const before = await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType);
+        const before = await sourceClipSnapshot(clips[i], input[i].projectItemId, input[i].mediaType, input[i].mediaTypeGiven);
         if (input[i].expectedInSeconds != null && !sameSeconds(before.inSeconds, input[i].expectedInSeconds)) {
           throw commandError("UXP_STALE_TARGET", "A source in point changed before the transaction");
         }
@@ -1540,7 +1540,7 @@
       const items = [];
       let fullyVerified = true;
       for (let i = 0; i < targets.length; i += 1) {
-        const target = targets[i], after = await sourceClipSnapshot(target.clip, target.input.projectItemId, target.input.mediaType);
+        const target = targets[i], after = await sourceClipSnapshot(target.clip, target.input.projectItemId, target.input.mediaType, target.input.mediaTypeGiven);
         let trimVerified = true;
         if (target.input.inSeconds != null) trimVerified = trimVerified && sameSeconds(after.inSeconds, target.input.inSeconds);
         if (target.input.outSeconds != null) trimVerified = trimVerified && sameSeconds(after.outSeconds, target.input.outSeconds);
@@ -1550,7 +1550,7 @@
         if (target.input.clearInOut || target.input.scaleToFrame) fullyVerified = false;
         items.push({
           projectItemId: target.input.projectItemId,
-          mediaType: target.input.mediaType,
+          mediaType: after.mediaType,
           before: target.before,
           after,
           trimVerified,
@@ -1585,7 +1585,7 @@
         ids.add(projectItemId);
         const mediaType = item.mediaType == null ? "video" : item.mediaType;
         if (mediaType !== "video" && mediaType !== "audio") throw refuse("UXP_INVALID_ARGUMENT", "mediaType must be video or audio");
-        const result = { projectItemId, mediaType };
+        const result = { projectItemId, mediaType, mediaTypeGiven: item.mediaType != null };
         if (!mutation) return result;
         const numberKeys = ["expectedInSeconds", "expectedOutSeconds", "inSeconds", "outSeconds"];
         for (let i = 0; i < numberKeys.length; i += 1) {
@@ -1608,19 +1608,28 @@
       });
     }
 
-    async function sourceClipSnapshot(clip, projectItemId, mediaType) {
+    // mediaTypeGiven false: the caller left mediaType to its video default, so an audio-only clip (whose video
+    // in/out reads as Premiere's negative "unset" value) is read as audio instead.
+    async function sourceClipSnapshot(clip, projectItemId, mediaType, mediaTypeGiven) {
       if (typeof clip.getInPoint !== "function" || typeof clip.getOutPoint !== "function") {
         throw commandError("UXP_COMMAND_UNAVAILABLE", "This source clip cannot report in/out points");
       }
       const mediaConstants = ppro.Constants && ppro.Constants.MediaType || {};
-      const constant = mediaConstants[mediaType === "video" ? "VIDEO" : "AUDIO"];
-      if (constant == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere media-type constants are unavailable");
-      return {
-        projectItemId,
-        mediaType,
-        inSeconds: tickSeconds(await clip.getInPoint(constant)),
-        outSeconds: tickSeconds(await clip.getOutPoint(constant))
-      };
+      async function read(type) {
+        const constant = mediaConstants[type === "video" ? "VIDEO" : "AUDIO"];
+        if (constant == null) throw commandError("UXP_COMMAND_UNAVAILABLE", "Premiere media-type constants are unavailable");
+        return { projectItemId, mediaType: type, inSeconds: sourcePoint(await clip.getInPoint(constant)), outSeconds: sourcePoint(await clip.getOutPoint(constant)) };
+      }
+      const snapshot = await read(mediaType);
+      if (mediaTypeGiven || mediaType !== "video" || snapshot.inSeconds != null || snapshot.outSeconds != null) return snapshot;
+      const audio = await read("audio");
+      return audio.inSeconds != null || audio.outSeconds != null ? audio : snapshot;
+    }
+
+    // A source point is never negative; Premiere reports an unset one as a large negative value (-400000 s in the 196 run).
+    function sourcePoint(value) {
+      const seconds = tickSeconds(value);
+      return seconds != null && seconds >= 0 ? seconds : null;
     }
 
     function tickSeconds(value) {

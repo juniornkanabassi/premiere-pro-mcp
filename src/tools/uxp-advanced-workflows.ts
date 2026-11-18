@@ -1,6 +1,6 @@
 import type { UxpWebSocketBridge } from "../bridge/uxp-websocket-bridge.js";
 import { planDerivedSilenceRemoval } from "./silence-removal.js";
-import { withApplyGuards, withApplySnapshot } from "./uxp-apply-snapshot.js";
+import { acceptingCamelTwins, toPanelShape, withApplyGuards, withApplySnapshot, type SnapshotSchema } from "./uxp-apply-snapshot.js";
 
 const WAIT_RESPONSE_BUFFER_MS = 5_000;
 
@@ -9,6 +9,7 @@ type AdvancedArgs = Record<string, unknown> & {
   operation_id?: string;
 };
 
+const IMMEDIATE_EXPORT_WAIT_MS = 30 * 60_000;
 function invoke(
   bridge: UxpWebSocketBridge,
   command: string,
@@ -201,6 +202,60 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
       audio_display_format: { type: "integer", minimum: 0, maximum: MAX_DISPLAY_FORMAT_CODE, sourceKey: "audioDisplayFormat" },
       video_display_format: { type: "integer", minimum: 0, maximum: MAX_DISPLAY_FORMAT_CODE, sourceKey: "videoDisplayFormat" },
     }, required: ["audio_display_format", "video_display_format"],
+  };
+  // Strict shapes for set_point_value / set_color_value. The tool schema also accepts each field's camelCase twin, so the raw
+  // inspect result works as well as the expected_*_snapshot it attaches; toPanelShape still enforces these.
+  const pointSnapshotStrict = {
+    type: "object", additionalProperties: false,
+    properties: {
+      project_id: { type: "string", minLength: 1, maxLength: 128 },
+      sequence_id: { type: "string", minLength: 1, maxLength: 128 },
+      media_type: { type: "string", enum: ["video", "audio"] },
+      track_index: { type: "integer", minimum: 0 },
+      clip_index: { type: "integer", minimum: 0 },
+      component_index: { type: "integer", minimum: 0 },
+      component_id: { type: "string", minLength: 1, maxLength: 256 },
+      param_index: { type: "integer", minimum: 0 },
+      param_name: { type: "string", maxLength: 255 },
+      time_varying: { type: "boolean" },
+      point: {
+        type: "object", additionalProperties: false,
+        properties: {
+          x: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+          y: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+        },
+        required: ["x", "y"],
+      },
+    },
+    required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "point"],
+    description: "Required for set_point_value: the expected_point_snapshot returned by inspect_point_value, unchanged (its raw camelCase result is accepted too).",
+  };
+  const colorSnapshotStrict = {
+    type: "object", additionalProperties: false,
+    properties: {
+      project_id: { type: "string", minLength: 1, maxLength: 128 },
+      sequence_id: { type: "string", minLength: 1, maxLength: 128 },
+      media_type: { type: "string", enum: ["video", "audio"] },
+      track_index: { type: "integer", minimum: 0 },
+      clip_index: { type: "integer", minimum: 0 },
+      component_index: { type: "integer", minimum: 0 },
+      component_id: { type: "string", minLength: 1, maxLength: 256 },
+      param_index: { type: "integer", minimum: 0 },
+      param_name: { type: "string", maxLength: 255 },
+      time_varying: { type: "boolean" },
+      color: {
+        type: "object", additionalProperties: false,
+        properties: {
+          red: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+          green: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+          blue: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+          alpha: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
+        },
+        required: ["red", "green", "blue", "alpha"],
+      },
+    },
+    required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "color"],
+    description: "Required for set_color_value: the expected_color_snapshot returned by inspect_color_value, unchanged (its raw camelCase result is accepted too).",
   };
   const parameterSnapshotSchema = (leaf: "point" | "color") => ({ properties: {
     project_id: { type: "string" }, sequence_id: { type: "string" }, media_type: { type: "string" },
@@ -611,58 +666,8 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
             required: ["red", "green", "blue", "alpha"],
             description: "Requested static Color RGBA value for set_color_value. Values are raw host components, not color-managed or rendered-appearance proof.",
           },
-          expected_point_snapshot: {
-            type: "object", additionalProperties: false,
-            properties: {
-              project_id: { type: "string", minLength: 1, maxLength: 128 },
-              sequence_id: { type: "string", minLength: 1, maxLength: 128 },
-              media_type: { type: "string", enum: ["video", "audio"] },
-              track_index: { type: "integer", minimum: 0 },
-              clip_index: { type: "integer", minimum: 0 },
-              component_index: { type: "integer", minimum: 0 },
-              component_id: { type: "string", minLength: 1, maxLength: 256 },
-              param_index: { type: "integer", minimum: 0 },
-              param_name: { type: "string", maxLength: 255 },
-              time_varying: { type: "boolean" },
-              point: {
-                type: "object", additionalProperties: false,
-                properties: {
-                  x: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                  y: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                },
-                required: ["x", "y"],
-              },
-            },
-            required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "point"],
-            description: "Required for set_point_value; copy the complete inspect_point_value snapshot unchanged.",
-          },
-          expected_color_snapshot: {
-            type: "object", additionalProperties: false,
-            properties: {
-              project_id: { type: "string", minLength: 1, maxLength: 128 },
-              sequence_id: { type: "string", minLength: 1, maxLength: 128 },
-              media_type: { type: "string", enum: ["video", "audio"] },
-              track_index: { type: "integer", minimum: 0 },
-              clip_index: { type: "integer", minimum: 0 },
-              component_index: { type: "integer", minimum: 0 },
-              component_id: { type: "string", minLength: 1, maxLength: 256 },
-              param_index: { type: "integer", minimum: 0 },
-              param_name: { type: "string", maxLength: 255 },
-              time_varying: { type: "boolean" },
-              color: {
-                type: "object", additionalProperties: false,
-                properties: {
-                  red: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                  green: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                  blue: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                  alpha: { type: "number", minimum: -1_000_000, maximum: 1_000_000 },
-                },
-                required: ["red", "green", "blue", "alpha"],
-              },
-            },
-            required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "color"],
-            description: "Required for set_color_value; copy the complete inspect_color_value snapshot unchanged.",
-          },
+          expected_point_snapshot: acceptingCamelTwins(pointSnapshotStrict),
+          expected_color_snapshot: acceptingCamelTwins(colorSnapshotStrict),
           confirm_set_point: { type: "boolean", description: "Required true for set_point_value after reviewing the complete point snapshot." },
           confirm_set_color: { type: "boolean", description: "Required true for set_color_value after reviewing the complete color snapshot." },
           time_seconds: { type: "number", minimum: 0, maximum: 86400 },
@@ -743,21 +748,15 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           }));
         }
         if (args.action === "set_point_value") {
-          const raw = args.expected_point_snapshot;
-          const snapshot = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
-          if (!snapshot) return refuse("set_point_value requires expected_point_snapshot from inspect_point_value");
+          if (!args.expected_point_snapshot) return refuse("set_point_value requires expected_point_snapshot from inspect_point_value");
+          let expectedSnapshot: unknown;
+          try { expectedSnapshot = toPanelShape(args.expected_point_snapshot, pointSnapshotStrict as SnapshotSchema, "expected_point_snapshot"); } catch (error) { return refuse(error instanceof Error ? error.message : String(error)); }
           return invoke(bridge, commands[args.action], {
             mediaType: args.media_type, trackIndex: args.track_index, clipIndex: args.clip_index,
             componentIndex: args.component_index, paramIndex: args.param_index,
             expectedComponentId: args.expected_component_id, expectedParamName: args.expected_param_name,
             point: args.point,
-            expectedSnapshot: {
-              projectId: snapshot.project_id, sequenceId: snapshot.sequence_id, mediaType: snapshot.media_type,
-              trackIndex: snapshot.track_index, clipIndex: snapshot.clip_index, componentIndex: snapshot.component_index,
-              componentId: snapshot.component_id, paramIndex: snapshot.param_index, paramName: snapshot.param_name,
-              timeVarying: snapshot.time_varying,
-              point: snapshot.point,
-            },
+            expectedSnapshot,
             confirmSetPoint: args.confirm_set_point,
             ...operation(args),
           });
@@ -770,21 +769,15 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           })), parameterSnapshotSchema("color"), "expected_color_snapshot");
         }
         if (args.action === "set_color_value") {
-          const raw = args.expected_color_snapshot;
-          const snapshot = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
-          if (!snapshot) return refuse("set_color_value requires expected_color_snapshot from inspect_color_value");
+          if (!args.expected_color_snapshot) return refuse("set_color_value requires expected_color_snapshot from inspect_color_value");
+          let expectedSnapshot: unknown;
+          try { expectedSnapshot = toPanelShape(args.expected_color_snapshot, colorSnapshotStrict as SnapshotSchema, "expected_color_snapshot"); } catch (error) { return refuse(error instanceof Error ? error.message : String(error)); }
           return invoke(bridge, commands[args.action], {
             mediaType: args.media_type, trackIndex: args.track_index, clipIndex: args.clip_index,
             componentIndex: args.component_index, paramIndex: args.param_index,
             expectedComponentId: args.expected_component_id, expectedParamName: args.expected_param_name,
             color: args.color,
-            expectedSnapshot: {
-              projectId: snapshot.project_id, sequenceId: snapshot.sequence_id, mediaType: snapshot.media_type,
-              trackIndex: snapshot.track_index, clipIndex: snapshot.clip_index, componentIndex: snapshot.component_index,
-              componentId: snapshot.component_id, paramIndex: snapshot.param_index, paramName: snapshot.param_name,
-              timeVarying: snapshot.time_varying,
-              color: snapshot.color,
-            },
+            expectedSnapshot,
             confirmSetColor: args.confirm_set_color,
             ...operation(args),
           });
@@ -794,15 +787,15 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     transform_track_item_uxp: {
-      description: "Inspect or atomically move, trim, rename, and enable/disable one audio or video track item with stale-position guards and readback.",
+      description: "Inspect or atomically move, trim, rename, and enable/disable one audio or video track item with stale-position guards and readback. inspect returns expected_start_seconds and expected_end_seconds beside its result (not inside it); pass them to update. Change the timeline position (move/start/end) and the source in/out in separate updates.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
         properties: {
           action: { type: "string", enum: ["inspect", "update"] },
           ...timelineTargetProperties,
-          expected_start_seconds: { ...guardSchemas.timelineSeconds, description: "The expected_start_seconds returned by inspect, passed unchanged." },
-          expected_end_seconds: { ...guardSchemas.timelineSeconds, description: "The expected_end_seconds returned by inspect, passed unchanged." },
+          expected_start_seconds: { ...guardSchemas.timelineSeconds, description: "The top-level expected_start_seconds returned by inspect (the same value as result.startSeconds), passed unchanged." },
+          expected_end_seconds: { ...guardSchemas.timelineSeconds, description: "The top-level expected_end_seconds returned by inspect (the same value as result.endSeconds), passed unchanged." },
           move_by_seconds: { type: "number", minimum: -86400, maximum: 86400 },
           start_seconds: { type: "number", minimum: 0, maximum: 86400 },
           end_seconds: { type: "number", minimum: 0, maximum: 86400 },
@@ -1024,7 +1017,7 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
     },
 
     encode_media_uxp: {
-      description: "Preflight, queue, or inspect and wait for conservatively correlated AME receipts inside the approved workspace. A terminal event is not output-file verification.",
+      description: "Preflight, queue, or inspect and wait for conservatively correlated AME receipts inside the approved workspace. A terminal event is not output-file verification. sequence with export_type immediately renders inside Premiere and waits up to 30 minutes for it to finish; output_file may name a file that does not exist yet.",
       parameters: {
         type: "object" as const,
         additionalProperties: false,
@@ -1070,6 +1063,10 @@ export function getUxpAdvancedWorkflowTools(bridge: UxpWebSocketBridge) {
           const hostWaitMs = typeof args.timeout_ms === "number" ? args.timeout_ms : 0;
           return invoke(bridge, commands[args.action], jobQuery, hostWaitMs);
         }
+        if (args.action === "preflight") return invoke(bridge, commands[args.action], compact({ sequenceId: args.sequence_id, presetFile: args.preset_file }));
+        // An immediate export renders inside Premiere and only returns when the file is written, well past the 30 s default.
+        // shortcut: a render longer than 30 minutes still times out and raises the recovery fence; upgrade to job polling if that happens.
+        if (args.action === "sequence" && args.export_type === "immediately") return invoke(bridge, commands[args.action], { ...common, ...operation(args) }, IMMEDIATE_EXPORT_WAIT_MS);
         return invoke(bridge, commands[args.action], args.action === "jobs"
           ? jobQuery
           : { ...common, ...operation(args) });

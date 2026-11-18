@@ -1779,15 +1779,23 @@
     }
 
     async function updateTrackItem(args) {
-      const context = await trackItemContext(args, true), before = await trackItemSnapshot(context);
-      assertExpectedNumber(before.startSeconds, args.expectedStartSeconds, "UXP_STALE_TRACK_ITEM", "Track item start");
-      assertExpectedNumber(before.endSeconds, args.expectedEndSeconds, "UXP_STALE_TRACK_ITEM", "Track item end");
-      if (args.moveBySeconds != null && (args.startSeconds != null || args.endSeconds != null)) throw refuse("UXP_INVALID_ARGUMENT", "moveBySeconds cannot be combined with startSeconds or endSeconds");
-      const requested = [args.moveBySeconds, args.startSeconds, args.endSeconds, args.inSeconds, args.outSeconds, args.disabled, args.name].filter((value) => value != null);
-      if (!requested.length) throw refuse("UXP_INVALID_ARGUMENT", "Provide at least one track-item field to update");
-      const moveTime = args.moveBySeconds == null ? null : await sequenceFrameTime(context.sequence, args.moveBySeconds, "moveBySeconds");
-      const startTime = args.startSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.startSeconds, "startSeconds", 0, 86400), "startSeconds");
-      const endTime = args.endSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.endSeconds, "endSeconds", 0, 86400), "endSeconds");
+      // A start/end action trims, moving the source point with it (see makeSplitEdit); setting in/out in the same
+      // transaction made Premiere 27 fail with "A nullptr was dereferenced" in the 196 run.
+      if (args && (args.moveBySeconds != null || args.startSeconds != null || args.endSeconds != null) && (args.inSeconds != null || args.outSeconds != null)) {
+        throw refuse("UXP_INVALID_ARGUMENT", "Change the timeline position (move/start/end) and the source in/out in two separate updates: Premiere fails when one transaction does both. Nothing was changed");
+      }
+      const { context, before, requested, moveTime, startTime, endTime } = await beforeWrite(async () => {
+        const context = await trackItemContext(args, true), before = await trackItemSnapshot(context);
+        assertExpectedNumber(before.startSeconds, args.expectedStartSeconds, "UXP_STALE_TRACK_ITEM", "Track item start");
+        assertExpectedNumber(before.endSeconds, args.expectedEndSeconds, "UXP_STALE_TRACK_ITEM", "Track item end");
+        if (args.moveBySeconds != null && (args.startSeconds != null || args.endSeconds != null)) throw refuse("UXP_INVALID_ARGUMENT", "moveBySeconds cannot be combined with startSeconds or endSeconds");
+        const requested = [args.moveBySeconds, args.startSeconds, args.endSeconds, args.inSeconds, args.outSeconds, args.disabled, args.name].filter((value) => value != null);
+        if (!requested.length) throw refuse("UXP_INVALID_ARGUMENT", "Provide at least one track-item field to update");
+        const moveTime = args.moveBySeconds == null ? null : await sequenceFrameTime(context.sequence, args.moveBySeconds, "moveBySeconds");
+        const startTime = args.startSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.startSeconds, "startSeconds", 0, 86400), "startSeconds");
+        const endTime = args.endSeconds == null ? null : await sequenceFrameTime(context.sequence, finiteNumber(args.endSeconds, "endSeconds", 0, 86400), "endSeconds");
+        return { context, before, requested, moveTime, startTime, endTime };
+      });
       const appliedArgs = { ...args, ...(moveTime ? { moveBySeconds: moveTime.appliedSeconds } : {}), ...(startTime ? { startSeconds: startTime.appliedSeconds } : {}), ...(endTime ? { endSeconds: endTime.appliedSeconds } : {}) };
       context.project.lockedAccess(() => {
         const actions = [];

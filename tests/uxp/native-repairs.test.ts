@@ -214,3 +214,47 @@ describe("output paths that do not exist yet", () => {
     expect(assertPathAllowed).toHaveBeenCalledWith("/Work/new.prproj", expect.objectContaining({ kind: "file", mayCreate: true }));
   });
 });
+
+describe("source in/out on audio-only clips", () => {
+  const NextWorkflows = require("../../uxp-plugin/next-workflows.cjs");
+  // An audio-only clip: its video in/out reads as Premiere's unset value; setting in/out moves the audio points.
+  function audioOnly() {
+    const points = { in: -400000, out: -400000 };
+    const clip = {
+      name: "Music", getId: vi.fn(() => "music-1"),
+      getInPoint: vi.fn(async (type: number) => ({ seconds: type === 2 ? points.in : -400000 })),
+      getOutPoint: vi.fn(async (type: number) => ({ seconds: type === 2 ? points.out : -400000 })),
+      createSetInOutPointsAction: vi.fn((inPoint: { seconds: number }, outPoint: { seconds: number }) => ({ apply: () => { points.in = inPoint.seconds; points.out = outPoint.seconds; } })),
+      createSetInPointAction: vi.fn(), createSetOutPointAction: vi.fn(), createClearInOutPointsAction: vi.fn(), createSetScaleToFrameSizeAction: vi.fn(),
+    };
+    const project = {
+      getRootItem: vi.fn(async () => ({ getItems: vi.fn(async () => [clip]) })),
+      lockedAccess: vi.fn((callback: () => void) => callback()),
+      executeTransaction: vi.fn((callback: (compound: { addAction: (action: { apply: () => void }) => boolean }) => void) => { callback({ addAction: (action) => { action.apply(); return true; } }); return true; }),
+    };
+    const definitions = NextWorkflows.createNextWorkflowDefinitions({ ppro: {
+      Project: { getActiveProject: vi.fn(async () => project) }, ClipProjectItem: { cast: vi.fn((item: unknown) => item) }, ProjectItem: { cast: vi.fn((item: unknown) => item) },
+      FolderItem: { cast: vi.fn(() => null) }, TickTime: { createWithSeconds: vi.fn((seconds: number) => ({ seconds })) }, Constants: { MediaType: { VIDEO: 1, AUDIO: 2 } },
+    } });
+    return { definitions, points };
+  }
+  it("reports unset points as null and reads an audio-only clip as audio when media type is left out", async () => {
+    const { definitions } = audioOnly();
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1" }] })).resolves.toMatchObject({ items: [{ mediaType: "video", inSeconds: null, outSeconds: null }] });
+    await expect(definitions["source.clip.update"].handler({ items: [{ projectItemId: "music-1", inSeconds: 12, outSeconds: 40 }] })).resolves.toMatchObject({ outcome: "verified", items: [{ mediaType: "audio", trimVerified: true, after: { inSeconds: 12, outSeconds: 40 } }] });
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1" }] })).resolves.toMatchObject({ items: [{ mediaType: "audio", inSeconds: 12, outSeconds: 40 }] });
+  });
+  it("still reads exactly the media type a caller names", async () => {
+    const { definitions } = audioOnly();
+    await expect(definitions["source.clip.inspect"].handler({ items: [{ projectItemId: "music-1", mediaType: "video" }] })).resolves.toMatchObject({ items: [{ mediaType: "video", inSeconds: null }] });
+  });
+});
+
+describe("track item update", () => {
+  it("refuses timeline edges and source in/out in one update before any write, and leaves no fence", async () => {
+    const host = parameterHost();
+    await expect(host.registry.dispatch("trackItem.update", { mediaType: "video", trackIndex: 0, clipIndex: 0, startSeconds: 0, endSeconds: 3.4, inSeconds: 71.5, outSeconds: 74.9, operationId: "full-trim" })).rejects.toMatchObject({ code: "UXP_INVALID_ARGUMENT", noHostWrite: true, message: expect.stringContaining("two separate updates") });
+    await expect(host.registry.dispatch("operations.recovery.inspect", {})).resolves.toMatchObject({ recoveryRequired: false });
+    expect(host.project.executeTransaction).not.toHaveBeenCalled();
+  });
+});

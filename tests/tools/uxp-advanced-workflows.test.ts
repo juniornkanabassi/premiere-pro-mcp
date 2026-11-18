@@ -87,9 +87,9 @@ describe("advanced stable UXP workflow MCP catalog", () => {
       properties: {
         action: { enum: ["inspect", "inspect_point_value", "inspect_point_displacement", "set_point_value", "inspect_color_value", "set_color_value", "inspect_keyframe", "set_value", "add_keyframe", "remove_keyframe", "remove_keyframe_range", "set_interpolation", "inspect_time_varying", "set_time_varying"] },
         point: { required: ["x", "y"], additionalProperties: false },
-        expected_point_snapshot: { required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "point"], additionalProperties: false },
+        expected_point_snapshot: { additionalProperties: false, properties: { project_id: { minLength: 1 }, projectId: { minLength: 1 }, point: { additionalProperties: false } } },
         color: { required: ["red", "green", "blue", "alpha"], additionalProperties: false },
-        expected_color_snapshot: { required: ["project_id", "sequence_id", "media_type", "track_index", "clip_index", "component_index", "component_id", "param_index", "param_name", "time_varying", "color"], additionalProperties: false },
+        expected_color_snapshot: { additionalProperties: false, properties: { project_id: { minLength: 1 }, projectId: { minLength: 1 }, color: { additionalProperties: false } } },
         expected_sequence_id: { maxLength: 128 }, expected_time_varying: { type: "boolean" },
         expected_keyframe_times_seconds: { maxItems: 256, uniqueItems: true },
         keyframe_direction: { enum: ["at", "next", "previous", "nearest"] },
