@@ -9,12 +9,12 @@ import { DETAIL_LIMIT } from "../src/tools/companion.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-// The 60 Companion 1.11.0 manifest commands, with its readOnly flags, plus one this adapter has never seen.
-const NAMES = ["status", "bins", "open", "close", "save", "import", "refresh", "autosync", "sequence_create", "sequence_list", "marker_add", "marker_list", "place", "remove", "job", "roots_list", "file_loose", "job_resolve", "presets_export", "presets_effects", "presets_show", "sequence_settings", "sequence_duplicate", "sequence_new", "sequence_inout", "timeline", "edit", "effect_available", "effect_list", "effect_apply", "effect_set", "effect_add", "effect_remove", "colour_status", "colour_set", "export", "export_frame", "export_status", "export_review", "audio_channels", "audio_clean", "roughcut", "short_setup", "first_cut", "bin_create", "bin_move", "bin_rename", "bin_label", "bin_layout", "stringout", "transcript_export", "transcript_import", "transcript_run", "audio_level", "sequence_vertical", "build", "finish", "multicam", "autocam", "captions_import"];
-const READ_ONLY = new Set(["status", "bins", "sequence_list", "marker_list", "job", "roots_list", "presets_export", "presets_effects", "presets_show", "timeline", "effect_available", "effect_list", "colour_status", "export_status", "first_cut"]);
+// The 59 Companion 1.11.0 manifest commands with its real readOnly flags (14; first_cut is unflagged), plus one this adapter has never seen.
+const NAMES = ["status", "bins", "open", "close", "save", "import", "refresh", "autosync", "sequence_create", "sequence_list", "marker_add", "marker_list", "place", "remove", "job", "roots_list", "file_loose", "presets_export", "presets_effects", "presets_show", "sequence_settings", "sequence_duplicate", "sequence_new", "sequence_inout", "timeline", "edit", "effect_available", "effect_list", "effect_apply", "effect_set", "effect_add", "effect_remove", "colour_status", "colour_set", "export", "export_frame", "export_status", "export_review", "audio_channels", "audio_clean", "roughcut", "short_setup", "first_cut", "bin_create", "bin_move", "bin_rename", "bin_label", "bin_layout", "stringout", "transcript_export", "transcript_import", "transcript_run", "audio_level", "sequence_vertical", "build", "finish", "multicam", "autocam", "captions_import"];
+const READ_ONLY = new Set(["status", "bins", "sequence_list", "marker_list", "job", "roots_list", "presets_export", "presets_effects", "presets_show", "timeline", "effect_available", "effect_list", "colour_status", "export_status"]);
 const s = { type: "string", minLength: 1 };
 const tools = [
-  ...NAMES.map(name => ({ name, description: `Fake ${name}.`, argv: name.split("_"), positional: [], ...(READ_ONLY.has(name) ? { readOnly: true } : {}), inputSchema: { type: "object", properties: { project: s, sequence: s, track: s, index: { type: "integer" } }, required: [], additionalProperties: false } })),
+  ...NAMES.map(name => ({ name, description: `Fake ${name}.`, argv: name.split("_"), positional: [], ...(READ_ONLY.has(name) ? { readOnly: true } : {}), inputSchema: { type: "object", properties: READ_ONLY.has(name) ? {} : name === "transcript_export" ? { clip: s, out: s } : { project: s, sequence: s, track: s, index: { type: "integer" } }, required: [], additionalProperties: false } })),
   { name: "first_cut_plan", description: "Plan a first cut from a transcript.", argv: ["first-cut", "plan"], positional: ["clip"], inputSchema: { type: "object", additionalProperties: false, required: ["clip"], properties: {
     clip: { ...s, description: "Clip name." }, mode: { type: "string", enum: ["tight", "loose"], description: "Default tight." }, padFrames: { type: "integer" } } } },
 ];
@@ -25,6 +25,8 @@ if (a[0] === "mcp-manifest") { console.log(JSON.stringify({ name: "premiere-comp
 fs.appendFileSync(process.env.FAKE_LOG, a.join(" ") + "\\n");
 if (a[0] === "place") console.log(JSON.stringify({ jobId: "j1", state: "done", result: { placed: 1, sequence: "199 - 01 Rough Cut", items: [1, 2, 3] } }));
 // presets export answers with the bare grouped list, no envelope (Companion bin/binboy.mjs cliPresets).
+// transcript export --out: the panel writes Premiere's transcript JSON to the new file and answers with its path.
+else if (a[0] === "transcript" && a.includes("--out")) { const out = a[a.indexOf("--out") + 1]; fs.writeFileSync(out, JSON.stringify({ segments: [{ start: 0, duration: 6.5, words: ["so", "today", "we", "look", "at", "barca.", "so", "today", "we", "look", "at", "barca", "again."].map((text, i) => ({ text, start: i * 0.5, duration: 0.4 })) }] }), { flag: "wx" }); console.log(JSON.stringify({ jobId: "t1", state: "done", result: { path: out } })); }
 else if (a[0] === "presets") console.log(JSON.stringify(Object.fromEntries(Array.from({ length: 90 }, (_, f) => ["Folder " + f, Array.from({ length: 20 }, (_, i) => "Preset " + f + "." + i)]))));
 else { console.log(JSON.stringify({ jobId: null, state: "guard-refused", error: { code: "no-grant", message: "no open grant" } })); process.exit(3); }
 `;
@@ -85,6 +87,22 @@ describe("Shorts profile", () => {
     } finally { await close(); }
   });
 
+  it("exports a transcript to a file and hands its timed words to a planner", async () => {
+    const { client, log, close } = await connect();
+    try {
+      const out = join(log, "..", "A-roll.transcript.json");
+      const exported = await client.callTool({ name: "companion_transcript_export", arguments: { clip: "A-roll.mp4", out } });
+      expect(data(exported)).toMatchObject({ state: "done", detail: { path: out } });
+      expect(readFileSync(log, "utf8")).toContain(`transcript export --clip A-roll.mp4 --out ${out} --json`);
+      // What the instructions tell the agent to do with the file: each word as text with start and end seconds.
+      const words = (JSON.parse(readFileSync(out, "utf8")) as { segments: { words: { text: string; start: number; duration: number }[] }[] }).segments
+        .flatMap(segment => segment.words.map(w => ({ text: w.text, start_seconds: w.start, end_seconds: w.start + w.duration })));
+      const planned = await client.callTool({ name: "detect_repeated_takes", arguments: { word_timeline: { source_project_item_id: "A-roll.mp4", words }, frame_rate: 25 } });
+      expect(planned.isError).toBeFalsy();
+      expect(data(planned)).toMatchObject({ applied: false, routes: { companion: ["companion_stringout"] } });
+    } finally { await close(); }
+  });
+
   it("gives every Companion result the same small receipt and caps large output", async () => {
     const { client, close } = await connect();
     try {
@@ -96,7 +114,8 @@ describe("Shorts profile", () => {
       const presets = await client.callTool({ name: "companion_presets_export", arguments: {} });
       const listing = data(presets);
       expect(listing).toMatchObject({ writer: null, changed: "nothing (read-only)", truncated: { limit: DETAIL_LIMIT } });
-      expect(listing.detail).toHaveProperty("Folder 0");
+      expect(listing.detail).toMatchObject({ page: 1, pieces: expect.arrayContaining([{ path: ["Folder 0"], value: expect.any(Array) }]) });
+      expect(listing.truncated).toMatchObject({ next: { tool: "companion_presets_export", arguments: { page: 2 } } });
       expect((listing.truncated as { characters: number }).characters).toBeGreaterThan(DETAIL_LIMIT);
       expect(JSON.stringify(listing.detail).length).toBeLessThanOrEqual(DETAIL_LIMIT);
       expect(JSON.stringify((presets as { content: { text: string }[] }).content).length).toBeLessThan(DETAIL_LIMIT + 4000);

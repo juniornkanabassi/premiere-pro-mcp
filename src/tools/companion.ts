@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { companionWriter, setCompanionReadOnly } from "../companion-policy.js";
+import { companionWriter, isCompanionRead, setCompanionReadOnly } from "../companion-policy.js";
 import { markHostDispatch } from "../workflows/invocation-context.js";
 import { getTranscriptWordEditTools } from "./transcript-word-edits.js";
 
@@ -83,6 +83,8 @@ function describeProperties(schema: CompanionTool["inputSchema"]): CompanionTool
 }
 
 export const DETAIL_LIMIT = 24_000;
+const PIECE = 2_000; // a list or object larger than this is split into its items or fields when paging
+const EXCERPT = 3_000; // room kept beside every page for the failed-row excerpt
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Json : undefined;
 // A row that reports a failure; capping keeps these before ordinary rows so a cap never hides one.
@@ -109,8 +111,48 @@ function shrink(value: unknown, depth = 0): unknown {
   return !object ? value : depth > 5 ? "{...}" : Object.fromEntries(Object.entries(object).map(([key, field]) => [key, shrink(field, depth + 1)]));
 }
 
+type Piece = { path: (string | number)[]; value: unknown };
+// Characters a value takes in the server's pretty-printed text result at that nesting depth (two spaces per level).
+const printed = (value: unknown, depth: number) => { const text = JSON.stringify(value, null, 2) ?? "null"; return text.length + 2 * depth * text.split("\n").length; };
+// The payload as complete pieces in order, each with its path in the full result: a large container is split, a value never cut.
+function pieces(value: unknown, path: Piece["path"] = [], out: Piece[] = []): Piece[] {
+  if ((Array.isArray(value) || record(value)) && JSON.stringify(value).length > PIECE)
+    Object.entries(value as object).forEach(([key, field]) => pieces(field, [...path, Array.isArray(value) ? Number(key) : key], out));
+  else out.push({ path, value });
+  return out;
+}
+function paginate(payload: unknown): Piece[][] {
+  const pages: Piece[][] = [[]];
+  let size = 0;
+  for (const piece of pieces(payload)) {
+    const length = printed(piece, 3) + 2; // data.detail.pieces[i]
+    if (size + length > DETAIL_LIMIT - EXCERPT && pages.at(-1)!.length) { pages.push([]); size = 0; }
+    pages.at(-1)!.push(piece); size += length;
+  }
+  return pages;
+}
+// Every failed row anywhere in the payload with its path, so a late failure is never reduced to a count.
+function failures(value: unknown, path: Piece["path"] = [], out: Piece[] = []): Piece[] {
+  if (path.length && failedRow(value)) out.push({ path, value });
+  else if (Array.isArray(value) || record(value)) Object.entries(value as object).forEach(([key, field]) => failures(field, [...path, Array.isArray(value) ? Number(key) : key], out));
+  return out;
+}
+function failedExcerpt(payload: unknown) {
+  const all = failures(payload), rows: unknown[] = [];
+  for (const row of all) {
+    const fits = (candidate: unknown) => printed([...rows, candidate], 3) <= EXCERPT - 200; // data.truncated.failed.rows
+    const full = { path: row.path, value: shrink(row.value) };
+    if (fits(full)) rows.push(full); else if (fits({ path: row.path })) rows.push({ path: row.path }); else break;
+  }
+  return all.length ? { count: all.length, rows } : undefined;
+}
+// These two write their whole result to a new file when given out, so a capped answer points there instead of paging.
+const FILE_ROUTE = new Set(["transcript_export", "first_cut"]);
+
 /** The small, consistent receipt every Companion-backed result carries, with the payload capped. */
-export function companionReceipt(tool: CompanionTool, args: Json, output: unknown, writes: boolean, ok = true): Json {
+export function companionReceipt(tool: CompanionTool, args: Json, output: unknown, toolWrites: boolean, ok = true, page = 1): Json {
+  // Invocation modes of writer commands that change nothing: autosync status only reads, first_cut without out only plans.
+  const writes = toolWrites && !(tool.name === "autosync" && args.mode === "status");
   // Companion answers with an envelope (state, jobId / exportId / refreshId, result, plus fields such as an export's paths)
   // or, for presets, roots, colour and first-cut, with the bare value itself.
   const out = record(output);
@@ -120,15 +162,34 @@ export function companionReceipt(tool: CompanionTool, args: Json, output: unknow
   const state = typeof rawState === "string" ? rawState : undefined;
   const error = record(rawError) ?? (typeof rawError === "string" ? { message: rawError } : undefined);
   const size = JSON.stringify(payload ?? null).length;
-  let detail = size > DETAIL_LIMIT ? shrink(payload) : payload;
-  if (JSON.stringify(detail ?? null).length > DETAIL_LIMIT) detail = brief(payload);
+  // Nothing an agent must act on is dropped unless the receipt names a working route to exactly that content.
+  let detail = payload;
+  let truncated: Json | undefined;
+  const lookup = exportId != null ? { tool: "companion_export_status", arguments: { id: exportId } }
+    : jobId != null ? { tool: "companion_job", arguments: { id: jobId } }
+    : !writes ? { tool: "companion_" + tool.name, arguments: args } : undefined;
+  if (size > DETAIL_LIMIT && FILE_ROUTE.has(tool.name)) {
+    detail = shrink(payload);
+    if (JSON.stringify(detail ?? null).length > DETAIL_LIMIT) detail = brief(payload);
+    truncated = { characters: size, limit: DETAIL_LIMIT, note: typeof args.out === "string"
+      ? `Capped here; the whole result is in ${args.out}. Read that file with your own file tool (with Junior's approval).`
+      : `Capped: long text is replaced by its length and lists are shortened. For the whole result call companion_${tool.name} again with the same arguments plus out (a new file path), then read that file with your own file tool (with Junior's approval).` };
+  } else if (size > DETAIL_LIMIT && lookup) {
+    const pages = paginate(payload), at = Math.min(page, pages.length), failed = failedExcerpt(payload);
+    detail = { page: at, pages: pages.length, pieces: pages[at - 1] };
+    truncated = { characters: size, limit: DETAIL_LIMIT, page: at, pages: pages.length,
+      next: at < pages.length ? { tool: lookup.tool, arguments: { ...lookup.arguments, page: at + 1 } } : null,
+      note: "Split into pages of complete pieces, each with its path in the full result; nothing is cut or left out. Call next for the following page.",
+      ...(failed ? { failed } : {}) };
+  }
+  // shortcut: a large write result with no id and no file route is returned whole (no route could fetch a dropped part); page it if one appears.
   const finished = ok && (state === "done" || (state === undefined && !error));
   const pending = ok && (state === "queued" || state === "running");
   // A dry run: the tool takes apply and it was not passed, or audio_level was asked only to measure.
-  const preview = writes && ((Object.hasOwn(tool.inputSchema.properties, "apply") && args.apply !== true) || args.measureOnly === true);
+  const preview = writes && ((Object.hasOwn(tool.inputSchema.properties, "apply") && args.apply !== true) || args.measureOnly === true || (tool.name === "first_cut" && args.out === undefined));
   const recovery = exportId != null ? { kind: "exportId", id: exportId, lookup: "companion_export_status" }
     : jobId != null ? { kind: "jobId", id: jobId, lookup: "companion_job" }
-    : refreshId != null ? { kind: "refreshId", id: refreshId, lookup: null, note: "No tool looks up a refresh id. Check companion_bins for the files, or run companion_refresh with wait: true to follow it to the end." }
+    : refreshId != null ? { kind: "refreshId", id: refreshId, lookup: null, note: "No tool looks up a refresh id, and calling companion_refresh again queues another pass, so do not. Wait for this one: companion_status shows it under projects (running, then last); companion_bins shows the files." }
     : null;
   const payloadRecord = record(result) ?? record(payload);
   return {
@@ -150,11 +211,12 @@ export function companionReceipt(tool: CompanionTool, args: Json, output: unknow
       : "nothing was confirmed",
     // Read by the server's mutation receipt (outcome, accepted); no top-level "result" key, so it reads these fields.
     ...(writes && finished ? { outcome: preview ? "not_applied" : "committed_unverified" } : {}),
+    ...(toolWrites && !writes && ok ? { outcome: "not_applied" } : {}),
     ...(writes && pending ? { outcome: "committed_unverified", accepted: true } : {}),
     ...(writes && (state === "guard-refused" || state === "no-panel") ? { outcome: "not_applied" } : {}),
     ...(error ? { error } : {}),
     detail: detail ?? null,
-    ...(detail !== payload ? { truncated: { characters: size, limit: DETAIL_LIMIT, note: "Output capped: long text is replaced by its length and failed rows are kept first. Call again with narrower arguments (one sequence, one preset by name with companion_presets_show, one job with companion_job). For a whole transcript, pass out to companion_transcript_export to write it to a file." } } : {}),
+    ...(truncated ? { truncated } : {}),
   };
 }
 
@@ -201,15 +263,16 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
   const manifest = JSON.parse(execFileSync(process.execPath, [cli, "mcp-manifest"], { encoding: "utf8", timeout: 10000, maxBuffer: 2 * 1024 * 1024 }));
   if (manifest.name !== "premiere-companion" || !Array.isArray(manifest.tools)) throw new Error("Invalid Premiere Companion manifest");
   const seen = new Set<string>();
-  setCompanionReadOnly((manifest.tools as CompanionTool[]).filter(tool => tool.readOnly === true).map(tool => tool.name));
+  setCompanionReadOnly(manifest.tools as CompanionTool[]);
   const tools = Object.fromEntries((manifest.tools as CompanionTool[]).map(tool => {
     if (!/^[a-z][a-z0-9_]*$/.test(tool.name) || seen.has(tool.name) || !Array.isArray(tool.argv) || !tool.argv.every(x => typeof x === "string") || !Array.isArray(tool.positional) || !tool.inputSchema?.properties) throw new Error("Invalid or duplicate Companion tool");
     seen.add(tool.name);
     const name = "companion_" + tool.name;
-    const writes = tool.readOnly !== true;
+    const writes = !isCompanionRead(tool);
+    const parameters = describeProperties(tool.inputSchema);
     return [name, {
       description: `Premiere Companion: ${tool.description} ${writes ? "Writes through Companion's grant, locks and job queue. Never retry an unknown outcome." : "Read-only."}`,
-      parameters: describeProperties(tool.inputSchema),
+      parameters: writes ? parameters : { ...parameters, properties: { ...parameters.properties, page: { type: "integer", minimum: 1, description: "Page of a long result, as truncated.next gives it; default 1." } } },
       annotations: { readOnlyHint: !writes },
       operationalCapability: {
         backend: "orchestrator", backends: ["orchestrator"], status: "supported",
@@ -217,12 +280,13 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
         notes: ["Uses the existing Companion CLI and its own grant, queue and readback checks; no upstream CEP dispatch."],
       },
       handler: async (args: unknown) => {
-        const argv = companionArguments(tool, args);
-        const input = args as Json;
+        const { page = 1, ...input } = args as Json;
+        if (!writes && (!Number.isInteger(page) || (page as number) < 1)) throw new Error("page must be a whole number from 1");
+        const argv = companionArguments(tool, writes ? args : input);
         try {
           if (writes) markHostDispatch();
           const { stdout } = await execute(cli, argv);
-          return { success: true, data: companionReceipt(tool, input, JSON.parse(stdout), writes) };
+          return { success: true, data: companionReceipt(tool, input, JSON.parse(stdout), writes, true, page as number) };
         } catch (cause) {
           const error = cause as Error & { code?: number | string; stdout?: string; stderr?: string; killed?: boolean };
           let result: unknown;

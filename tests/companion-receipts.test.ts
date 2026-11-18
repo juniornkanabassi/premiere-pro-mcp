@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { companionReceipt, DETAIL_LIMIT, getCompanionTools } from "../src/tools/companion.js";
-import { companionAuthority } from "../src/companion-policy.js";
+import { companionAuthority, isCompanionRead } from "../src/companion-policy.js";
 import { mutationReceipt } from "../src/workflows/mutation-receipt.js";
 import { buildPremiereInstructions } from "../src/workflows/agent-instructions.js";
 
@@ -11,7 +11,7 @@ import { buildPremiereInstructions } from "../src/workflows/agent-instructions.j
 const schema = (properties: Record<string, unknown> = {}) => ({ type: "object", properties, required: [], additionalProperties: false });
 const tool = (name: string, argv: string[], properties: Record<string, unknown> = {}, readOnly?: boolean) =>
   ({ name, description: name, argv, positional: [], inputSchema: schema(properties), ...(readOnly ? { readOnly } : {}) });
-const receipt = (t: ReturnType<typeof tool>, output: unknown, args: Record<string, unknown> = {}) => companionReceipt(t as never, args, output, t.readOnly !== true);
+const receipt = (t: ReturnType<typeof tool>, output: unknown, args: Record<string, unknown> = {}) => companionReceipt(t as never, args, output, !isCompanionRead(t));
 const server = (r: Record<string, unknown>) => mutationReceipt(true, r, { dispatched: true }, "x");
 
 const scratch: string[] = [];
@@ -27,12 +27,15 @@ describe("Companion receipts against real CLI shapes", () => {
     expect(receipt(tool("roots_list", ["roots", "list"], {}, true), config).detail).toEqual(config);
   });
 
-  it("gives a queued refresh its refresh id and no job lookup", () => {
-    const r = receipt(tool("refresh", ["refresh"], { wait: { type: "boolean" } }), { refreshId: "r-1", state: "queued" });
-    expect(r.recovery).toMatchObject({ id: "r-1", kind: "refreshId" });
+  it("never tells the agent to run a second refresh to follow a queued one", () => {
+    // Companion's refresh always POSTs a new pass, so "companion_refresh with wait" would queue another, not follow r-1.
+    const r = receipt(tool("refresh", ["refresh"], { project: { type: "string" }, wait: { type: "boolean" }, allowMass: { type: "boolean" } }), { refreshId: "r-1", state: "queued" });
+    expect(r.recovery).toMatchObject({ id: "r-1", kind: "refreshId", lookup: null });
     expect(r.jobId).toBeNull();
-    expect(String(r.verified)).not.toContain("companion_job");
-    expect(String(r.verified)).toContain("wait");
+    const advice = String(r.verified) + JSON.stringify(r.recovery);
+    expect(advice).not.toMatch(/run companion_refresh|wait: true|companion_job/);
+    expect(advice).toContain("companion_status");
+    expect(advice).toMatch(/do not/i);
   });
 
   it("keeps export path and status metadata and points at export status", () => {
@@ -53,8 +56,6 @@ describe("Companion receipts against real CLI shapes", () => {
     expect(preview).toMatchObject({ outcome: "not_applied", changed: "nothing (preview)" });
     expect(server(preview).outcome).toBe("not_applied");
     expect(receipt(layout, { jobId: "j3", state: "done", result: {} }, { apply: true }).outcome).toBe("committed_unverified");
-    const status = receipt(tool("autosync", ["autosync"], { mode: { type: "string" } }), { autoSync: true, watchers: [] }, { mode: "status" });
-    expect(status.outcome).toBe("committed_unverified");
     expect(receipt(tool("close", ["close"]), { jobId: "j4", state: "done", result: {} }).outcome).toBe("committed_unverified");
   });
 
@@ -75,22 +76,119 @@ describe("Companion receipts against real CLI shapes", () => {
     const r = receipt(tool("stringout", ["stringout"]), { jobId: "s1", state: "failed", error: { code: "partial", message: "1 failed" }, result: { items } });
     expect(r.state).toBe("failed");
     expect(r.error).toMatchObject({ code: "partial" });
-    expect(JSON.stringify(r.detail)).toContain("media offline");
+    expect(r.truncated).toMatchObject({ failed: { count: 1, rows: [{ path: ["items", 55], value: { error: "media offline" } }] } });
   });
 });
 
-describe("Companion read-only authority comes from the manifest", () => {
-  it("honours readOnly and treats a missing flag as a writer, whatever the name", () => {
+describe("Companion modes that change nothing", () => {
+  it("reports autosync status as a read and first_cut without out as a plan", () => {
+    const autosync = tool("autosync", ["autosync"], { mode: { type: "string" } });
+    const status = receipt(autosync, { autoSync: true, watchers: [] }, { mode: "status" });
+    expect(status).toMatchObject({ writer: null, changed: "nothing (read-only)", outcome: "not_applied" });
+    expect(server(status).outcome).toBe("not_applied");
+    expect(receipt(autosync, { autoSync: true, watchers: [] }, { mode: "on" }).outcome).toBe("committed_unverified");
+    const firstCut = tool("first_cut", ["first-cut"], { transcript: { type: "string" }, clip: { type: "string" }, out: { type: "string" } });
+    const plan = receipt(firstCut, { keep: [[0, 2]] }, { transcript: "/t.json", clip: "/a.mp4" });
+    expect(plan).toMatchObject({ changed: "nothing (preview)", outcome: "not_applied" });
+    expect(server(plan).outcome).toBe("not_applied");
+    expect(receipt(firstCut, { keep: [[0, 2]] }, { transcript: "/t.json", clip: "/a.mp4", out: "/cuts.json" }).outcome).toBe("committed_unverified");
+  });
+});
+
+// Companion 1.11.0's real flags and contracts for the reads (bin/binboy.mjs READ_ONLY and its manifest entries).
+const REAL_READS = [tool("status", ["status"], {}, true), tool("timeline", ["timeline"], { sequence: { type: "string" }, project: { type: "string" } }, true),
+  tool("job", ["job"], { id: { type: "string" } }, true), tool("export_status", ["export", "status"], { id: { type: "string" } }, true)];
+
+describe("Companion read-only authority needs the flag and the known read contract", () => {
+  it("keeps the real reads read-only and makes a remapped, extended or unknown flagged command a writer", () => {
     const dir = mkdtempSync(join(tmpdir(), "companion-ro-")); scratch.push(dir);
     const cli = join(dir, "fake.cjs");
-    const tools = [tool("status", ["bin", "move"]), tool("first_cut", ["first-cut"], {}, true), tool("timeline", ["timeline"], {}, true)];
+    const tools = [
+      tool("status", ["bin", "move"], {}, true), // remapped verb, flag kept
+      tool("timeline", ["timeline"], { sequence: { type: "string" }, apply: { type: "boolean" } }, true), // extra argument
+      tool("first_cut", ["first-cut"], { out: { type: "string" } }, true), // not a 1.11.0 read (its real entry is unflagged)
+      tool("bins", ["bins"], { project: { type: "string" } }), // known read without the flag
+      ...REAL_READS.slice(2),
+    ];
     writeFileSync(cli, `console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools })}))`);
     vi.stubEnv("PREMIERE_COMPANION_CLI", cli);
     const registered = getCompanionTools(cli) as Record<string, { annotations: { readOnlyHint: boolean } }>;
-    expect(registered.companion_status.annotations.readOnlyHint).toBe(false);
-    expect(companionAuthority("companion_status")).toHaveLength(4);
-    expect(registered.companion_first_cut.annotations.readOnlyHint).toBe(true);
-    expect(companionAuthority("companion_first_cut")).toEqual(["inspect"]);
+    for (const name of ["status", "timeline", "first_cut", "bins"]) {
+      expect(registered["companion_" + name].annotations.readOnlyHint).toBe(false);
+      expect(companionAuthority("companion_" + name)).toHaveLength(4);
+    }
+    for (const name of ["job", "export_status"]) {
+      expect(registered["companion_" + name].annotations.readOnlyHint).toBe(true);
+      expect(companionAuthority("companion_" + name)).toEqual(["inspect"]);
+    }
+    expect(REAL_READS.every(isCompanionRead)).toBe(true);
+  });
+});
+
+describe("Capped Companion output keeps every value reachable", () => {
+  // Shapes from Companion 1.11.0: timeline is a panel job whose result is { video: [[row per item]], audio } (panel/main.js timelineItems),
+  // and companion_job answers GET /api/job/<id> with the same snapshot (bin/binboy.mjs snapshotResponse).
+  const row = (index: number) => ({ track: "V1", index, name: `Clip ${index}`, mediaPath: "/Volumes/Media/" + "p".repeat(479) + `/${String(index).padStart(2, "0")}.mp4`,
+    startSeconds: index, endSeconds: index + 1, inSeconds: 0, outSeconds: 1, startTicks: "0", endTicks: "0", inTicks: "0", outTicks: "0", disabled: false, speed: 1, reversed: false, components: ["Motion", "Opacity"] });
+  const snapshot = { jobId: "t1", state: "done", result: { video: [Array.from({ length: 60 }, (_, i) => row(i))], audio: [] }, error: null };
+
+  async function follow(cli: string, first: { name: string; args: Record<string, unknown> }) {
+    const tools = getCompanionTools(cli) as Record<string, { handler: (a: unknown) => Promise<{ data: Record<string, unknown> }> }>;
+    const pieces: { path: unknown[]; value: unknown }[] = [];
+    let call: { tool: string; arguments: Record<string, unknown> } | null = { tool: first.name, arguments: first.args };
+    let first_receipt: Record<string, unknown> | undefined;
+    for (let guard = 0; call && guard < 20; guard++) {
+      const { data } = await tools[call.tool].handler(call.arguments);
+      first_receipt ??= data;
+      expect(JSON.stringify(data).length).toBeLessThan(DETAIL_LIMIT + 4000);
+      pieces.push(...(data.detail as { pieces: typeof pieces }).pieces);
+      call = (data.truncated as { next: typeof call }).next;
+    }
+    return { pieces, first: first_receipt! };
+  }
+
+  it("pages a 60-item timeline with a 501-character path so item 59 and its whole path come back", async () => {
+    expect(row(59).mediaPath).toHaveLength(501);
+    const dir = mkdtempSync(join(tmpdir(), "companion-page-")); scratch.push(dir);
+    const cli = join(dir, "fake.cjs");
+    writeFileSync(cli, `const a = process.argv.slice(2);
+if (a[0] === "mcp-manifest") console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: REAL_READS })}));
+else if ((a[0] === "timeline" && a.includes("199")) || (a[0] === "job" && a.includes("t1"))) console.log(JSON.stringify(${JSON.stringify(snapshot)}));
+else { console.log("{}"); process.exit(2); }`);
+    const { pieces, first } = await follow(cli, { name: "companion_timeline", args: { sequence: "199" } });
+    expect(first.truncated).toMatchObject({ page: 1, next: { tool: "companion_job", arguments: { id: "t1", page: 2 } } });
+    const items = pieces.filter(p => p.path[0] === "video").map(p => p.value as ReturnType<typeof row>);
+    expect(items).toHaveLength(60);
+    expect(items[59]).toEqual(row(59));
+    expect(pieces.find(p => (p.value as { index?: number }).index === 59)!.path).toEqual(["video", 0, 59]);
+  });
+
+  it("keeps a late failed row and its reason when 66 rows overflow, and pages the rest through companion_job", async () => {
+    const rows = Array.from({ length: 66 }, (_, i) => ({ index: i, ok: i !== 64, ...(i === 64 ? { error: { code: "media-offline", message: "A-roll 64 is offline" } } : {}), note: "n".repeat(500) }));
+    const output = { jobId: "s1", state: "done", result: { items: rows } };
+    const r = receipt(tool("stringout", ["stringout"], { plan: { type: "string" } }), output, { plan: "/p.json" });
+    expect(r.truncated).toMatchObject({ failed: { count: 1, rows: [{ path: ["items", 64], value: { error: { message: "A-roll 64 is offline" } } }] }, next: { tool: "companion_job", arguments: { id: "s1", page: 2 } } });
+    const dir = mkdtempSync(join(tmpdir(), "companion-page-")); scratch.push(dir);
+    const cli = join(dir, "fake.cjs");
+    writeFileSync(cli, `if (process.argv[2] === "mcp-manifest") console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: REAL_READS })})); else console.log(JSON.stringify(${JSON.stringify(output)}));`);
+    const { pieces } = await follow(cli, { name: "companion_job", args: { id: "s1" } });
+    expect(pieces.filter(p => p.path[0] === "items").map(p => p.value)).toEqual(rows);
+  });
+
+  it("returns a large write result whole when no tool could fetch a dropped part", () => {
+    const rows = Array.from({ length: 66 }, (_, i) => ({ index: i, ok: i !== 64, note: "n".repeat(500) }));
+    const r = receipt(tool("colour_set", ["colour"], { path: { type: "string" } }), { rows }, { path: "/x.prproj" });
+    expect(r.truncated).toBeUndefined();
+    expect(r.detail).toEqual({ rows });
+  });
+
+  it("names the first_cut file route when its review flags or takes are capped", () => {
+    const firstCut = tool("first_cut", ["first-cut"], { transcript: { type: "string" }, clip: { type: "string" }, out: { type: "string" } });
+    const plan = { keep: [[0, 2]], takes: Array.from({ length: 80 }, (_, i) => ({ line: i, text: "t".repeat(500) })), flags: [{ line: 3, reason: "x".repeat(450) }] };
+    const capped = receipt(firstCut, plan, { transcript: "/t.json", clip: "/a.mp4" });
+    expect(String((capped.truncated as { note: string }).note)).toContain("companion_first_cut again with the same arguments plus out");
+    const written = receipt(firstCut, plan, { transcript: "/t.json", clip: "/a.mp4", out: "/cuts.json" });
+    expect(String((written.truncated as { note: string }).note)).toContain("/cuts.json");
   });
 });
 

@@ -1,10 +1,22 @@
 // Companion remains the only writer unless the operator restarts in native mode.
-// Read-only commands are the ones Companion's own manifest marks readOnly: true (1.11.0 on); a command without the flag is a writer,
-// so a renamed or remapped command can never keep inspect-only authority by its name alone.
+// Read-only means both: Companion's manifest marks the command readOnly: true (1.11.0 on), and it still has the verb and
+// arguments of a known Companion 1.11.0 read below. A renamed, remapped or extended command is a writer.
+const READ_CONTRACT: Record<string, [argv: string, properties: string]> = {
+  status: ["status", ""], bins: ["bins", "project"], sequence_list: ["sequence list", "project"], marker_list: ["marker list", "sequence,project"],
+  job: ["job", "id"], roots_list: ["roots list", ""], presets_export: ["presets export", "detail"], presets_effects: ["presets effects", ""],
+  presets_show: ["presets show", "name,effect,folder"], timeline: ["timeline", "sequence,project"], effect_available: ["effect available", "project"],
+  effect_list: ["effect list", "sequence,track,index,at,clip,project"], colour_status: ["colour status", "path"], export_status: ["export status", "id"],
+};
+export interface CompanionCommand { name: string; argv: string[]; readOnly?: boolean; inputSchema: { properties: Record<string, unknown> } }
+export function isCompanionRead(tool: CompanionCommand): boolean {
+  const contract = Object.hasOwn(READ_CONTRACT, tool.name) ? READ_CONTRACT[tool.name] : undefined;
+  return tool.readOnly === true && !!contract && tool.argv.join(" ") === contract[0]
+    && Object.keys(tool.inputSchema.properties).every(key => contract[1].split(",").includes(key));
+}
 const companionReadOnly = new Set<string>();
-export function setCompanionReadOnly(names: Iterable<string>): void {
+export function setCompanionReadOnly(tools: readonly CompanionCommand[]): void {
   companionReadOnly.clear();
-  for (const name of names) companionReadOnly.add(name);
+  for (const tool of tools) if (isCompanionRead(tool)) companionReadOnly.add(tool.name);
 }
 
 export function companionAuthority(name: string): readonly ("inspect" | "edit" | "export" | "filesystem")[] | undefined {

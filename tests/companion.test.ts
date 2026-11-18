@@ -29,7 +29,7 @@ describe("Companion integration", () => {
   });
   it("allows exactly one writer, including direct handler calls", async () => {
     vi.stubEnv("PREMIERE_COMPANION_CLI", "/fixture/companion.mjs");
-    setCompanionReadOnly(["status"]); // as a manifest marking status readOnly: true would
+    setCompanionReadOnly([{ name: "status", argv: ["status"], readOnly: true, inputSchema: { properties: {} } }]); // Companion 1.11.0's status entry
     const handler = vi.fn(async () => ({ success: true }));
     const authority = resolveCapabilities("inspect,edit,export,filesystem");
     expect(isToolPermitted("companion_status", authority)).toBe(true);
@@ -79,6 +79,8 @@ describe("Companion integration", () => {
     const cli = join(dir, "fake.mjs");
     writeFileSync(cli, `if(process.argv[2]==='mcp-manifest') console.log(JSON.stringify(${JSON.stringify({ name: "premiere-companion", tools: [tool] })})); else {console.log(JSON.stringify({state:'done',result:{text:'x'.repeat(300000)}}));process.exit(0);}`);
     const result = await getCompanionTools(cli).companion_bin_move.handler({ items: ["a"], to: "b" });
-    expect(result).toMatchObject({ success: true, data: { state: "done", truncated: { characters: 300011 } } });
+    // A write with no job id has no route to fetch a dropped part, so the whole result comes back.
+    expect(result).toMatchObject({ success: true, data: { state: "done", detail: { text: "x".repeat(300000) } } });
+    expect(result.data).not.toHaveProperty("truncated");
   });
 });
