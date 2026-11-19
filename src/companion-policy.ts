@@ -1,17 +1,23 @@
 // Companion remains the only writer unless the operator restarts in native mode.
-// Read-only means both: Companion's manifest marks the command readOnly: true (1.11.0 on), and it still has the verb and
-// arguments of a known Companion 1.11.0 read below. A renamed, remapped or extended command is a writer.
-const READ_CONTRACT: Record<string, [argv: string, properties: string]> = {
-  status: ["status", ""], bins: ["bins", "project"], sequence_list: ["sequence list", "project"], marker_list: ["marker list", "sequence,project"],
-  job: ["job", "id"], roots_list: ["roots list", ""], presets_export: ["presets export", "detail"], presets_effects: ["presets effects", ""],
-  presets_show: ["presets show", "name,effect,folder"], timeline: ["timeline", "sequence,project"], effect_available: ["effect available", "project"],
-  effect_list: ["effect list", "sequence,track,index,at,clip,project"], colour_status: ["colour status", "path"], export_status: ["export status", "id"],
+// Read-only means both: Companion's manifest marks the command readOnly: true (1.11.0 on), and it still has the verb, argument
+// types and positional bindings of a known Companion 1.11.0 read below. A renamed, remapped, retyped or extended command is a writer.
+const READ_CONTRACT: Record<string, [argv: string, properties: string, positional: string]> = {
+  status: ["status", "", ""], bins: ["bins", "project:string", ""], sequence_list: ["sequence list", "project:string", ""],
+  marker_list: ["marker list", "sequence:string,project:string", "sequence"], job: ["job", "id:string", "id"], roots_list: ["roots list", "", ""],
+  presets_export: ["presets export", "detail:boolean", ""], presets_effects: ["presets effects", "", ""],
+  presets_show: ["presets show", "name:string,effect:boolean,folder:string", "name"], timeline: ["timeline", "sequence:string,project:string", "sequence"],
+  effect_available: ["effect available", "project:string", ""],
+  effect_list: ["effect list", "sequence:string,track:string,index:integer,at:string,clip:string,project:string", "sequence"],
+  colour_status: ["colour status", "path:string", "path"], export_status: ["export status", "id:string", "id"],
 };
-export interface CompanionCommand { name: string; argv: string[]; readOnly?: boolean; inputSchema: { properties: Record<string, unknown> } }
+export interface CompanionCommand { name: string; argv: string[]; positional?: string[]; readOnly?: boolean; inputSchema: { properties: Record<string, unknown> } }
 export function isCompanionRead(tool: CompanionCommand): boolean {
   const contract = Object.hasOwn(READ_CONTRACT, tool.name) ? READ_CONTRACT[tool.name] : undefined;
-  return tool.readOnly === true && !!contract && tool.argv.join(" ") === contract[0]
-    && Object.keys(tool.inputSchema.properties).every(key => contract[1].split(",").includes(key));
+  if (tool.readOnly !== true || !contract || tool.argv.join(" ") !== contract[0]) return false;
+  const keys = Object.keys(tool.inputSchema.properties);
+  // A read may drop arguments, but each one left keeps its 1.11.0 type and stays positional exactly when it was.
+  return keys.every(key => contract[1].split(",").includes(`${key}:${(tool.inputSchema.properties[key] as { type?: unknown }).type}`))
+    && tool.positional?.join(",") === contract[2].split(",").filter(key => keys.includes(key)).join(",");
 }
 const companionReadOnly = new Set<string>();
 export function setCompanionReadOnly(tools: readonly CompanionCommand[]): void {

@@ -96,8 +96,9 @@ describe("Companion modes that change nothing", () => {
 });
 
 // Companion 1.11.0's real flags and contracts for the reads (bin/binboy.mjs READ_ONLY and its manifest entries).
-const REAL_READS = [tool("status", ["status"], {}, true), tool("timeline", ["timeline"], { sequence: { type: "string" }, project: { type: "string" } }, true),
-  tool("job", ["job"], { id: { type: "string" } }, true), tool("export_status", ["export", "status"], { id: { type: "string" } }, true)];
+const bound = (t: ReturnType<typeof tool>, positional: string[]) => ({ ...t, positional });
+const REAL_READS = [tool("status", ["status"], {}, true), bound(tool("timeline", ["timeline"], { sequence: { type: "string" }, project: { type: "string" } }, true), ["sequence"]),
+  bound(tool("job", ["job"], { id: { type: "string" } }, true), ["id"]), bound(tool("export_status", ["export", "status"], { id: { type: "string" } }, true), ["id"])];
 
 describe("Companion read-only authority needs the flag and the known read contract", () => {
   it("keeps the real reads read-only and makes a remapped, extended or unknown flagged command a writer", () => {
@@ -122,6 +123,14 @@ describe("Companion read-only authority needs the flag and the known read contra
       expect(companionAuthority("companion_" + name)).toEqual(["inspect"]);
     }
     expect(REAL_READS.every(isCompanionRead)).toBe(true);
+  });
+
+  it("makes a known read a writer when an argument changes type or positional binding", () => {
+    const timeline = REAL_READS[1];
+    expect(isCompanionRead({ ...timeline, inputSchema: schema({ sequence: { type: "integer" }, project: { type: "string" } }) })).toBe(false);
+    expect(isCompanionRead({ ...timeline, positional: [] })).toBe(false);
+    expect(isCompanionRead({ ...timeline, positional: ["project"] })).toBe(false);
+    expect(isCompanionRead({ ...timeline, inputSchema: schema({ project: { type: "string" } }), positional: [] })).toBe(true); // a narrower read stays a read
   });
 });
 

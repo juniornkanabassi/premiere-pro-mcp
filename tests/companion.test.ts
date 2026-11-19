@@ -29,7 +29,7 @@ describe("Companion integration", () => {
   });
   it("allows exactly one writer, including direct handler calls", async () => {
     vi.stubEnv("PREMIERE_COMPANION_CLI", "/fixture/companion.mjs");
-    setCompanionReadOnly([{ name: "status", argv: ["status"], readOnly: true, inputSchema: { properties: {} } }]); // Companion 1.11.0's status entry
+    setCompanionReadOnly([{ name: "status", argv: ["status"], positional: [], readOnly: true, inputSchema: { properties: {} } }]); // Companion 1.11.0's status entry
     const handler = vi.fn(async () => ({ success: true }));
     const authority = resolveCapabilities("inspect,edit,export,filesystem");
     expect(isToolPermitted("companion_status", authority)).toBe(true);
