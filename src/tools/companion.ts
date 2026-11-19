@@ -88,7 +88,7 @@ const EXCERPT = 3_000; // room kept beside every page for the failed-row excerpt
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Json : undefined;
 // A row that reports a failure; capping keeps these before ordinary rows so a cap never hides one.
-const failedRow = (item: unknown): boolean => { const row = record(item); return !!row && (row.ok === false || (row.error !== undefined && row.error !== null) || /fail|error|refused|unknown/i.test(String(row.state ?? row.status ?? ""))); };
+const failedRow = (item: unknown): boolean => { const row = record(item); return !!row && (row.ok === false || (row.error !== undefined && row.error !== null) || /fail|error|refused|unknown|ambiguous|not-found/i.test(String(row.state ?? row.status ?? ""))); };
 const count = (list: unknown[]) => { const failed = list.filter(failedRow).length; return `${list.length} item(s)${failed ? `, ${failed} failed` : ""}`; };
 // One line per field: scalars as they are, lists as a count. Enough for "what changed" without the payload.
 function brief(value: unknown): unknown {
@@ -148,9 +148,12 @@ function failedExcerpt(payload: unknown) {
 }
 // These two write their whole result to a new file when given out, so a capped answer points there instead of paging.
 const FILE_ROUTE = new Set(["transcript_export", "first_cut"]);
+// Exactly what companion_job answers for a stored job (Companion's snapshotResponse); any other envelope (status, export, refresh) has no route back to the same payload.
+const JOB_SNAPSHOT = ["jobId", "state", "result", "error", "scope"];
+const fingerprint = (payload: unknown) => createHash("sha256").update(JSON.stringify(payload ?? null)).digest("hex").slice(0, 16);
 
 /** The small, consistent receipt every Companion-backed result carries, with the payload capped. */
-export function companionReceipt(tool: CompanionTool, args: Json, output: unknown, toolWrites: boolean, ok = true, page = 1): Json {
+export function companionReceipt(tool: CompanionTool, args: Json, output: unknown, toolWrites: boolean, ok = true, page = 1, snapshot?: unknown): Json {
   // Invocation modes of writer commands that change nothing: autosync status only reads, first_cut without out only plans.
   const writes = toolWrites && !(tool.name === "autosync" && args.mode === "status");
   // Companion answers with an envelope (state, jobId / exportId / refreshId, result, plus fields such as an export's paths)
@@ -165,9 +168,12 @@ export function companionReceipt(tool: CompanionTool, args: Json, output: unknow
   // Nothing an agent must act on is dropped unless the receipt names a working route to exactly that content.
   let detail = payload;
   let truncated: Json | undefined;
-  const lookup = exportId != null ? { tool: "companion_export_status", arguments: { id: exportId } }
-    : jobId != null ? { tool: "companion_job", arguments: { id: jobId } }
-    : !writes ? { tool: "companion_" + tool.name, arguments: args } : undefined;
+  // A page is fetched again from the same stored job, or by re-running a read that has no job; nothing else is paged.
+  const lookup = envelope ? (jobId != null && Object.keys(envelope).every(key => JOB_SNAPSHOT.includes(key)) ? { tool: "companion_job", arguments: { id: jobId } } : undefined)
+    : !toolWrites ? { tool: "companion_" + tool.name, arguments: args } : undefined;
+  const continued = page !== 1 || snapshot !== undefined;
+  if (continued && snapshot !== fingerprint(payload)) throw new Error("This result changed since its first page (or has none); call again without page and snapshot");
+  if (continued && !(size > DETAIL_LIMIT && lookup && !FILE_ROUTE.has(tool.name))) throw new Error("This result is not paged; call without page");
   if (size > DETAIL_LIMIT && FILE_ROUTE.has(tool.name)) {
     detail = shrink(payload);
     if (JSON.stringify(detail ?? null).length > DETAIL_LIMIT) detail = brief(payload);
@@ -175,11 +181,13 @@ export function companionReceipt(tool: CompanionTool, args: Json, output: unknow
       ? `Capped here; the whole result is in ${args.out}. Read that file with your own file tool (with Junior's approval).`
       : `Capped: long text is replaced by its length and lists are shortened. For the whole result call companion_${tool.name} again with the same arguments plus out (a new file path), then read that file with your own file tool (with Junior's approval).` };
   } else if (size > DETAIL_LIMIT && lookup) {
-    const pages = paginate(payload), at = Math.min(page, pages.length), failed = failedExcerpt(payload);
+    const pages = paginate(payload), at = page, failed = page === 1 ? failedExcerpt(payload) : undefined;
+    if (at > pages.length) throw new Error(`This result has ${pages.length} pages`);
     detail = { page: at, pages: pages.length, pieces: pages[at - 1] };
     truncated = { characters: size, limit: DETAIL_LIMIT, page: at, pages: pages.length,
-      next: at < pages.length ? { tool: lookup.tool, arguments: { ...lookup.arguments, page: at + 1 } } : null,
-      note: "Split into pages of complete pieces, each with its path in the full result; nothing is cut or left out. Call next for the following page.",
+      next: at < pages.length ? { tool: lookup.tool, arguments: { ...lookup.arguments, page: at + 1, snapshot: fingerprint(payload) } } : null,
+      note: at === 1 ? "Split into pages of complete pieces, each with its path in the full result; nothing is cut or left out. Call next for the following page."
+        : "A further page of the result reported above, not a new outcome. Call next for the following page.",
       ...(failed ? { failed } : {}) };
   }
   // shortcut: a large write result with no id and no file route is returned whole (no route could fetch a dropped part); page it if one appears.
@@ -272,7 +280,9 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
     const parameters = describeProperties(tool.inputSchema);
     return [name, {
       description: `Premiere Companion: ${tool.description} ${writes ? "Writes through Companion's grant, locks and job queue. Never retry an unknown outcome." : "Read-only."}`,
-      parameters: writes ? parameters : { ...parameters, properties: { ...parameters.properties, page: { type: "integer", minimum: 1, description: "Page of a long result, as truncated.next gives it; default 1." } } },
+      parameters: writes ? parameters : { ...parameters, properties: { ...parameters.properties,
+        page: { type: "integer", minimum: 1, description: "Page of a long result, as truncated.next gives it; default 1." },
+        snapshot: { type: "string", description: "Copied from truncated.next; proves the page comes from the same result." } } },
       annotations: { readOnlyHint: !writes },
       operationalCapability: {
         backend: "orchestrator", backends: ["orchestrator"], status: "supported",
@@ -280,23 +290,28 @@ export function getCompanionTools(cli = process.env.PREMIERE_COMPANION_CLI) {
         notes: ["Uses the existing Companion CLI and its own grant, queue and readback checks; no upstream CEP dispatch."],
       },
       handler: async (args: unknown) => {
-        const { page = 1, ...input } = args as Json;
+        const { page = 1, snapshot, ...input } = args as Json;
         if (!writes && (!Number.isInteger(page) || (page as number) < 1)) throw new Error("page must be a whole number from 1");
         const argv = companionArguments(tool, writes ? args : input);
+        let stdout = "", error: (Error & { code?: number | string; stdout?: string; stderr?: string; killed?: boolean }) | undefined;
         try {
           if (writes) markHostDispatch();
-          const { stdout } = await execute(cli, argv);
-          return { success: true, data: companionReceipt(tool, input, JSON.parse(stdout), writes, true, page as number) };
-        } catch (cause) {
-          const error = cause as Error & { code?: number | string; stdout?: string; stderr?: string; killed?: boolean };
-          let result: unknown;
-          try { result = JSON.parse(error.stdout ?? ""); } catch { /* Preserve non-JSON diagnostics below. */ }
-          const reported = record(record(result)?.error);
-          const message = String(reported?.message ?? reported?.code ?? (error.stdout?.trim() || error.stderr?.trim() || error.message)).slice(0, 2000);
-          return { success: false, error: message,
-            data: { ...companionReceipt(tool, input, result, writes, false), exitCode: error.code ?? null,
-              outcome: error.killed || error.code === 5 ? "unknown" : error.code === 3 || error.code === 4 ? "not_applied" : "failed", retry: false } };
+          ({ stdout } = await execute(cli, argv));
+        } catch (cause) { error = cause as typeof error; stdout = error!.stdout ?? ""; }
+        let result: unknown;
+        try { result = JSON.parse(stdout); } catch { /* Preserve non-JSON diagnostics below. */ }
+        // A later page re-reads a result already reported on page 1 (a failed job keeps exiting 2): it is not a new failure.
+        if (page !== 1 || snapshot !== undefined) {
+          if (result === undefined) throw new Error("Companion did not return the paged result; call again without page");
+          return { success: true, data: companionReceipt(tool, input, result, writes, true, page as number, snapshot) };
         }
+        if (!error && result !== undefined) return { success: true, data: companionReceipt(tool, input, result, writes) };
+        error ??= Object.assign(new Error("Companion did not print JSON"), { stdout });
+        const reported = record(record(result)?.error);
+        const message = String(reported?.message ?? reported?.code ?? (error.stdout?.trim() || error.stderr?.trim() || error.message)).slice(0, 2000);
+        return { success: false, error: message,
+          data: { ...companionReceipt(tool, input, result, writes, false), exitCode: error.code ?? null,
+            outcome: error.killed || error.code === 5 ? "unknown" : error.code === 3 || error.code === 4 ? "not_applied" : "failed", retry: false } };
       },
     }];
   }));
